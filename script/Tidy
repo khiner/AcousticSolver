@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Runs clang-tidy over the project's own sources using the checks configured in .clang-tidy.
+# Pass a file or directory to lint just that target; defaults to Source/ + main.cpp.
+#   script/Tidy
+#   script/Tidy Source/WaveBlender.cpp
+# Exits non-zero if any findings remain.
+
+set -uo pipefail
+
+ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
+ProjectRootDir="$(dirname "${ScriptDir}")"
+
+Targets=("${1:-${ProjectRootDir}/Source/(WaveBlender|Metal/|FDTD/|Shaders/).*\.cpp|${ProjectRootDir}/main.cpp}")
+
+Findings="$(
+    run-clang-tidy -p "${ProjectRootDir}/build" -quiet "${Targets[@]}" 2>&1 |
+        grep -oE "${ProjectRootDir}/(Source|main)[^ ]*: warning:.*\[[a-z-]+\]" | sort -u
+)"
+
+if [[ -n "${Findings}" ]]; then
+    echo "${Findings}"
+    echo "$(echo "${Findings}" | wc -l | tr -d ' ') finding(s)."
+    exit 1
+fi
+echo "clang-tidy: clean."

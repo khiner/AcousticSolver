@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Formats (and, when a compile database exists, tidies) staged C++ sources, then re-stages them
+# so the commit lands with cleaned-up code. Vendored code is excluded.
+# Installed via `git config core.hooksPath .githooks`.
+
+set -e
+
+RootDir="$(git rev-parse --show-toplevel)"
+cd "${RootDir}"
+
+Files="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(cpp|hpp|c|cc|cxx|h|hh)$' | grep -vE '^Source/(ModalSound|FluidSound|ThirdParty)/' || true)"
+[ -z "${Files}" ] && exit 0
+
+echo "${Files}" | xargs clang-format -style=file -i
+
+if [ -f "${RootDir}/build/compile_commands.json" ]; then
+    Tus="$(echo "${Files}" | grep -E '\.cpp$' || true)"
+    if [ -n "${Tus}" ]; then
+        echo "${Tus}" | xargs clang-tidy -p "${RootDir}/build" --fix --quiet || true
+        echo "${Files}" | xargs clang-format -style=file -i # tidy fixes may need reformatting
+    fi
+fi
+
+echo "${Files}" | xargs git add

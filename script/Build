@@ -1,0 +1,22 @@
+#!/bin/bash
+
+set -e
+
+ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
+ProjectRootDir="$(dirname "${ScriptDir}")"
+
+build_type="Release"
+
+for arg in "$@"; do
+    case "$arg" in
+        -d|--debug) build_type="Debug" ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
+BuildDir="${ProjectRootDir}/build"
+# Configure only when unconfigured or the build type changed. Ninja reconfigures on CMake file changes.
+if [ ! -f "${BuildDir}/build.ninja" ] || ! grep -qx "CMAKE_BUILD_TYPE:STRING=${build_type}" "${BuildDir}/CMakeCache.txt"; then
+    CC=clang CXX=clang++ cmake -G Ninja -S "${ProjectRootDir}" -B "${BuildDir}" -DCMAKE_BUILD_TYPE="$build_type"
+fi
+cmake --build "${BuildDir}" --config "$build_type"

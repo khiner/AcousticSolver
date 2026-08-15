@@ -26,7 +26,12 @@ class Integrator
 {
 public:
     Integrator(double dt) : _dt(dt) { }
-     
+
+    // LOCAL PATCH (not upstream): Solver::~Solver() deletes derived integrators through this
+    // base pointer, which is undefined behavior without a virtual destructor. Clang at -O2
+    // compiles that delete to a trap. Upstream (github.com/kangruix/FluidSound) is archived.
+    virtual ~Integrator() = default;
+
     /** \brief Takes an RK4 integration step */
     void step(double time);
 

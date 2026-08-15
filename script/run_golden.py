@@ -9,6 +9,21 @@ import json, os, shutil, subprocess, sys, time
 SCENES_DIR = "../Scenes"
 OUT_DIR = "golden"
 
+
+def write_wav(bin_path, srate):
+    """Peak-normalized .bin -> .wav, as in the reference write_wav.py (without its matplotlib import)."""
+    try:
+        import numpy as np
+        import soundfile as sf
+    except ImportError as e:
+        print(f"WAV CONVERSION SKIPPED ({e}) — install numpy + soundfile", flush=True)
+        return
+    data = np.fromfile(bin_path, dtype=np.float32)
+    peak = np.abs(data).max()
+    if peak > 0:
+        data = data / peak
+    sf.write(os.path.splitext(bin_path)[0] + ".wav", data, srate)
+
 results = []
 for scene in sorted(os.listdir(SCENES_DIR)):
     config_path = os.path.join(SCENES_DIR, scene, "config.json")
@@ -34,7 +49,7 @@ for scene in sorted(os.listdir(SCENES_DIR)):
     for name in outputs:
         bin_path = name + ".bin"
         if os.path.isfile(bin_path):
-            subprocess.run([sys.executable, "../scripts/write_wav.py", bin_path, str(srate)])
+            write_wav(bin_path, srate)
             for ext in (".bin", ".wav"):
                 if os.path.isfile(name + ext):
                     shutil.move(name + ext, os.path.join(dest, name + ext))

@@ -37,6 +37,7 @@ SCENES="CupPhone 2016Pour GlassPour PaddleSplash LegoDrop SpollingBowl TalkFan T
 
 echo "==> Installing dependencies on $HOST"
 run 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null && apt-get install -y -qq libeigen3-dev unzip rsync >/dev/null'
+run 'python3 -m pip install --quiet --break-system-packages numpy soundfile 2>/dev/null || python3 -m pip install --quiet numpy soundfile' # for run_golden.py's .bin -> .wav conversion
 
 echo "==> Uploading WaveBlender source ($WAVEBLENDER_DIR) and FluidSound ($FLUIDSOUND_DIR)"
 rsync -az --exclude '.git' --exclude 'Scenes' --exclude 'build' -e "$RSYNC_RSH" "$WAVEBLENDER_DIR"/ "$HOST":'~/WaveBlender/'

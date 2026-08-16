@@ -56,6 +56,25 @@ private:
     int NShaderPoints{0}; // number of shader points (object boundary faces)
     int NRegularShaderPoints{0}; // leading shader points that are velocity blends (the rest are forces)
     int MaxNShaderPoints{0}; // maximum number of shader points allocated in memory so far
+    bool FoldApply{false}; // this batch folds the boundary application into the velocity kernels
+
+    // Chooses the boundary-application path per batch. Both paths are bit-exact, so probe
+    // batches alternate them and measure GPU time, locking to the faster once each has
+    // enough samples. Probe state resets whenever the dispatch-structure key changes.
+    struct ApplyPathTuner {
+        bool Choose(bool has_points, bool has_forces); // the path for this batch (true: folded)
+        void MarkInFlight(bool fold); // this batch is a probe: measure it at the next drain
+        void RecordDrained(double gpu_seconds); // the last-marked probe batch just drained
+
+    private:
+        uint32_t Key{~0u}; // dispatch-structure key the probe state applies to
+        int Locked{-1}; // -1 while probing, else the chosen path (0 plain, 1 folded)
+        double BestSeconds[2]{}; // best measured batch GPU seconds per path
+        int ProbeCount[2]{}; // completed probe batches per path
+        int InFlightFold{-1}; // path of the in-flight probe batch (-1: none)
+        bool SeenForces{false}; // sticky: any batch so far had force points
+    };
+    ApplyPathTuner PathTuner;
 
     // Precomputed constants
     REAL RhoCCDt{0}, InvDx{0}, InvRhoDt{0};
@@ -67,37 +86,35 @@ private:
     bool ListenerPending{false}; // a batch's listener samples are on the GPU timeline, not yet written to file
 
     // ----- Device (GPU) buffers -----
-    // While P[cid] and Beta[cid] values are stored at cell centers, velocities are staggered on
+    // While P[cid] and cell states are stored at cell centers, velocities are staggered on
     // cell faces. By convention, each cell index stores the velocities on its RIGHT, TOP, and BACK faces.
     // P and the velocities ping-pong per fused step (read Cur(), write Other()), so the
     // current state is always Cur().
     GpuDouble P; // pressure
     GpuDouble Vx, Vy, Vz; // velocity components
-    GpuBuffer Beta; // blending field
     GpuBuffer Px, Py, Pz; // split pressure field (for PML), also used as fresh-cell acceleration scratch
     GpuBuffer PmlNp, PmlDp, PmlNv, PmlDv; // PML weights (separate pressure and velocity)
     GpuBuffer ListenerCids, ListenerOut; // listener cell indices and per-batch sampled pressure
 
-    // Rasterized cell states (which object each cell contains, 0 for air), the map from
-    // boundary faces to shader points, and the shader sample data. All three are rewritten
-    // by the CPU while the previous batch may still be in flight, hence double-buffered.
+    // Per-cell blending state for the batch (CELL_* in KernelParams.h), the map from
+    // boundary faces to shader points, and the shader sample data. All rewritten by the
+    // CPU while the previous batch may still be in flight, hence double-buffered.
     // For boundary points (b1, ..., bN) and times (0, ..., T), ShaderData corresponds to:
     //   [ v_b1(0) ... v_b1(T) ]
     //   [   :            :    ]
     //   [ v_bN(0) ... v_bN(T) ]
-    GpuDouble Cell, ShaderMap, ShaderData;
+    GpuDouble CellState, ShaderMap, ShaderData;
 
-    // Cells changing solidity this batch, encoded (cid << 1) | new_solidity — the
-    // per-step beta update set (see update_beta in Kernels.metal).
-    GpuDouble BetaTransitions;
-    int NBetaTransitions{0};
-    std::vector<uint8_t> BetaSolid; // host-tracked beta state at batch start (exactly 0 or 1)
+    // Per-cell shader-face lookup for the folded boundary application (layout note in
+    // KernelParams.h)
+    GpuDouble ShaderFaces;
+
+    bool HadTransitions{false}; // last uploaded states include RISING/FALLING cells
 
     std::vector<uint8_t> Cell1, Cell2; // rasterized cell states at batch endpoints t1 and t2 (values: 0 air, oid + 1, CavityInterior)
 
     // ----- Persistent scratch (sized once, reused per batch) -----
     std::vector<int> ShaderMapHost;
-    std::vector<int> TransitionsHost;
     std::vector<uint8_t> FloodVisited; // flood-fill visited flags
     std::vector<int> FloodStack;
     std::vector<uint32_t> FaceStamp[3]; // epoch-stamped per-direction used-face sets (shader setup)

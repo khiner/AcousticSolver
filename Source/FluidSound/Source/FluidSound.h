@@ -45,6 +45,10 @@ public:
     /** \brief Returns vector of sorted event times (i.e., when bubbles are added or removed) */
     const std::vector<double>& eventTimes() { return _eventTimes; }
 
+    /** LOCAL PATCH (perf): exposes the integrator so a precomputed-factor provider can be
+     *  installed (see BubbleFactorPipeline.h). */
+    Integrator<T>* integrator() { return _integrator; }
+
     /** \brief Prints timings from Integrator */
     void printTimings()
     {

@@ -14,6 +14,7 @@
 
 #include "igl/AABB.h"
 
+#include "BubbleFactorPipeline.h"
 #include "FluidSound.h"
 #include "ModalSound.h"
 
@@ -145,7 +146,8 @@ struct Occluder {
 // Bubble-based water sound shader.
 struct Bubbles {
     Bubbles(int blend_rate, int shader_srate, double ts, const std::string &bub_file, std::string fluid_mesh_dir, REAL dx = 0.)
-        : Obj(ShaderClass::Bubbles, true, blend_rate, shader_srate, ts), Solver(bub_file, 1. / shader_srate, 1, ts), Dx(dx), FluidMeshDir(std::move(fluid_mesh_dir)) {
+        : Obj(ShaderClass::Bubbles, true, blend_rate, shader_srate, ts), Solver(bub_file, 1. / shader_srate, 1, ts),
+          FactorPipeline(std::make_unique<BubbleFactorPipeline>(Solver, 1. / shader_srate, ts)), Dx(dx), FluidMeshDir(std::move(fluid_mesh_dir)) {
         ReadFluidMesh();
     }
     void Compute(GpuBuffer &vb, int global_bid);
@@ -154,6 +156,7 @@ struct Bubbles {
 
 private:
     FluidSound::Solver<double> Solver; // solver for timestepping bubble oscillations
+    std::unique_ptr<BubbleFactorPipeline> FactorPipeline; // precomputes mass-matrix factorizations (declared after Solver: destroyed first)
     REAL Dx; // FDTD cell size (for flux normalization)
 
     std::string FluidMeshDir; // path to directory containing fluid meshes

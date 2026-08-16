@@ -15,8 +15,15 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <iostream>
+#include <limits>
+
+namespace {
+// Whether a cell state is solid at batch end (RISING converges to solid, FALLING to air)
+bool EndsSolid(uint8_t state) { return state == CELL_SOLID || state == CELL_RISING; }
+} // namespace
 
 WaveBlender::WaveBlender(const SimParams &params)
     : Params(params), GridSize(Params.Nx * Params.Ny * Params.Nz),
@@ -27,11 +34,17 @@ WaveBlender::WaveBlender(const SimParams &params)
         field->Cur().ResizeZeroed(GridSize * sizeof(REAL));
         field->Other().ResizeZeroed(GridSize * sizeof(REAL));
     }
-    Beta.ResizeZeroed(GridSize * sizeof(REAL));
 
     Cell1.resize(GridSize);
     Cell2.resize(GridSize);
-    BetaSolid.assign(GridSize, 0);
+
+    // Both slots all-AIR: Cur() doubles as the previous batch-end solidity source
+    CellState.Cur().ResizeZeroed(GridSize * sizeof(uint8_t));
+    CellState.Other().ResizeZeroed(GridSize * sizeof(uint8_t));
+
+    // Valid (unread) allocations for plain-path batches, which bind but never touch these
+    ShaderFaces.Cur().ResizeZeroed(16);
+    ShaderFaces.Other().ResizeZeroed(16);
 
     for (auto &stamp : FaceStamp) stamp.assign(GridSize, 0);
     for (auto &col : FaceCol) col.assign(GridSize, -1);
@@ -118,8 +131,10 @@ void WaveBlender::LogZSlice(const std::string &filetag) {
     const auto *p = P.Cur().As<REAL>(); // synchronizes the stream
     logfile.write(reinterpret_cast<const char *>(p + offset), Params.Nx * Params.Ny * sizeof(REAL));
 
-    const auto *beta = Beta.As<REAL>();
-    logfile.write(reinterpret_cast<const char *>(beta + offset), Params.Nx * Params.Ny * sizeof(REAL));
+    const auto *states = CellState.Cur().As<uint8_t>();
+    std::vector<REAL> beta(Params.Nx * Params.Ny); // converged between batches: exactly 0 or 1
+    for (int c = 0; c < int(beta.size()); ++c) beta[c] = EndsSolid(states[offset + c]) ? 1. : 0.;
+    logfile.write(reinterpret_cast<const char *>(beta.data()), beta.size() * sizeof(REAL));
 }
 
 bool WaveBlender::RunBatch() {
@@ -156,36 +171,37 @@ bool WaveBlender::RunBatch() {
             DetectCavities(); // Runtime cavity detection
         }
 
-        if (Step == 0) { // Initialize Beta
-            std::vector<REAL> buf(GridSize);
-            for (int cid = 0; cid < GridSize; ++cid) {
-                BetaSolid[cid] = Cell2[cid] > 0;
-                buf[cid] = BetaSolid[cid] ? 1. : 0.;
-            }
-            Beta.Upload(buf.data(), buf.size() * sizeof(REAL));
+        if (Step == 0) { // batch-start solidity (pre point-source reversion, as in the reference)
+            auto *states = static_cast<uint8_t *>(CellState.Cur().RawData()); // no GPU work in flight yet
+            for (int cid = 0; cid < GridSize; ++cid) states[cid] = Cell2[cid] > 0 ? CELL_SOLID : CELL_AIR;
         }
         {
             const profile::Scope scope{"cpu/setup_shaders"};
             SetupShaders();
         }
-        // Cells changing solidity this batch: the per-step beta update set (each batch
-        // ends at tb = 1, so beta is exactly 0 or 1 at batch start).
-        TransitionsHost.clear();
+        // Per-cell blending states for the batch, written into the spare CellState slot
+        // (the in-flight batch reads Cur(), which also holds the previous batch-end
+        // solidity). Cells whose solidity changed transition over the batch.
+        const auto *prev = static_cast<const uint8_t *>(CellState.Cur().RawData());
+        auto *states = static_cast<uint8_t *>(CellState.Other().RawData());
+        HadTransitions = false;
         for (int cid = 0; cid < GridSize; ++cid) {
-            const uint8_t solid = Cell2[cid] > 0;
-            if (solid != BetaSolid[cid]) {
-                TransitionsHost.push_back((cid << 1) | solid);
-                BetaSolid[cid] = solid;
+            const bool solid = Cell2[cid] > 0;
+            if (solid != EndsSolid(prev[cid])) {
+                states[cid] = solid ? CELL_RISING : CELL_FALLING;
+                HadTransitions = true;
+            } else {
+                states[cid] = solid ? CELL_SOLID : CELL_AIR;
             }
         }
-        NBetaTransitions = TransitionsHost.size();
-        if (NBetaTransitions > 0) {
-            BetaTransitions.Flip();
-            BetaTransitions.Cur().Resize(size_t(NBetaTransitions) * sizeof(int));
-            BetaTransitions.Cur().Upload(TransitionsHost.data(), size_t(NBetaTransitions) * sizeof(int));
-        }
-    } else {
-        NBetaTransitions = 0; // geometry unchanged: beta is fully converged
+        CellState.Flip();
+    } else if (HadTransitions) {
+        // Geometry unchanged: last batch's transitioning cells have converged
+        const auto *prev = static_cast<const uint8_t *>(CellState.Cur().RawData());
+        auto *states = static_cast<uint8_t *>(CellState.Other().RawData());
+        for (int cid = 0; cid < GridSize; ++cid) states[cid] = EndsSolid(prev[cid]) ? CELL_SOLID : CELL_AIR;
+        CellState.Flip();
+        HadTransitions = false;
     }
     // 3. Compute shader values at all sampled positions and times.
     // Overlaps with the previous batch's FDTD steps on the GPU: shader kernels encode
@@ -211,6 +227,7 @@ bool WaveBlender::RunBatch() {
     // batch's final velocities (and this batch's prologue kernels, which clear interior
     // velocities first) on the host.
     MetalContext::Get().Sync();
+    PathTuner.RecordDrained(MetalContext::Get().TakeBatchGpuSeconds());
     WritePendingListeners();
     {
         const profile::Scope scope{"cpu/fresh_cell_velocity"};
@@ -514,11 +531,7 @@ void WaveBlender::SetupShaders() {
         base.SetSamplePoints(b, bn);
     } // loop over objects
 
-    // Upload raster and shader map into this batch's double-buffer slots
-    Cell.Flip();
-    Cell.Cur().Resize(GridSize * sizeof(uint8_t));
-    Cell.Cur().Upload(Cell2.data(), GridSize * sizeof(uint8_t));
-
+    // Upload shader map into this batch's double-buffer slots
     NShaderPoints = ShaderMapHost.size();
     MaxNShaderPoints = std::max(MaxNShaderPoints, NShaderPoints);
 
@@ -529,6 +542,45 @@ void WaveBlender::SetupShaders() {
     ShaderData.Flip();
     ShaderData.Cur().Resize(size_t(MaxNShaderPoints) * NShaderSamples * sizeof(REAL));
     ShaderData.Cur().Zero(size_t(NShaderPoints) * NShaderSamples * sizeof(REAL));
+
+    // Boundary-application path for this batch (see KernelParams.h)
+    FoldApply = PathTuner.Choose(NShaderPoints > 0, NRegularShaderPoints != NShaderPoints);
+    if (!FoldApply) return;
+
+    // Per-cell face masks, shader-data row ids, and per-tile flags for the folded
+    // boundary application (layout in KernelParams.h). Row-id planes are read only where
+    // the mask bit is set, so only the mask and tile flags need clearing.
+    const size_t bids_base = SHADER_FACES_BIDS_OFFSET(size_t(GridSize));
+    const size_t tiles_base = SHADER_FACES_TILES_OFFSET(size_t(GridSize));
+    const int ntx = (Params.Nx + FDTD_TGX - 1) / FDTD_TGX;
+    const int nty = (Params.Ny + FDTD_TGY - 1) / FDTD_TGY;
+    const int ntz = (Params.Nz + FDTD_TGZ - 1) / FDTD_TGZ;
+    ShaderFaces.Flip();
+    ShaderFaces.Cur().Resize(tiles_base + size_t(ntx) * nty * ntz);
+    auto *mask = static_cast<uint8_t *>(ShaderFaces.Cur().RawData());
+    std::memset(mask, 0, bids_base);
+    auto *bids = reinterpret_cast<int *>(mask + bids_base);
+    auto *tiles = mask + tiles_base;
+    std::memset(tiles, 0, size_t(ntx) * nty * ntz);
+    const auto mark_tile = [&](int i, int j, int k) { tiles[FDTD_TILE_INDEX(i / FDTD_TGX, j / FDTD_TGY, k / FDTD_TGZ, ntx, nty)] = 1; };
+    for (int bid = 0; bid < NShaderPoints; ++bid) {
+        const int entry = ShaderMapHost[bid];
+        const bool is_force = entry < 0;
+        const int face = is_force ? -entry : entry;
+        const int dir = face % 3, cid = face / 3;
+        const int plane = dir + (is_force ? 3 : 0);
+        mask[cid] |= 1u << plane;
+        bids[plane * size_t(GridSize) + cid] = bid;
+
+        // Flag every tile whose threads read this cell's mask: its own, and the upper
+        // neighbors that read it as their lower halo (shader faces are never at the
+        // outermost grid layer)
+        const int i = cid % Params.Nx, j = (cid / Params.Nx) % Params.Ny, k = (cid / Params.Nx) / Params.Ny;
+        mark_tile(i, j, k);
+        mark_tile(i + 1, j, k);
+        mark_tile(i, j + 1, k);
+        mark_tile(i, j, k + 1);
+    }
 }
 
 void WaveBlender::FreshCellPressure() {
@@ -548,10 +600,10 @@ void WaveBlender::FreshCellPressure() {
     ctx.Dispatch("prepare_fresh_cell", shader_blocks, shader_threads, {&Px, &Py, &Pz, &ShaderData.Cur(), &ShaderMap.Cur()}, &prep_params, sizeof(prep_params));
 
     const FreshCellPressureParams fc_params{Params.Nx, Params.Ny, Params.Nz, Params.Rho * Params.Dx};
-    ctx.Dispatch("fresh_cell_pressure", fdtd_blocks, fdtd_threads, {&P.Cur(), &Px, &Py, &Pz, &Beta}, &fc_params, sizeof(fc_params));
+    ctx.Dispatch("fresh_cell_pressure", fdtd_blocks, fdtd_threads, {&P.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &fc_params, sizeof(fc_params));
 
     const ClearSolidParams cs_params{Params.Nx, Params.Ny, Params.Nz};
-    ctx.Dispatch("clear_solid", fdtd_blocks, fdtd_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &Px, &Py, &Pz, &Beta}, &cs_params, sizeof(cs_params));
+    ctx.Dispatch("clear_solid", fdtd_blocks, fdtd_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &cs_params, sizeof(cs_params));
 }
 
 void WaveBlender::FreshCellVelocity() {
@@ -700,43 +752,77 @@ void WaveBlender::ShaderReInit() {
     MetalContext::Get().Dispatch("shader_reinit", shader_blocks, shader_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &ShaderData.Cur(), &ShaderMap.Cur()}, &params, sizeof(params));
 }
 
+bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces) {
+    constexpr int ProbesPerPath{4};
+
+    SeenForces |= has_forces;
+    const uint32_t key = uint32_t(has_points) | (SeenForces ? 2u : 0u);
+    if (key != Key) {
+        Key = key;
+        Locked = -1;
+        BestSeconds[0] = BestSeconds[1] = std::numeric_limits<double>::max();
+        ProbeCount[0] = ProbeCount[1] = 0;
+        InFlightFold = -1;
+    }
+    if (!has_points) return false; // no boundary application either way
+    if (Locked >= 0) return Locked == 1;
+
+    if (ProbeCount[0] >= ProbesPerPath && ProbeCount[1] >= ProbesPerPath) {
+        Locked = BestSeconds[1] < BestSeconds[0] ? 1 : 0;
+        if (profile::Enabled()) {
+            std::cout << std::format("[apply-path] locked {} (plain {:.1f} ms, folded {:.1f} ms per batch)\n", Locked == 1 ? "folded" : "plain", BestSeconds[0] * 1e3, BestSeconds[1] * 1e3);
+        }
+        return Locked == 1;
+    }
+    return ProbeCount[1] < ProbeCount[0];
+}
+
+void WaveBlender::ApplyPathTuner::MarkInFlight(bool fold) {
+    if (Locked < 0) InFlightFold = fold;
+}
+
+void WaveBlender::ApplyPathTuner::RecordDrained(double gpu_seconds) {
+    if (InFlightFold < 0) return;
+    BestSeconds[InFlightFold] = std::min(BestSeconds[InFlightFold], gpu_seconds);
+    ProbeCount[InFlightFold] += 1;
+    InFlightFold = -1;
+}
+
 // Encodes all timesteps of the batch into one command buffer with a persistent argument
 // table, then commits without waiting — the GPU crunches while the CPU prepares the next
-// batch. The steady-state loop runs one full-grid pass per step (the fused
-// step_velocity_pressure kernel) plus the small apply_shader and update_beta dispatches,
-// book-ended by a step_pressure prologue and a step_velocity tail:
-//   P(0) A(0) | [V(0),P(1)] beta(1) A(1) | ... | [V(N-2),P(N-1)] beta(N-1) A(N-1) | V(N-1)
+// batch. Each step's sequence is [pressure, boundary application, velocity]. With the
+// boundary application folded in and beta derived in-kernel, the loop is one full-grid
+// pass per step (the fused step_velocity_pressure kernel), book-ended by a step_pressure
+// prologue and a step_velocity tail:
+//   P(0) | [V(0),P(1)] | ... | [V(N-2),P(N-1)] | V(N-1)
+// The dispatch computing V(q) gets step q's params (tb, ss, and the listener slot for p(q)).
 void WaveBlender::RunFdtd() {
     const profile::Scope scope{"encode/fdtd"};
     auto &ctx = MetalContext::Get();
 
-    const MTL::Size fdtd_threads{8, 8, 8};
-    const MTL::Size fdtd_blocks{uint32_t(Params.Nx + 7) / 8, uint32_t(Params.Ny + 7) / 8, uint32_t(Params.Nz + 7) / 8};
-    const MTL::Size shader_threads{32, 1, 1};
-
-    // Velocity-blend points and force points dispatch separately, blend first, so a face
-    // claimed by both updates in a defined order (see ApplyShaderRange in KernelParams.h).
-    const ApplyShaderRange shader_ranges[2]{{0, NRegularShaderPoints}, {NRegularShaderPoints, NShaderPoints}};
-    MTL::Size shader_blocks[2];
-    for (int p = 0; p < 2; ++p) shader_blocks[p] = MTL::Size{uint32_t(shader_ranges[p].end - shader_ranges[p].start + 31) / 32, 1, 1};
+    const MTL::Size fdtd_threads{FDTD_TGX, FDTD_TGY, FDTD_TGZ};
+    const MTL::Size fdtd_blocks{uint32_t(Params.Nx + FDTD_TGX - 1) / FDTD_TGX, uint32_t(Params.Ny + FDTD_TGY - 1) / FDTD_TGY, uint32_t(Params.Nz + FDTD_TGZ - 1) / FDTD_TGZ};
 
     auto *pressure_pso = ctx.Pipeline("step_pressure");
-    auto *shader_pso = ctx.Pipeline("apply_shader");
-    auto *fused_pso = ctx.Pipeline("step_velocity_pressure");
-    auto *beta_pso = ctx.Pipeline("update_beta");
-    auto *velocity_pso = ctx.Pipeline("step_velocity");
+    auto *fused_pso = ctx.Pipeline("step_velocity_pressure", FoldApply);
+    auto *velocity_pso = ctx.Pipeline("step_velocity", FoldApply);
+    auto *shader_pso = FoldApply ? nullptr : ctx.Pipeline("apply_shader");
+
+    // Standalone boundary application (plain path): blend range then force range, so a
+    // dual-claimed face updates in a defined order.
+    const MTL::Size shader_threads{32, 1, 1};
+    const ApplyShaderRange shader_ranges[2]{{0, NRegularShaderPoints}, {NRegularShaderPoints, NShaderPoints}};
 
     auto *encoder = ctx.ActiveEncoder();
     const GpuBuffer *const table[]{
-        nullptr, &Px, &Py, &Pz, nullptr, nullptr, nullptr, &Beta, &Cell.Cur(), &PmlNp, &PmlDp, &PmlNv, &PmlDv,
+        nullptr, &Px, &Py, &Pz, nullptr, nullptr, nullptr, &ShaderFaces.Cur(), &CellState.Cur(), &PmlNp, &PmlDp, &PmlNv, &PmlDv,
         &ShaderData.Cur(), &ShaderMap.Cur(), &ListenerCids, &ListenerOut
     };
     for (uint32_t index = 1; index < std::size(table); ++index) {
         if (table[index]) encoder->setBuffer(table[index]->Handle(), 0, index);
     }
-    encoder->setBuffer(BetaTransitions.Cur().Handle(), 0, 20);
 
-    const FdtdBatchParams batch_params{RhoCCDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size()), NBetaTransitions};
+    const FdtdBatchParams batch_params{RhoCCDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size())};
     encoder->setBytes(&batch_params, sizeof(batch_params), FDTD_BATCH_PARAMS_INDEX);
 
     const auto bind_fields = [&] { // in slots 0, 4-6; out slots 21-24
@@ -749,33 +835,33 @@ void WaveBlender::RunFdtd() {
         encoder->setBuffer(Vy.Other().Handle(), 0, 23);
         encoder->setBuffer(Vz.Other().Handle(), 0, 24);
     };
-    // The listener slot is the fused kernel's pre-update pressure sample p(q - 1).
-    const auto set_step_params = [&](int q) {
-        REAL t = (q + 1 == NFdtdSamples) ? 1. : REAL(q + 1) / NFdtdSamples; // normalized blending time (0, 1]
-        const REAL ss = t * (NShaderSamples - 1); // shader sample index (fractional to support interpolation)
-        if (Params.Scheme == BlendScheme::NoBlend) t = (q + 1 == NFdtdSamples) ? 1. : 0.;
-        const FdtdStepParams step_params{t, ss, q - 1};
-        encoder->setBytes(&step_params, sizeof(step_params), FDTD_STEP_PARAMS_INDEX);
-    };
-    const auto apply_shader_dispatches = [&] {
-        if (NShaderPoints == 0) return;
+    // The pending step's boundary application, as standalone dispatches (plain path)
+    const auto apply_dispatches = [&] {
+        if (FoldApply || NShaderPoints == 0) return;
         encoder->setComputePipelineState(shader_pso);
-        for (int p = 0; p < 2; ++p) {
-            if (shader_ranges[p].start == shader_ranges[p].end) continue;
-            encoder->setBytes(&shader_ranges[p], sizeof(shader_ranges[p]), FDTD_APPLY_RANGE_INDEX);
-            encoder->dispatchThreadgroups(shader_blocks[p], shader_threads);
+        for (const auto &range : shader_ranges) {
+            if (range.start == range.end) continue;
+            encoder->setBytes(&range, sizeof(range), FDTD_APPLY_RANGE_INDEX);
+            encoder->dispatchThreadgroups(MTL::Size{uint32_t(range.end - range.start + 31) / 32, 1, 1}, shader_threads);
         }
     };
+    // Step params of step q, consumed by the dispatch that computes V(q).
+    const auto set_step_params = [&](int q) {
+        const REAL t = (q + 1 == NFdtdSamples) ? 1. : REAL(q + 1) / NFdtdSamples; // normalized blending time (0, 1]
+        const REAL ss = t * (NShaderSamples - 1); // shader sample index (fractional to support interpolation)
+        const REAL tb = (Params.Scheme == BlendScheme::NoBlend && q + 1 != NFdtdSamples) ? 0. : t;
+        const FdtdStepParams step_params{tb, ss, q};
+        encoder->setBytes(&step_params, sizeof(step_params), FDTD_STEP_PARAMS_INDEX);
+    };
 
-    // Prologue: P(0) (in-place, with its own per-cell beta update) and A(0)
+    // Prologue: P(0) (in-place, before step 0's boundary application)
     bind_fields();
-    set_step_params(0);
     encoder->setComputePipelineState(pressure_pso);
     encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
-    apply_shader_dispatches();
 
     for (int q = 1; q < NFdtdSamples; ++q) {
-        set_step_params(q);
+        set_step_params(q - 1);
+        apply_dispatches();
 
         encoder->setComputePipelineState(fused_pso);
         encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
@@ -784,20 +870,16 @@ void WaveBlender::RunFdtd() {
         Vy.Flip();
         Vz.Flip();
         bind_fields();
-
-        if (NBetaTransitions > 0) {
-            encoder->setComputePipelineState(beta_pso);
-            encoder->dispatchThreadgroups(MTL::Size{uint32_t(NBetaTransitions + 31) / 32, 1, 1}, shader_threads);
-        }
-        apply_shader_dispatches();
     }
 
     // Tail: V(N-1) (in-place) and the final listener sample p(N-1)
-    set_step_params(NFdtdSamples); // listener slot N-1; tb/ss unused by step_velocity
+    set_step_params(NFdtdSamples - 1);
+    apply_dispatches();
     encoder->setComputePipelineState(velocity_pso);
     encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
 
     Step += NFdtdSamples;
     ctx.Flush();
     ListenerPending = true;
+    if (NShaderPoints > 0) PathTuner.MarkInFlight(FoldApply); // measure this batch at the next sync
 }

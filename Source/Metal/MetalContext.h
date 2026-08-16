@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace MTL {
@@ -63,8 +64,13 @@ public:
     // Flushes pending dispatches and blocks until the GPU is idle. No-op when idle.
     void Sync();
 
-    // The pipeline state for a kernel, compiled on first use.
-    MTL::ComputePipelineState *Pipeline(const char *name);
+    // GPU execution time of the longest command buffer drained since the last call
+    // (a running max, so intermediate syncs during batch prep don't hide it).
+    double TakeBatchGpuSeconds() { return std::exchange(LastBatchSeconds, 0.); }
+
+    // The pipeline state for a kernel, compiled on first use. `fold_apply` selects the
+    // FOLD_APPLY function-constant specialization (see Kernels.metal).
+    MTL::ComputePipelineState *Pipeline(const char *name, bool fold_apply = false);
 
     // The active serial compute encoder, creating a command buffer/encoder if needed.
     // For hot encode loops that bypass Dispatch() and bind buffers persistently.
@@ -80,6 +86,7 @@ private:
     MTL::CommandBuffer *CmdBuf{nullptr};
     MTL::ComputeCommandEncoder *Encoder{nullptr};
     std::vector<MTL::CommandBuffer *> Committed; // committed, not yet waited on (in-order queue: waiting on the last waits on all)
+    double LastBatchSeconds{0.};
     std::unordered_map<std::string, MTL::ComputePipelineState *> Pipelines;
 };
 
@@ -102,6 +109,10 @@ public:
     // Synchronizes the stream, then returns the host-visible pointer. For host reads.
     void *Data() const;
     template<typename T> T *As() const { return static_cast<T *>(Data()); }
+
+    // Host-visible pointer without synchronizing, for scatter writes (see the discipline
+    // note above).
+    void *RawData() const { return Contents(); }
 
     // Host-to-buffer copy without synchronizing (see the discipline note above).
     void Upload(const void *src, size_t bytes, size_t dst_offset_bytes = 0) const;

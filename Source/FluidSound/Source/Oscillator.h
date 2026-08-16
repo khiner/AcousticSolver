@@ -45,18 +45,21 @@ struct Oscillator
      *  [ 2β(0) ... 2β(N) ]]
      */
 
-    /** \brief Returns array of linearly interpolated solve data at specified time */
-    Eigen::Array<T, 6, 1> interp(double time)
+    /** \brief Returns array of linearly interpolated solve data at specified time
+     *  LOCAL PATCH (perf): cursor-explicit static, shared with the factor-precompute
+     *  workers (see BubbleFactorPipeline.h). */
+    static Eigen::Array<T, 6, 1> interpAt(const Oscillator<T>& osc, double time, int& idx)
     {
-        if (time >= solveTimes.back()) { return solveData.col(solveTimes.size() - 1); }
-        else if (time <= solveTimes[0]) { return solveData.col(0); }
+        if (time >= osc.solveTimes.back()) { return osc.solveData.col(osc.solveTimes.size() - 1); }
+        else if (time <= osc.solveTimes[0]) { return osc.solveData.col(0); }
 
-        while (time < solveTimes[_idx]) { _idx--; }
-        while (_idx < solveTimes.size() - 1 && time > solveTimes[_idx + 1]) { _idx++; }
+        while (time < osc.solveTimes[idx]) { idx--; }
+        while (idx < osc.solveTimes.size() - 1 && time > osc.solveTimes[idx + 1]) { idx++; }
 
-        double alpha = (time - solveTimes[_idx]) / (solveTimes[_idx + 1] - solveTimes[_idx]);
-        return (1. - alpha) * solveData.col(_idx) + alpha * solveData.col(_idx + 1);
+        double alpha = (time - osc.solveTimes[idx]) / (osc.solveTimes[idx + 1] - osc.solveTimes[idx]);
+        return (1. - alpha) * osc.solveData.col(idx) + alpha * osc.solveData.col(idx + 1);
     }
+    Eigen::Array<T, 6, 1> interp(double time) { return interpAt(*this, time, _idx); }
 
     /** \brief Returns true if this Oscillator has decayed sufficiently */
     bool is_dead() const { return state.norm() < 1e-10; }

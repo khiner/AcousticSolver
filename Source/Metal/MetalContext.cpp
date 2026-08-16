@@ -9,12 +9,14 @@
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 
+#include "KernelParams.h"
 #include "MetalContext.h"
 #include "Profile.h"
 
@@ -50,17 +52,22 @@ MetalContext::MetalContext() : Device(MTL::CreateSystemDefaultDevice()) {
     if (!Library) throw std::runtime_error(std::format("MSL compilation failed:\n{}", error ? error->localizedDescription()->utf8String() : "unknown error"));
 }
 
-MTL::ComputePipelineState *MetalContext::Pipeline(const char *name) {
-    if (auto it = Pipelines.find(name); it != Pipelines.end()) return it->second;
+MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool fold_apply) {
+    const std::string key = fold_apply ? std::string{name} + "#fold" : std::string{name};
+    if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
 
-    auto *fn = Library->newFunction(NS::String::string(name, NS::UTF8StringEncoding));
+    auto *constants = MTL::FunctionConstantValues::alloc()->init();
+    constants->setConstantValue(&fold_apply, MTL::DataTypeBool, NS::UInteger{FOLD_APPLY_FC_INDEX});
+    NS::Error *fn_error{nullptr};
+    auto *fn = Library->newFunction(NS::String::string(name, NS::UTF8StringEncoding), constants, &fn_error);
+    constants->release();
     if (!fn) throw std::runtime_error(std::format("Kernel not found: {}", name));
 
     NS::Error *error{nullptr};
     auto *pso = Device->newComputePipelineState(fn, &error);
     fn->release();
     if (!pso) throw std::runtime_error(std::format("Pipeline creation failed for {}:\n{}", name, error ? error->localizedDescription()->utf8String() : "unknown error"));
-    Pipelines[name] = pso;
+    Pipelines[key] = pso;
     return pso;
 }
 
@@ -109,6 +116,7 @@ void MetalContext::Sync() {
         const profile::Scope scope{"gpu/wait"};
         Committed.back()->waitUntilCompleted(); // in-order queue: implies all earlier command buffers completed
     }
+    for (const auto *cb : Committed) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
     if (profile::Enabled()) {
         auto &exec = profile::Entries()["gpu/exec"];
         for (const auto *cb : Committed) exec.Seconds += cb->GPUEndTime() - cb->GPUStartTime();

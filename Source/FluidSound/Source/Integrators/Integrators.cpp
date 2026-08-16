@@ -9,6 +9,8 @@
 
 #include "Integrators.h"
 
+#include "Parallel.h" // LOCAL PATCH (perf): bit-exact parallel fan-out helpers
+
 namespace FluidSound {
 
 /** */
@@ -113,50 +115,73 @@ template class Integrator<float>;
 template class Integrator<double>;
 
 
-/** */
+/** LOCAL PATCH (perf, bit-exact): standalone construction shared by the inline path and
+ *  the background precompute workers, with a parallel row fill (each element written
+ *  exactly once, arithmetic unchanged). */
 template <typename T>
-void Coupled_Direct<T>::_constructMass(double time)
+void Coupled_Direct<T>::ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic>& solveData1, const Eigen::Array<T, 6, Eigen::Dynamic>& solveData2,
+    double t1, double t2, double time, int N_coupled, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>& M)
 {
-    double alpha = (time - _t1) / (_t2 - _t1);
+    double alpha = (time - t1) / (t2 - t1);
 
     // Precompute bubble centers and radii
-    _centers.resize(3, _N_total);
-    _centers.row(0) = (1. - alpha) * _solveData1.row(2) + alpha * _solveData2.row(2);  // x
-    _centers.row(1) = (1. - alpha) * _solveData1.row(3) + alpha * _solveData2.row(3);  // y
-    _centers.row(2) = (1. - alpha) * _solveData1.row(4) + alpha * _solveData2.row(4);  // z
+    Eigen::Matrix<T, 3, Eigen::Dynamic, Eigen::RowMajor> centers(3, solveData1.cols());
+    centers.row(0) = (1. - alpha) * solveData1.row(2) + alpha * solveData2.row(2);  // x
+    centers.row(1) = (1. - alpha) * solveData1.row(3) + alpha * solveData2.row(3);  // y
+    centers.row(2) = (1. - alpha) * solveData1.row(4) + alpha * solveData2.row(4);  // z
 
-    _radii = (1. - alpha) * _solveData1.row(0) + alpha * _solveData2.row(0);
+    Eigen::ArrayX<T> radii = (1. - alpha) * solveData1.row(0) + alpha * solveData2.row(0);
 
     // Dense, symmetric mass matrix M
-    _M.resize(_N_coupled, _N_coupled);
-    for (int i = 0; i < _N_coupled; ++i)
+    M.resize(N_coupled, N_coupled);
+    ParallelChunks(N_coupled, 16, [&](size_t begin, size_t end)
     {
-        T r_i = _radii[i];
-        for (int j = i; j < _N_coupled; ++j)
+        for (int i = int(begin); i < int(end); ++i)
         {
-            if (i == j) { _M(i, j) = 1.; } // diagonal entries
-            else {
-                T r_j = _radii[j];
-                T distSq = (_centers.col(j) - _centers.col(i)).squaredNorm();
-                _M(i, j) = 1. / std::sqrt(distSq / (r_i * r_j) + _epsSq);
-                _M(j, i) = _M(i, j);
+            T r_i = radii[i];
+            for (int j = i; j < N_coupled; ++j)
+            {
+                if (i == j) { M(i, j) = 1.; } // diagonal entries
+                else {
+                    T r_j = radii[j];
+                    T distSq = (centers.col(j) - centers.col(i)).squaredNorm();
+                    M(i, j) = 1. / std::sqrt(distSq / (r_i * r_j) + _epsSq);
+                    M(j, i) = M(i, j);
+                }
             }
         }
-    }
+    });
 }
 
-/**  */
+template <typename T>
+void Coupled_Direct<T>::_constructMass(double time, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &M) const
+{
+    ConstructMass(_solveData1, _solveData2, _t1, _t2, time, _N_coupled, M);
+}
+
+/** LOCAL PATCH (perf, bit-exact): takes factors from the precompute pipeline when one is
+ *  installed, otherwise constructs and factors the two independent endpoints
+ *  concurrently. */
 template <typename T>
 void Coupled_Direct<T>::refactor()
 {
     auto mass_start = std::chrono::steady_clock::now();
 
-    _constructMass(_t1);
-    _factor1.compute(_M.topLeftCorner(_N_coupled, _N_coupled));
+    if (FactorProvider && FactorProvider(_t1, _t2, _N_coupled, _factor1, _factor2))
+    {
+        if (_factor1.info() == Eigen::NumericalIssue) { throw std::runtime_error("Non positive definite matrix!"); }
+        if (_factor2.info() == Eigen::NumericalIssue) { throw std::runtime_error("Non positive definite matrix!"); }
+        auto mass_end = std::chrono::steady_clock::now();
+        this->mass_time += mass_end - mass_start;
+        return;
+    }
+    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> M1, M2;
+    ParallelFor(2, 1, [&](size_t which)
+    {
+        if (which == 0) { _constructMass(_t1, M1); _factor1.compute(M1); }
+        else { _constructMass(_t2, M2); _factor2.compute(M2); }
+    });
     if (_factor1.info() == Eigen::NumericalIssue) { throw std::runtime_error("Non positive definite matrix!"); }
-
-    _constructMass(_t2);
-    _factor2.compute(_M.topLeftCorner(_N_coupled, _N_coupled));
     if (_factor2.info() == Eigen::NumericalIssue) { throw std::runtime_error("Non positive definite matrix!"); }
 
     auto mass_end = std::chrono::steady_clock::now();
@@ -176,7 +201,19 @@ Eigen::ArrayX<T> Coupled_Direct<T>::solve(const Eigen::ArrayX<T>& States, double
 
     // solve for y'' | My'' = (F/sqrt(r) - Cy' - Ky) (linearly interpolate M^{-1})
     _RHS = (_Fvals - _Cvals * States.segment(_N_total, _N_total) - _Kvals * States.segment(0, _N_total)) / _radii.sqrt();
-    _RHS.head(_N_coupled) = (1. - alpha) * _factor1.solve(_RHS.head(_N_coupled)) + alpha * _factor2.solve(_RHS.head(_N_coupled));
+    // LOCAL PATCH (perf, bit-exact): the two endpoint triangular solves are independent,
+    // so run them concurrently when the system is large enough to cover the fan-out cost.
+    if (_N_coupled >= 128) {
+        Eigen::Vector<T, Eigen::Dynamic> sol1, sol2;
+        ParallelFor(2, 1, [&](size_t which)
+        {
+            if (which == 0) sol1 = _factor1.solve(_RHS.head(_N_coupled));
+            else sol2 = _factor2.solve(_RHS.head(_N_coupled));
+        });
+        _RHS.head(_N_coupled) = (1. - alpha) * sol1 + alpha * sol2;
+    } else {
+        _RHS.head(_N_coupled) = (1. - alpha) * _factor1.solve(_RHS.head(_N_coupled)) + alpha * _factor2.solve(_RHS.head(_N_coupled));
+    }
 
     _Derivs.segment(0, _N_total) = States.segment(_N_total, _N_total);
     _Derivs.segment(_N_total, _N_total) = _RHS.array() * _radii.sqrt();

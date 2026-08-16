@@ -8,6 +8,7 @@
 #define _FS_INTEGRATORS_H
 
 #include <chrono>
+#include <functional> // LOCAL PATCH (perf): precomputed-factor provider hook
 
 #include "Oscillator.h"
 
@@ -97,17 +98,29 @@ public:
 
     void refactor();
     Eigen::ArrayX<T> solve(const Eigen::ArrayX<T>& States, double time);
-    
+
+    // LOCAL PATCH (perf, bit-exact): optional provider of precomputed endpoint
+    // factorizations (see BubbleFactorPipeline.h). refactor() calls it with
+    // (t1, t2, N_coupled) and computes inline as before when it returns false.
+    std::function<bool(double, double, int,
+        Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>&,
+        Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>&)> FactorProvider;
+
+    /** LOCAL PATCH (perf): standalone mass-matrix construction over packed solve data,
+     *  shared by the inline path and the background precompute workers. */
+    static void ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic>& solveData1, const Eigen::Array<T, 6, Eigen::Dynamic>& solveData2,
+        double t1, double t2, double time, int N_coupled, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>& M);
+
 private:
-    const T _epsSq = 4.;  //!< regularization term
+    static constexpr T _epsSq = 4.;  //!< regularization term
 
-    /** \private constructs mass matrix M */
-    void _constructMass(double time);
+    /** \private constructs mass matrix M
+     *  LOCAL PATCH (perf): out-parameter + const so the two endpoint constructions can
+     *  run concurrently. */
+    void _constructMass(double time, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &M) const;
 
-    Eigen::Matrix<T, 3, Eigen::Dynamic, Eigen::RowMajor> _centers;
     Eigen::ArrayX<T> _radii;
 
-    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> _M;
     Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>> _factor1, _factor2;
     Eigen::Vector<T, Eigen::Dynamic> _RHS;
 

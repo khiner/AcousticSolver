@@ -129,6 +129,67 @@ What changed (all output-equivalent, see Key numerics decisions):
 
 Profiling: `ACOUSTIC_PROFILE=1` prints per-phase wall time and GPU-busy time at exit.
 
+## Performance, round 2 (same outputs, bit-exact vs round 1)
+
+A second optimization pass, validated the same way: every scene's listener output is
+byte-identical to the round-1 build, and the full-suite verdicts/error metrics above are
+unchanged (including CupPhone's 4.66s CUDA-bit-exact prefix).
+
+| Scene | Round 1 | Round 2 | Speedup | vs original port |
+|---|---|---|---|---|
+| PaddleSplash | 359.3s | 96.5s | 3.7× | 4.2× |
+| GlassPour | 26.6s | 15.0s | 1.8× | 2.3× |
+| 2016Pour | 105.9s | 82.6s | 1.3× | 2.3× |
+| CupPhone | 44.0s | 37.4s | 1.2× | 1.5× |
+| FillerUp | 40.8s | 34.8s | 1.2× | 2.6× |
+| LegoDrop | 4.1s | 3.5s | 1.2× | 2.9× |
+| HandShake | 64.4s | 57.5s | 1.1× | 2.2× |
+| Trumpet | 43.8s | 39.7s | 1.1× | 1.9× |
+| TalkFan | 58.5s | 55.7s | 1.1× | 2.3× |
+| SpollingBowl | 14.5s | 14.2s | 1.0× | 4.3× |
+
+Total 762s → 437s (1.7×); 1170s → 437s (2.7×) vs the original straight translation.
+
+What changed:
+
+- **Precomputed bubble mass-matrix factorizations** (`Source/BubbleFactorPipeline.h`).
+  The coupled-bubble integrator re-factorizes two dense Cholesky systems at every bubble
+  event (~32k refactors in GlassPour, avg N≈200) — the dominant cost of every bubble
+  scene. The factor schedule depends only on static oscillator trajectory data and the
+  event times (the one dynamic input to the solver's event bookkeeping affects only the
+  uncoupled list, which the mass matrix excludes), so worker threads replay the
+  bookkeeping and compute the factors ahead of consumption with identical arithmetic.
+  Fetch verifies each interval against the schedule and permanently falls back to inline
+  computation on any mismatch. The two endpoint factorizations (and, for large systems,
+  the two endpoint triangular solves per RK4 stage) also run concurrently — independent
+  computations, unchanged arithmetic.
+- **Byte cell-state stream instead of a float beta field.** Beta is always 0, 1, or the
+  cubic smoothstep of the current blending time, so a 2-bit state (air / solid / rising /
+  falling) plus the step's blend time reproduces it bit-exactly in-kernel. This replaces
+  three GPU inputs (float Beta field, uint8 Cell array, transition list + its per-step
+  update dispatch) with one uint8 state stream — less memory traffic in the bandwidth-
+  bound fused kernel, and two fewer state buffers.
+- **Boundary application folded into the velocity kernels, auto-tuned.** Each step's
+  sequence is [pressure, apply, velocity], so the apply_shader work can fold into the
+  next velocity update's reads via a per-cell face-mask lookup (mask byte + shader-row-id
+  planes + per-threadgroup-tile flags), eliminating the per-step apply dispatches. Folding
+  carries a fixed per-cell kernel overhead that wins on some scenes (FillerUp −10% GPU)
+  and loses on others, so both paths compile from one source via a Metal function
+  constant and `ChooseApplyPath` probes a few batches of each at runtime, locking to the
+  faster (`[apply-path]` line under `ACOUSTIC_PROFILE=1`). Both paths are bit-exact.
+- **Threadgroup shape 32×4×4** for the full-grid step kernels (SIMD-width-aligned rows;
+  ~5% over 8×8×8).
+- **Fast .obj parsing** for the plain triangle meshes read per batch by the bubble scenes
+  (strtod/strtol — the same correctly-rounded conversions the general reader uses), with
+  fallback to libigl for anything outside that subset.
+
+Measured limits (M5 Max), for future reference: the fused FDTD kernel runs within ~15% of
+a pure 9-stream copy floor at these grid sizes (the working set is SLC-resident), halving
+its redundant halo arithmetic changes nothing, and a bit-exact 2-steps-per-pass temporal
+blocking variant was implemented and measured slower (extra cached loads and barriers
+outweigh the halved traffic) — the single fused pass appears to be the right shape for
+this hardware.
+
 ## Rerunning
 
 ```

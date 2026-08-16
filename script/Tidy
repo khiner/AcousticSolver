@@ -11,7 +11,7 @@ set -uo pipefail
 ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
 ProjectRootDir="$(dirname "${ScriptDir}")"
 
-# src/ThirdParty holds no .cpp, so every translation unit under src/ is ours.
+# src/external holds no .cpp, so every translation unit under src/ is ours.
 Targets=("${1:-${ProjectRootDir}/src/.*\.cpp|${ProjectRootDir}/main.cpp}")
 
 Findings="$(

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Re-vendors Eigen into src/ThirdParty/Eigen. To bump it, change Version and Sha256 and
+# Re-vendors Eigen into src/external/Eigen. To bump it, change Version and Sha256 and
 # rerun. script/Build is the check: every kept module is reached through <Eigen/Dense>.
 
 set -euo pipefail
@@ -16,7 +16,7 @@ Modules=(Core LU Cholesky QR SVD Geometry Eigenvalues Householder Jacobi)
 
 ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
 ProjectRootDir="$(dirname "${ScriptDir}")"
-Dest="${ProjectRootDir}/src/ThirdParty/Eigen"
+Dest="${ProjectRootDir}/src/external/Eigen"
 
 Work="$(mktemp -d)"
 trap 'rm -rf "${Work}"' EXIT

@@ -39,7 +39,7 @@ add_executable(${PROJECT_NAME}
 
 target_include_directories(${PROJECT_NAME} PRIVATE src src/FDTD src/Metal)
 target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
-    src/ThirdParty
+    src/external
     ${metalcpp_SOURCE_DIR}
 )
 

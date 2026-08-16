@@ -36,13 +36,17 @@ struct ImpulseSeries {
     }
 
     // The impacts whose support contains `time`, with their impulse vectors scaled by the
-    // half-sine contact profile.
+    // half-sine contact profile. When the records are sorted by timestamp (they are, for
+    // every impulse file we load), only the window that can overlap `time` is scanned.
     void GetForces(double time, std::vector<ImpactRecord> &out) const {
-        if (time > LastTime && time < FirstTime) return; // TODO: refactor (this also appears in the modal shader)
-
         out.clear();
-        for (const auto &record : Records) {
-            if (time >= record.Timestamp && time < record.Timestamp + record.SupportLength) out.push_back(record);
+        auto begin = Records.begin(), end = Records.end();
+        if (SortedByTime) {
+            begin = std::lower_bound(begin, end, time, [max = MaxSupportLength](const ImpactRecord &r, double t) { return r.Timestamp + max <= t; });
+            end = std::upper_bound(begin, end, time, [](double t, const ImpactRecord &r) { return t < r.Timestamp; });
+        }
+        for (auto it = begin; it != end; ++it) {
+            if (time >= it->Timestamp && time < it->Timestamp + it->SupportLength) out.push_back(*it);
         }
         for (auto &r : out) {
             const double j = r.ImpactVector.norm();
@@ -65,23 +69,28 @@ struct ImpulseSeries {
             FirstTime = Records.front().Timestamp;
             LastTime = Records.size() == 1 ? FirstTime + 1e-8 : Records.back().Timestamp;
         }
+
+        MaxSupportLength = 0.;
+        for (const auto &r : Records) MaxSupportLength = std::max(MaxSupportLength, r.SupportLength);
+        SortedByTime = std::is_sorted(Records.begin(), Records.end(), [](const ImpactRecord &a, const ImpactRecord &b) { return a.Timestamp < b.Timestamp; });
     }
 
     std::vector<ImpactRecord> Records;
     double FirstTime{0}, LastTime{0};
+    double MaxSupportLength{0};
+    bool SortedByTime{false};
 };
 
 struct Solver {
     Solver(const std::string &data_prefix, const std::string &mesh_file, const std::string &material_name, double dt);
 
-    // Timesteps the modal oscillators, returning their summed modal acceleration.
-    double Step(double time);
+    // Timesteps the modal oscillators.
+    void Step(double time);
 
     Eigen::MatrixXd EigenVectorsNormal; // Eigenvectors projected onto the vertex normal, N_S x M
     Eigen::MatrixXd Normals;
 
     Eigen::VectorXd QDotCPlus; // Modal velocity
-    Eigen::VectorXd QDDotC; // Modal acceleration
 
     ImpulseSeries Impulses;
 
@@ -109,6 +118,12 @@ private:
     Eigen::VectorXd Curvature;
 
     Eigen::VectorXd QPrev, QCur, QNext, QNextNext; // Displacement at t-1, t, t+1, t+2
+
+    // Per-mode IIR filter coefficients, fixed for the run (computed in the constructor)
+    Eigen::VectorXd CoeffQNew, CoeffQOld, CoeffQ;
+
+    Eigen::VectorXd Force; // Modal-space force scratch, reused across Steps
+    std::vector<ImpactRecord> ActiveScratch; // GetForces output scratch, reused across Steps
 };
 
 } // namespace ModalSound

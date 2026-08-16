@@ -62,28 +62,13 @@ Solver::Solver(const std::string &data_prefix, const std::string &mesh_file, con
     QNextNext.setZero(n_modes);
 
     QDotCPlus.setZero(n_modes);
-    QDDotC.setZero(n_modes);
-}
 
-double Solver::Step(double time) {
-    std::vector<ImpactRecord> active;
-    Impulses.GetForces(time, active);
-
-    // Force in modal space: for each impact within this timestep, add forces to the corresponding modes
-    Eigen::VectorXd force = Eigen::VectorXd::Zero(EigenVectors.cols());
-    for (const auto &impact : active) {
-        const Eigen::Vector3d &j = impact.ImpactVector;
-        const int vertex = impact.AppliedVertex;
-        force += EigenVectors.row(3 * vertex + 0) * j[0] + EigenVectors.row(3 * vertex + 1) * j[1] + EigenVectors.row(3 * vertex + 2) * j[2];
-    }
-
+    // The IIR filter coefficients depend only on the eigenvalues, material, and timestep,
+    // all fixed for the run, so compute them once here instead of every Step.
     const auto material = MaterialByName(MaterialName);
-
-    // Filter coefficients for this time step
-    const int n_modes = EigenVectors.cols();
-    Eigen::VectorXd coeff_q_new = Eigen::VectorXd::Zero(n_modes);
-    Eigen::VectorXd coeff_q_old = Eigen::VectorXd::Zero(n_modes);
-    Eigen::VectorXd coeff_q = Eigen::VectorXd::Zero(n_modes);
+    CoeffQNew.resize(n_modes);
+    CoeffQOld.resize(n_modes);
+    CoeffQ.resize(n_modes);
     for (int i = 0; i < n_modes; ++i) {
         const double omega = std::sqrt(EigenValues[i] / material.Density);
         const double omega_d = material.OmegaD(omega);
@@ -93,22 +78,34 @@ double Solver::Step(double time) {
         const double theta = omega_d * Dt;
         const double gamma = std::asin(xi);
 
-        coeff_q_new[i] = 2. * epsilon * std::cos(theta);
-        coeff_q_old[i] = epsilon * epsilon;
-        coeff_q[i] = 2. / (3. * omega * omega_d) * (epsilon * std::cos(theta + gamma) - epsilon * epsilon * std::cos(2. * theta + gamma)) / material.Density;
+        CoeffQNew[i] = 2. * epsilon * std::cos(theta);
+        CoeffQOld[i] = epsilon * epsilon;
+        CoeffQ[i] = 2. / (3. * omega * omega_d) * (epsilon * std::cos(theta + gamma) - epsilon * epsilon * std::cos(2. * theta + gamma)) / material.Density;
+    }
+
+    Force.setZero(n_modes);
+}
+
+void Solver::Step(double time) {
+    Impulses.GetForces(time, ActiveScratch);
+
+    // Force in modal space: for each impact within this timestep, add forces to the corresponding modes
+    Force.setZero();
+    for (const auto &impact : ActiveScratch) {
+        const Eigen::Vector3d &j = impact.ImpactVector;
+        const int vertex = impact.AppliedVertex;
+        Force += EigenVectors.row(3 * vertex + 0) * j[0] + EigenVectors.row(3 * vertex + 1) * j[1] + EigenVectors.row(3 * vertex + 2) * j[2];
     }
 
     // Step the system
-    QNextNext = coeff_q_new.cwiseProduct(QNext) - coeff_q_old.cwiseProduct(QCur) + coeff_q.cwiseProduct(force);
+    QNextNext = CoeffQNew.cwiseProduct(QNext) - CoeffQOld.cwiseProduct(QCur) + CoeffQ.cwiseProduct(Force);
 
     QDotCPlus = (QNext - QCur) / Dt;
-    QDDotC = (QNext + QPrev - 2. * QCur) / (Dt * Dt);
 
-    QPrev = QCur;
-    QCur = QNext;
-    QNext = QNextNext;
-
-    return QDDotC.sum();
+    // Rotate the displacement history without copying (QNextNext becomes the write scratch)
+    QPrev.swap(QCur);
+    QCur.swap(QNext);
+    QNext.swap(QNextNext);
 }
 
 void Solver::CullNonSurfaceModes() {

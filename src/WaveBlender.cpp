@@ -491,6 +491,7 @@ void WaveBlender::SetupShaders() {
         const uint8_t fill = oid + 1;
         std::vector<Eigen::Vector3<real>> b_vec;
         std::vector<Eigen::Vector3<real>> bn_vec;
+        std::vector<int> key_vec;
         int bid = 0;
         CellBox scan = ObjectBounds[oid]; // the object's cells at either batch endpoint
         scan.Expand(PrevObjectBounds[oid]);
@@ -519,6 +520,7 @@ void WaveBlender::SetupShaders() {
                     FaceStamp[dir][face_cid] = FaceEpoch;
 
                     ShaderMapHost.push_back(3 * face_cid + dir);
+                    key_vec.push_back(3 * face_cid + dir);
                     bn_vec.emplace_back(sign * Eigen::Vector3<real>{dir == 0 ? 1.f : 0.f, dir == 1 ? 1.f : 0.f, dir == 2 ? 1.f : 0.f});
                     b_vec.emplace_back(p.cast<real>() + (0.5 * Params.Dx) * bn_vec[bid]);
                     bid += 1;
@@ -532,7 +534,7 @@ void WaveBlender::SetupShaders() {
             b.row(row) = b_vec[row];
             bn.row(row) = bn_vec[row];
         }
-        base.SetSamplePoints(b, bn);
+        base.SetSamplePoints(b, bn, std::move(key_vec));
     }
 
     NRegularShaderPoints = ShaderMapHost.size();
@@ -547,6 +549,7 @@ void WaveBlender::SetupShaders() {
         const uint8_t fill = oid + 1;
         std::vector<Eigen::Vector3<real>> b_vec;
         std::vector<Eigen::Vector3<real>> bn_vec;
+        std::vector<int> key_vec;
         int bid = 0;
         ForEachCell(ObjectBounds[oid], Params.Nx, Params.Ny, [&](int cid, int i, int j, int k) {
             if (Cell2[cid] != fill) return;
@@ -567,6 +570,7 @@ void WaveBlender::SetupShaders() {
                 FaceStamp[dir][face_cid] = FaceEpoch;
 
                 ShaderMapHost.push_back(-3 * face_cid - dir);
+                key_vec.push_back(-3 * face_cid - dir);
                 bn_vec.emplace_back(sign * Eigen::Vector3<real>{dir == 0 ? 1.f : 0.f, dir == 1 ? 1.f : 0.f, dir == 2 ? 1.f : 0.f});
                 b_vec.emplace_back(p.cast<real>() + (0.5 * Params.Dx) * bn_vec[bid]);
                 bid += 1;
@@ -579,7 +583,7 @@ void WaveBlender::SetupShaders() {
             b.row(row) = b_vec[row];
             bn.row(row) = bn_vec[row];
         }
-        base.SetSamplePoints(b, bn);
+        base.SetSamplePoints(b, bn, std::move(key_vec));
     }
 
     // Upload shader map into this batch's double-buffer slots

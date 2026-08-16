@@ -3,6 +3,10 @@
 // Axis-aligned bounding box hierarchy over a triangle mesh, for closest-point queries.
 // The split rule (median barycenter rank along the box's longest axis) and the child-visit
 // order mirror the reference implementation, so queries resolve to the triangle it picks.
+//
+// Layout is traversal-friendly: an interior node stores both children's boxes (so a visit
+// decision touches one node), and leaf triangle vertices are copied inline at Init so a
+// triangle test reads one contiguous record instead of gathering rows of the mesh.
 
 #include <Eigen/Core>
 
@@ -15,9 +19,10 @@ template<typename Scalar> struct AabbTree {
     using Vertices = Eigen::MatrixX<Scalar>;
     using RowVector3 = Eigen::Matrix<Scalar, 1, 3>;
 
-    // Queries must pass the same mesh this was built over.
     void Init(const Vertices &v, const Eigen::MatrixXi &f) {
         Nodes.clear();
+        Leaves.clear();
+        Root = -1;
         if (v.rows() == 0 || f.rows() == 0) return;
 
         // Each triangle's rank among the barycenters along each axis. Splitting on rank
@@ -36,34 +41,42 @@ template<typename Scalar> struct AabbTree {
 
         std::vector<int> elements(f.rows());
         std::iota(elements.begin(), elements.end(), 0);
-        Nodes.reserve(2 * f.rows());
-        Build(v, f, ranks, elements);
+        Nodes.reserve(f.rows());
+        Leaves.reserve(f.rows());
+        Box root_box;
+        Root = Build(v, f, ranks, elements, root_box);
     }
 
     // Index of the triangle closest to `p`, and the closest point on it.
-    void ClosestPoint(const Vertices &v, const Eigen::MatrixXi &f, const RowVector3 &p, int &i_out, RowVector3 &c_out) const {
+    void ClosestPoint(const RowVector3 &p, int &i_out, RowVector3 &c_out) const {
         i_out = -1;
         c_out.setZero();
-        if (Nodes.empty()) return;
+        if (Leaves.empty()) return;
 
         Scalar sqr_d = std::numeric_limits<Scalar>::infinity();
-        Search(0, v, f, p, sqr_d, i_out, c_out);
+        Visit(Root, p, sqr_d, i_out, c_out);
     }
 
 private:
-    struct Node {
+    struct Box {
         Scalar Min[3], Max[3];
-        int Left{-1}, Right{-1};
-        int Primitive{-1}; // triangle index, -1 for interior nodes
+    };
+    // Child references: a non-negative ref indexes Nodes, a negative ref is ~index into Leaves.
+    struct Node {
+        Box LBox, RBox;
+        int LRef, RRef;
+    };
+    struct Leaf {
+        RowVector3 A, B, C; // triangle vertices, copied at Init
+        int Triangle; // original triangle index
     };
 
-    std::vector<Node> Nodes; // Nodes[0] is the root
+    int Root{-1};
+    std::vector<Node> Nodes;
+    std::vector<Leaf> Leaves;
 
-    // Returns the new node's index.
-    int Build(const Vertices &v, const Eigen::MatrixXi &f, const Eigen::MatrixXi &ranks, const std::vector<int> &elements) {
-        const int node = int(Nodes.size());
-        Nodes.emplace_back();
-
+    // Returns the new child's ref and writes its bounding box (over `elements`) to `box`.
+    int Build(const Vertices &v, const Eigen::MatrixXi &f, const Eigen::MatrixXi &ranks, const std::vector<int> &elements, Box &box) {
         Scalar lo[3], hi[3];
         for (int d = 0; d < 3; ++d) {
             lo[d] = std::numeric_limits<Scalar>::max();
@@ -78,12 +91,13 @@ private:
                 }
             }
         }
-        std::copy_n(lo, 3, Nodes[node].Min);
-        std::copy_n(hi, 3, Nodes[node].Max);
+        std::copy_n(lo, 3, box.Min);
+        std::copy_n(hi, 3, box.Max);
 
         if (elements.size() == 1) {
-            Nodes[node].Primitive = elements[0];
-            return node;
+            const int e = elements[0];
+            Leaves.push_back({v.row(f(e, 0)), v.row(f(e, 1)), v.row(f(e, 2)), e});
+            return ~int(Leaves.size() - 1);
         }
 
         int axis = 0;
@@ -103,62 +117,67 @@ private:
         right.reserve(elements.size() / 2);
         for (size_t i = 0; i < elements.size(); ++i) (keys[i] <= median ? left : right).push_back(elements[i]);
 
-        const int l = Build(v, f, ranks, left);
-        const int r = Build(v, f, ranks, right);
-        Nodes[node].Left = l;
-        Nodes[node].Right = r;
+        const int node = int(Nodes.size());
+        Nodes.emplace_back();
+        Box l_box, r_box;
+        const int l = Build(v, f, ranks, left, l_box);
+        const int r = Build(v, f, ranks, right, r_box);
+        Nodes[node] = {l_box, r_box, l, r};
         return node;
     }
 
-    void Search(int node, const Vertices &v, const Eigen::MatrixXi &f, const RowVector3 &p, Scalar &sqr_d, int &i, RowVector3 &c) const {
-        const Node &n = Nodes[node];
-        if (n.Primitive >= 0) {
-            const RowVector3 candidate = ClosestPointOnTriangle(p, v.row(f(n.Primitive, 0)), v.row(f(n.Primitive, 1)), v.row(f(n.Primitive, 2)));
+    void Visit(int ref, const RowVector3 &p, Scalar &sqr_d, int &i, RowVector3 &c) const {
+        if (ref < 0) {
+            const Leaf &leaf = Leaves[~ref];
+            const RowVector3 candidate = ClosestPointOnTriangle(p, leaf.A, leaf.B, leaf.C);
             const Scalar d = (p - candidate).squaredNorm();
             if (d < sqr_d) {
                 sqr_d = d;
-                i = n.Primitive;
+                i = leaf.Triangle;
                 c = candidate;
             }
             return;
         }
         // Descend into any child whose box contains the query point, then into the
         // remaining ones nearest-first, skipping those that cannot beat the current best.
+        const Node &n = Nodes[ref];
         bool looked_left = false, looked_right = false;
-        if (Contains(Nodes[n.Left], p)) {
-            Search(n.Left, v, f, p, sqr_d, i, c);
+        if (Contains(n.LBox, p)) {
+            Visit(n.LRef, p, sqr_d, i, c);
             looked_left = true;
         }
-        if (Contains(Nodes[n.Right], p)) {
-            Search(n.Right, v, f, p, sqr_d, i, c);
+        if (Contains(n.RBox, p)) {
+            Visit(n.RRef, p, sqr_d, i, c);
             looked_right = true;
         }
-        const Scalar left_d = ExteriorSquaredDistance(Nodes[n.Left], p);
-        const Scalar right_d = ExteriorSquaredDistance(Nodes[n.Right], p);
+        if (looked_left && looked_right) return;
+
+        const Scalar left_d = ExteriorSquaredDistance(n.LBox, p);
+        const Scalar right_d = ExteriorSquaredDistance(n.RBox, p);
         if (left_d < right_d) {
-            if (!looked_left && left_d < sqr_d) Search(n.Left, v, f, p, sqr_d, i, c);
-            if (!looked_right && right_d < sqr_d) Search(n.Right, v, f, p, sqr_d, i, c);
+            if (!looked_left && left_d < sqr_d) Visit(n.LRef, p, sqr_d, i, c);
+            if (!looked_right && right_d < sqr_d) Visit(n.RRef, p, sqr_d, i, c);
         } else {
-            if (!looked_right && right_d < sqr_d) Search(n.Right, v, f, p, sqr_d, i, c);
-            if (!looked_left && left_d < sqr_d) Search(n.Left, v, f, p, sqr_d, i, c);
+            if (!looked_right && right_d < sqr_d) Visit(n.RRef, p, sqr_d, i, c);
+            if (!looked_left && left_d < sqr_d) Visit(n.LRef, p, sqr_d, i, c);
         }
     }
 
-    static bool Contains(const Node &n, const RowVector3 &p) {
+    static bool Contains(const Box &b, const RowVector3 &p) {
         for (int d = 0; d < 3; ++d) {
-            if (p[d] < n.Min[d] || p[d] > n.Max[d]) return false;
+            if (p[d] < b.Min[d] || p[d] > b.Max[d]) return false;
         }
         return true;
     }
 
-    static Scalar ExteriorSquaredDistance(const Node &n, const RowVector3 &p) {
+    static Scalar ExteriorSquaredDistance(const Box &b, const RowVector3 &p) {
         Scalar sqr_d{0};
         for (int d = 0; d < 3; ++d) {
-            if (n.Min[d] > p[d]) {
-                const Scalar aux = n.Min[d] - p[d];
+            if (b.Min[d] > p[d]) {
+                const Scalar aux = b.Min[d] - p[d];
                 sqr_d += aux * aux;
-            } else if (p[d] > n.Max[d]) {
-                const Scalar aux = p[d] - n.Max[d];
+            } else if (p[d] > b.Max[d]) {
+                const Scalar aux = p[d] - b.Max[d];
                 sqr_d += aux * aux;
             }
         }

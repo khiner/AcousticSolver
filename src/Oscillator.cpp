@@ -29,48 +29,45 @@ std::uniform_real_distribution<double> Frac{0.4, 0.8};
 } // namespace
 
 // Eq. 14 from [Langlois et al. 2016]
-template<typename T> std::pair<T, T> Oscillator<T>::CzerskiJetForcing(T radius) {
-    const T eta = 0.95; // TODO
+std::pair<double, double> Oscillator::CzerskiJetForcing(double radius) {
+    const double eta = 0.95; // TODO
 
-    const T cutoff = std::min(MaxCutoff, 0.5 / (3. / radius)); // 1/2 minnaert period
+    const double cutoff = std::min(MaxCutoff, 0.5 / (3. / radius)); // 1/2 minnaert period
 
-    const T pressure_in0 = (Atm + 2. * Sigma / radius);
-    const T weight = -9. * Gamma * Sigma * eta * pressure_in0 * std::sqrt(1. + eta * eta) / (4. * RhoWater * radius * radius * radius);
+    const double pressure_in0 = (Atm + 2. * Sigma / radius);
+    const double weight = -9. * Gamma * Sigma * eta * pressure_in0 * std::sqrt(1. + eta * eta) / (4. * RhoWater * radius * radius * radius);
 
-    const T mass = (RhoWater / (4. * std::numbers::pi * radius));
+    const double mass = (RhoWater / (4. * std::numbers::pi * radius));
 
     return {cutoff, weight / mass};
 }
 
 // Eq. 15 from [Langlois et al. 2016]
-template<typename T> std::pair<T, T> Oscillator<T>::MergeForcing(T radius, T r1, T r2) {
-    const T frac = Frac(ForcingRnd);
-    const T factor = std::pow(2. * Sigma * r1 * r2 / (RhoWater * (r1 + r2)), 0.25);
+std::pair<double, double> Oscillator::MergeForcing(double radius, double r1, double r2) {
+    const double frac = Frac(ForcingRnd);
+    const double factor = std::pow(2. * Sigma * r1 * r2 / (RhoWater * (r1 + r2)), 0.25);
 
-    T cutoff = std::min(MaxCutoff, 0.5 / (3. / radius)); // 1/2 minnaert period
-    const T tmp = std::pow(frac * std::min(r1, r2) / 2. / factor, 2); // TODO: cleanup
+    double cutoff = std::min(MaxCutoff, 0.5 / (3. / radius)); // 1/2 minnaert period
+    const double tmp = std::pow(frac * std::min(r1, r2) / 2. / factor, 2); // TODO: cleanup
     cutoff = std::min(cutoff, tmp);
 
-    const T pressure_in0 = (Atm + 2. * Sigma / radius);
-    const T weight = 6. * Sigma * Gamma * pressure_in0 / (RhoWater * radius * radius * radius);
+    const double pressure_in0 = (Atm + 2. * Sigma / radius);
+    const double weight = 6. * Sigma * Gamma * pressure_in0 / (RhoWater * radius * radius * radius);
 
-    const T mass = (RhoWater / (4. * std::numbers::pi * radius));
+    const double mass = (RhoWater / (4. * std::numbers::pi * radius));
 
     return {cutoff, weight / mass};
 }
 
-template<typename T> T Oscillator<T>::CalcBeta(T radius, T w0) {
-    const T dr = w0 * radius / Cf;
-    const T dvis = 4 * Mu / (RhoWater * w0 * radius * radius);
-    const T phi = 16. * GTh * G / (9 * (Gamma - 1) * (Gamma - 1) * w0 / 2. / std::numbers::pi);
-    const T dth = 2 * (std::sqrt(phi - 3) - (3 * Gamma - 1) / (3 * (Gamma - 1))) / (phi - 4);
+double Oscillator::CalcBeta(double radius, double w0) {
+    const double dr = w0 * radius / Cf;
+    const double dvis = 4 * Mu / (RhoWater * w0 * radius * radius);
+    const double phi = 16. * GTh * G / (9 * (Gamma - 1) * (Gamma - 1) * w0 / 2. / std::numbers::pi);
+    const double dth = 2 * (std::sqrt(phi - 3) - (3 * Gamma - 1) / (3 * (Gamma - 1))) / (phi - 4);
 
-    const T dtotal = dr + dvis + dth;
+    const double dtotal = dr + dvis + dth;
 
     return w0 * dtotal / std::sqrt(dtotal * dtotal + 4);
 }
-
-template struct Oscillator<float>;
-template struct Oscillator<double>;
 
 } // namespace FluidSound

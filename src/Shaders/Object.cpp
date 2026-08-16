@@ -4,6 +4,7 @@
 #include "Shaders.h"
 
 #include "Parallel.h"
+#include "Profile.h"
 
 #include <sstream>
 
@@ -18,10 +19,11 @@ Eigen::RowVector3<real> BarycentricWeights(const Eigen::RowVector3<real> &p, con
 }
 } // namespace
 
-void ObjectBase::SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn) {
+void ObjectBase::SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn, std::vector<int> &&keys) {
     NPoints = b.rows();
     B = b;
     BN = bn;
+    SampleKeys = std::move(keys);
 
     GpuB.Resize(B.size() * sizeof(real));
     GpuBN.Resize(BN.size() * sizeof(real));
@@ -71,20 +73,21 @@ void ObjectBase::ReadAnimation() {
 
 void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &v) const {
     i_out.resize(b.rows());
-    ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
+    ParallelChunks(b.rows(), 32, [&](size_t begin, size_t end) {
         Eigen::RowVector3<real> closest;
-        for (size_t r = begin; r < end; ++r) Tree.ClosestPoint(v, F, b.row(r), i_out[r], closest);
+        for (size_t r = begin; r < end; ++r) Tree.ClosestPoint(b.row(r), i_out[r], closest);
     });
 }
 
 void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<real> &w_out, const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &v) const {
+    const profile::Scope scope{"cpu/closest_point"};
     i_out.resize(b.rows());
     w_out.resize(b.rows(), 3);
-    ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
+    ParallelChunks(b.rows(), 32, [&](size_t begin, size_t end) {
         Eigen::RowVector3<real> closest;
         for (size_t r = begin; r < end; ++r) {
             int &index = i_out[r];
-            Tree.ClosestPoint(v, F, b.row(r), index, closest);
+            Tree.ClosestPoint(b.row(r), index, closest);
             w_out.row(r) = BarycentricWeights(closest, v.row(F(index, 0)), v.row(F(index, 1)), v.row(F(index, 2)));
         }
     });

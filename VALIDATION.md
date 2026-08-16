@@ -320,6 +320,70 @@ kernel's memory-traffic floor, PaddleSplash at the three-way AMX bandwidth equil
 (worker inversions, worker updates, main-thread GEMV), and SpollingBowl/LegoDrop at the
 vendored modal ODE.
 
+## Performance, round 5 (2026-08-16)
+
+A fifth pass, opening up the modal ODE path that round 4 had treated as a fixed floor
+(all `src/` solver code is ours to change — only output equivalence constrains). Every
+change is **bit-exact**: listener outputs are byte-identical to the round-4 build on all
+validated scenes (modal, bubble, speaker, point, and density subsets checked directly),
+and the full golden suite reproduces every verdict and error metric above to all
+displayed digits.
+
+| Scene | Round 3/4 | Round 5 | Speedup | Notes |
+|---|---|---|---|---|
+| SpollingBowl | 13.6s | 8.9s (7.2s rested) | 1.5× | was modal-CPU-bound, now GPU-bound |
+| LegoDrop | 3.5s | 3.4s (3.0s rested) | 1.0× | GPU-bound throughout |
+| all others | — | — | 1.0× | within back-to-back thermal noise |
+
+What changed:
+
+1. **Modal solver hoisting** (`src/ModalSound.cpp`). `Step` recomputed the per-mode IIR
+   filter coefficients — a sqrt/exp/cos/asin chain per mode — every audio step (120k
+   steps × 173 modes for SpollingBowl), though they depend only on the eigenvalues,
+   material, and timestep. They now compute once in the constructor. The per-step
+   impulse query scans a binary-searched timestamp window instead of every record, the
+   displacement history rotates by pointer swap, and the per-step modal acceleration
+   vector (whose only use was an ignored return value) is gone.
+2. **Mode-to-boundary row reuse** (`src/Shaders/ModalShader.cpp`). A batch's
+   mode-to-boundary matrix at batch start is evaluated at exactly the pose of the
+   previous batch's end matrix (nothing advances the animation in between), and the
+   boundary point set overlaps heavily between adjacent rasterizations. Rows are keyed
+   by grid-face identity (`SampleKeys`, carried from `SetupShaders`) and reused only
+   when the rest-frame query point and boundary normal are *bit-identical* to the
+   snapshot row — the copied row is a pure function of those inputs, so no assumptions
+   about expression-level rounding are needed.
+3. **Data-oriented AABB tree** (`src/AabbTree.h`). Interior nodes store both children's
+   boxes (one node read per visit decision), leaf triangle vertices are inlined at
+   `Init` (no vertex-index gathers into a column-major mesh), and the child distance
+   tests are skipped when both children were already visited. Traversal order and all
+   arithmetic are unchanged, so query results — including tie resolution — are
+   identical. Closest-point chunking is also finer (grain 32), balancing the query load
+   across all cores.
+4. **FluidSound de-templatized and de-virtualized** (style, identical codegen for the
+   used paths): the float instantiations were dead, only the coupled scheme was ever
+   constructed, and `Integrator`/`CoupledDirect`/`Uncoupled` collapse into one concrete
+   `CoupledDirect` value member — no virtual dispatch, no `dynamic_cast`, and no
+   inheritance anywhere in `src/` outside `src/external/`.
+
+Measured and rejected this round:
+- **Warm-start seeding of closest-point queries** (pruning bound from the previous
+  answer's triangle, one ulp above): provably reaches the first minimal triangle, but
+  tie resolution can still flip — the *computed* candidate point can round to just
+  outside its box on the query-facing side, so a box holding the reference tie-winner
+  prunes against the seeded bound. Confirmed by a SpollingBowl output diff, and not
+  faster anyway (on-surface queries reach a ~0 bound after the first descent).
+- **`dpotrf`+`dtrsm`×2 and `dpotrf`+`dtrtri`+`dtrmm` as `dpotri` replacements**: both
+  slower on Accelerate at N=958 and N=1400, solo and under the pipeline's 4-way worker
+  concurrency (958, 4 threads: 2.46 ms vs 5.00 ms vs 3.55 ms). The round-3 inverse
+  pipeline is optimal, and one fresh inversion per distinct event time is the
+  algorithmic floor — PaddleSplash's AMX equilibrium stands.
+
+After this round SpollingBowl joins the GPU-bound scenes (64³ at ~20 µs/step: ~8 µs
+stream traffic, PML split-field extra over the ~2/3 of a 64³ grid inside the PML, and
+~5 µs dispatch overhead). The remaining measured slack on GPU-bound scenes is
+0.3–0.7s/scene of per-batch sync-window CPU (FDTD encode, fresh-cell solve, listener
+writes) — recoverable in principle by encoding before the sync and committing after.
+
 ## Rerunning
 
 ```

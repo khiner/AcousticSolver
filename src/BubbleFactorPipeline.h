@@ -34,10 +34,10 @@
 #include <vector>
 
 struct BubbleFactorPipeline {
-    BubbleFactorPipeline(FluidSound::Solver<double> &solver, double dt, double ts)
+    BubbleFactorPipeline(FluidSound::Solver &solver, double dt, double ts)
         : Oscillators(&solver.Oscillators), Events(&solver.EventTimes),
-          Integ(dynamic_cast<Integrator *>(solver.Integ.get())), Dt(dt), Ts(ts) {
-        if (!Integ || Events->size() < 2) return;
+          Integ(&solver.Integ), Dt(dt), Ts(ts) {
+        if (Events->size() < 2) return;
 
         Integ->InverseProvider = [this](double t1, double t2, int n, Eigen::MatrixXd &i1, Eigen::MatrixXd &i2) { return Fetch(t1, t2, n, i1, i2); };
         // A handful of concurrent LAPACK calls saturate the matrix units' aggregate
@@ -49,7 +49,7 @@ struct BubbleFactorPipeline {
     }
 
     ~BubbleFactorPipeline() {
-        if (Integ) Integ->InverseProvider = nullptr;
+        Integ->InverseProvider = nullptr;
         {
             const std::scoped_lock lock{Mutex};
             Stop = true;
@@ -62,8 +62,8 @@ struct BubbleFactorPipeline {
     }
 
 private:
-    using Osc = FluidSound::Oscillator<double>;
-    using Integrator = FluidSound::CoupledDirect<double>;
+    using Osc = FluidSound::Oscillator;
+    using Integrator = FluidSound::CoupledDirect;
 
     struct Interval {
         double T1, T2;

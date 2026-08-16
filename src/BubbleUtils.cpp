@@ -11,14 +11,14 @@ namespace FluidSound {
 
 namespace {
 // Returns false at end of file.
-template<typename T> bool ParseBubble(Bubble<T> &bub, std::ifstream &in) {
+bool ParseBubble(Bubble &bub, std::ifstream &in) {
     std::string line;
     std::istringstream is;
 
     int id;
     double time;
-    T freq_hz, x, y, z;
-    T pressure = 101450.; // Default for a line that omits it
+    double freq_hz, x, y, z;
+    double pressure = 101450.; // Default for a line that omits it
 
     // Line 1: 'Bub <unique bubble ID> <radius>'
     std::getline(in, line);
@@ -76,17 +76,17 @@ template<typename T> bool ParseBubble(Bubble<T> &bub, std::ifstream &in) {
 }
 } // namespace
 
-template<typename T> void LoadBubbleFile(std::map<int, Bubble<T>> &out, const std::string &filename) {
+void LoadBubbleFile(std::map<int, Bubble> &out, const std::string &filename) {
     out.clear();
     std::ifstream in{filename};
     while (in.good()) {
-        Bubble<T> bub;
+        Bubble bub;
         if (ParseBubble(bub, in)) out.insert({bub.Id, std::move(bub)});
     }
 }
 
-template<typename T> int LargestBubbleId(const std::vector<int> &ids, const std::map<int, Bubble<T>> &bubbles) {
-    T max_radius = 0.;
+int LargestBubbleId(const std::vector<int> &ids, const std::map<int, Bubble> &bubbles) {
+    double max_radius = 0.;
     int max_id = 0;
     for (const int id : ids) {
         if (bubbles.at(id).Radius > max_radius) {
@@ -96,10 +96,5 @@ template<typename T> int LargestBubbleId(const std::vector<int> &ids, const std:
     }
     return max_id;
 }
-
-template void LoadBubbleFile<float>(std::map<int, Bubble<float>> &, const std::string &);
-template void LoadBubbleFile<double>(std::map<int, Bubble<double>> &, const std::string &);
-template int LargestBubbleId<float>(const std::vector<int> &, const std::map<int, Bubble<float>> &);
-template int LargestBubbleId<double>(const std::vector<int> &, const std::map<int, Bubble<double>> &);
 
 } // namespace FluidSound

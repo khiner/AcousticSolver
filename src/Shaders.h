@@ -58,6 +58,9 @@ struct ObjectBase {
     // B and BN are the set of all boundary positions and corresponding boundary normals
     // to compute shader samples at. See SetSamplePoints().
     Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> B, BN;
+    // Per-row grid-face identity for B/BN (±(3 * face_cid + dir), the ShaderMap encoding),
+    // so shaders can recognize the same boundary face across batches.
+    std::vector<int> SampleKeys;
     GpuBuffer GpuB, GpuBN;
 
     // ----- Animation -----
@@ -68,8 +71,9 @@ struct ObjectBase {
 
     void ReadAnimation();
 
-    // Sets this batch's (NPoints, 3) boundary sample points and their normals.
-    void SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn);
+    // Sets this batch's (NPoints, 3) boundary sample points, their normals, and their
+    // grid-face keys.
+    void SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn, std::vector<int> &&keys);
 
     // ----- Closest point query (must be called after Tree.Init()) -----
     AabbTree<real> Tree;
@@ -141,7 +145,7 @@ struct Occluder {
 // Bubble-based water sound shader.
 struct Bubbles {
     Bubbles(int blend_rate, int shader_srate, double ts, const std::string &bub_file, std::string fluid_mesh_dir, real dx = 0.)
-        : Obj(ShaderClass::Bubbles, true, blend_rate, shader_srate, ts), Solver(bub_file, 1. / shader_srate, 1, ts),
+        : Obj(ShaderClass::Bubbles, true, blend_rate, shader_srate, ts), Solver(bub_file, 1. / shader_srate, ts),
           FactorPipeline(std::make_unique<BubbleFactorPipeline>(Solver, 1. / shader_srate, ts)), Dx(dx), FluidMeshDir(std::move(fluid_mesh_dir)) {
         ReadFluidMesh();
     }
@@ -150,7 +154,7 @@ struct Bubbles {
     ObjectBase Obj;
 
 private:
-    FluidSound::Solver<double> Solver;
+    FluidSound::Solver Solver;
     std::unique_ptr<BubbleFactorPipeline> FactorPipeline; // precomputes mass-matrix factorizations (declared after Solver: destroyed first)
     real Dx; // FDTD cell size (for flux normalization)
 
@@ -180,6 +184,12 @@ struct Modal {
         Obj.V2 = Obj.V0;
         Obj.Tree.Init(Obj.V0, Obj.F);
 
+        // Row-major single-precision copies of the solver's per-vertex data, so the
+        // per-boundary-point accumulation in SetModeToBoundary reads contiguous rows
+        // without converting from double on every use.
+        EvnReal = Solver.EigenVectorsNormal.cast<real>();
+        NormalsReal = Solver.Normals.cast<real>();
+
         if (!anim_file.empty()) {
             Obj.AnimFile.open(anim_file);
             Obj.ReadAnimation();
@@ -193,7 +203,22 @@ private:
     ModalSound::Solver Solver;
     Eigen::Vector3d AccelSum{Eigen::Vector3d::Zero()};
 
-    void SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary) const;
+    // Pre-cast copies of Solver.EigenVectorsNormal and Solver.Normals (see constructor)
+    Eigen::Matrix<real, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> EvnReal;
+    Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> NormalsReal;
+
+    // Computes the (NPoints, NModes) mode-to-boundary transfer matrix at the current
+    // animation pose. A batch's ModeToBoundary1 is evaluated at exactly the pose of the
+    // previous batch's ModeToBoundary2, so with reuse_previous set, rows whose rest-frame
+    // query point and normal bit-match a snapshot row are copied from ModeToBoundary2.
+    // Without it, every row is computed fresh and the inputs are snapshotted.
+    void SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse_previous);
+
+    // The reuse snapshot: rest-frame query points, normals, and face keys of the last
+    // populating call, plus a direct-indexed map from face key to snapshot row.
+    Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> PrevQ, PrevBN;
+    std::vector<int> PrevKeys;
+    std::vector<int32_t> KeyToRow;
 
     // --- Host (CPU) ---
     Eigen::MatrixX<real> ModeToBoundary1, ModeToBoundary2;

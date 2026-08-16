@@ -16,9 +16,9 @@ enum class EventType {
     Collapse,
 };
 
-template<typename T> struct Bubble {
+struct Bubble {
     int Id{-1};
-    T Radius{0}; // Effective radius
+    double Radius{0}; // Effective radius
 
     double StartTime{-1};
     EventType StartType{}; // Entrain, merge, or split
@@ -30,11 +30,11 @@ template<typename T> struct Bubble {
 
     // Solve data (the bubble's own start and end times are not among these)
     std::vector<double> SolveTimes;
-    std::vector<T> W0, X, Y, Z;
+    std::vector<double> W0, X, Y, Z;
 };
 
-template<typename T> void LoadBubbleFile(std::map<int, Bubble<T>> &out, const std::string &filename);
+void LoadBubbleFile(std::map<int, Bubble> &out, const std::string &filename);
 
-template<typename T> int LargestBubbleId(const std::vector<int> &ids, const std::map<int, Bubble<T>> &bubbles);
+int LargestBubbleId(const std::vector<int> &ids, const std::map<int, Bubble> &bubbles);
 
 } // namespace FluidSound

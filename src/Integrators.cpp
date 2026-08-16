@@ -16,25 +16,25 @@
 
 namespace FluidSound {
 
-template<typename T> void Integrator<T>::Step(double time) {
-    const Eigen::ArrayX<T> &k1 = Solve(States, time);
+void CoupledDirect::Step(double time) {
+    const Eigen::ArrayXd &k1 = Solve(States, time);
     Acc = k1;
     Y = States + Dt / 2. * k1;
-    const Eigen::ArrayX<T> &k2 = Solve(Y, time + Dt / 2.);
+    const Eigen::ArrayXd &k2 = Solve(Y, time + Dt / 2.);
     Acc += 2. * k2;
     Y = States + Dt / 2. * k2;
-    const Eigen::ArrayX<T> &k3 = Solve(Y, time + Dt / 2.);
+    const Eigen::ArrayXd &k3 = Solve(Y, time + Dt / 2.);
     Acc += 2. * k3;
     Y = States + Dt * k3;
-    const Eigen::ArrayX<T> &k4 = Solve(Y, time + Dt);
+    const Eigen::ArrayXd &k4 = Solve(Y, time + Dt);
     Acc += k4;
 
     Derivs = Acc / 6.;
     States += Dt * Derivs;
 }
 
-template<typename T> void Integrator<T>::UpdateData(const std::vector<Oscillator<T> *> &coupled, const std::vector<Oscillator<T> *> &uncoupled, double time1, double time2) {
-    std::vector<Oscillator<T> *> total(coupled.begin(), coupled.end());
+void CoupledDirect::UpdateData(const std::vector<Oscillator *> &coupled, const std::vector<Oscillator *> &uncoupled, double time1, double time2) {
+    std::vector<Oscillator *> total(coupled.begin(), coupled.end());
     total.insert(total.end(), uncoupled.begin(), uncoupled.end());
 
     NCoupled = coupled.size();
@@ -76,7 +76,7 @@ template<typename T> void Integrator<T>::UpdateData(const std::vector<Oscillator
     Derivs.resize(2 * NTotal);
 }
 
-template<typename T> void Integrator<T>::ComputeKcf(double time) {
+void CoupledDirect::ComputeKcf(double time) {
     const auto coeff_start = std::chrono::steady_clock::now();
 
     const double alpha = (time - T1) / (T2 - T1);
@@ -93,35 +93,32 @@ template<typename T> void Integrator<T>::ComputeKcf(double time) {
     FVals.setZero(NTotal);
     for (int i = 0; i < NCoupled; ++i) {
         const auto &force = time > ForceData2(0, i) ? ForceData2 : ForceData1;
-        const T cutoff = force(1, i), weight = force(2, i), t = time - force(0, i);
+        const double cutoff = force(1, i), weight = force(2, i), t = time - force(0, i);
         FVals[i] = (t < cutoff) * weight * t * t;
     }
 
     CoeffTime += std::chrono::steady_clock::now() - coeff_start;
 }
 
-template struct Integrator<float>;
-template struct Integrator<double>;
-
-template<typename T> void CoupledDirect<T>::ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic> &solve_data1, const Eigen::Array<T, 6, Eigen::Dynamic> &solve_data2, double t1, double t2, double time, int n_coupled, Matrix &m) {
+void CoupledDirect::ConstructMass(const Eigen::Array<double, 6, Eigen::Dynamic> &solve_data1, const Eigen::Array<double, 6, Eigen::Dynamic> &solve_data2, double t1, double t2, double time, int n_coupled, Matrix &m) {
     const double alpha = (time - t1) / (t2 - t1);
 
-    Eigen::Matrix<T, 3, Eigen::Dynamic, Eigen::RowMajor> centers(3, solve_data1.cols());
+    Eigen::Matrix<double, 3, Eigen::Dynamic, Eigen::RowMajor> centers(3, solve_data1.cols());
     centers.row(0) = (1. - alpha) * solve_data1.row(2) + alpha * solve_data2.row(2); // x
     centers.row(1) = (1. - alpha) * solve_data1.row(3) + alpha * solve_data2.row(3); // y
     centers.row(2) = (1. - alpha) * solve_data1.row(4) + alpha * solve_data2.row(4); // z
 
-    const Eigen::ArrayX<T> radii = (1. - alpha) * solve_data1.row(0) + alpha * solve_data2.row(0);
+    const Eigen::ArrayXd radii = (1. - alpha) * solve_data1.row(0) + alpha * solve_data2.row(0);
 
     m.resize(n_coupled, n_coupled);
     ParallelChunks(n_coupled, 16, [&](size_t begin, size_t end) {
         for (int i = int(begin); i < int(end); ++i) {
-            const T r_i = radii[i];
+            const double r_i = radii[i];
             for (int j = i; j < n_coupled; ++j) {
                 if (i == j) {
                     m(i, j) = 1.;
                 } else {
-                    const T dist_sq = (centers.col(j) - centers.col(i)).squaredNorm();
+                    const double dist_sq = (centers.col(j) - centers.col(i)).squaredNorm();
                     m(i, j) = 1. / std::sqrt(dist_sq / (r_i * radii[j]) + EpsSq);
                     m(j, i) = m(i, j);
                 }
@@ -132,12 +129,12 @@ template<typename T> void CoupledDirect<T>::ConstructMass(const Eigen::Array<T, 
 
 // Takes endpoint inverses from the precompute pipeline when one is installed, otherwise
 // constructs and factors the two independent endpoints concurrently (the reference path).
-template<typename T> void CoupledDirect<T>::Refactor() {
+void CoupledDirect::Refactor() {
     const auto mass_start = std::chrono::steady_clock::now();
 
     if (InverseProvider && InverseProvider(T1, T2, NCoupled, Inv1, Inv2)) {
         UseInverse = true;
-        this->MassTime += std::chrono::steady_clock::now() - mass_start;
+        MassTime += std::chrono::steady_clock::now() - mass_start;
         return;
     }
     UseInverse = false;
@@ -153,11 +150,11 @@ template<typename T> void CoupledDirect<T>::Refactor() {
     });
     if (Factor1.info() == Eigen::NumericalIssue || Factor2.info() == Eigen::NumericalIssue) throw std::runtime_error("Non positive definite matrix!");
 
-    this->MassTime += std::chrono::steady_clock::now() - mass_start;
+    MassTime += std::chrono::steady_clock::now() - mass_start;
 }
 
-template<typename T> const Eigen::ArrayX<T> &CoupledDirect<T>::Solve(const Eigen::ArrayX<T> &states, double time) {
-    this->ComputeKcf(time);
+const Eigen::ArrayXd &CoupledDirect::Solve(const Eigen::ArrayXd &states, double time) {
+    ComputeKcf(time);
 
     const auto solve_start = std::chrono::steady_clock::now();
 
@@ -173,13 +170,8 @@ template<typename T> const Eigen::ArrayX<T> &CoupledDirect<T>::Solve(const Eigen
         if (NCoupled > 0) {
             Sol1.resize(NCoupled);
             Sol2.resize(NCoupled);
-            if constexpr (std::is_same_v<T, double>) {
-                cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv1.data(), NCoupled, Rhs.data(), 1, 0., Sol1.data(), 1);
-                cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv2.data(), NCoupled, Rhs.data(), 1, 0., Sol2.data(), 1);
-            } else {
-                cblas_sgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1.f, Inv1.data(), NCoupled, Rhs.data(), 1, 0.f, Sol1.data(), 1);
-                cblas_sgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1.f, Inv2.data(), NCoupled, Rhs.data(), 1, 0.f, Sol2.data(), 1);
-            }
+            cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv1.data(), NCoupled, Rhs.data(), 1, 0., Sol1.data(), 1);
+            cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv2.data(), NCoupled, Rhs.data(), 1, 0., Sol2.data(), 1);
             Rhs.head(NCoupled) = (1. - alpha) * Sol1 + alpha * Sol2;
         }
     } else {
@@ -189,28 +181,9 @@ template<typename T> const Eigen::ArrayX<T> &CoupledDirect<T>::Solve(const Eigen
     Derivs.segment(0, NTotal) = states.segment(NTotal, NTotal);
     Derivs.segment(NTotal, NTotal) = Rhs.array() * SqrtRadii;
 
-    this->SolveTime += std::chrono::steady_clock::now() - solve_start;
+    SolveTime += std::chrono::steady_clock::now() - solve_start;
 
     return Derivs;
 }
-
-template struct CoupledDirect<float>;
-template struct CoupledDirect<double>;
-
-template<typename T> const Eigen::ArrayX<T> &Uncoupled<T>::Solve(const Eigen::ArrayX<T> &states, double time) {
-    this->ComputeKcf(time);
-
-    const auto solve_start = std::chrono::steady_clock::now();
-
-    Derivs.segment(0, NTotal) = states.segment(NTotal, NTotal);
-    Derivs.segment(NTotal, NTotal) = FVals - CVals * states.segment(NTotal, NTotal) - KVals * states.segment(0, NTotal);
-
-    this->SolveTime += std::chrono::steady_clock::now() - solve_start;
-
-    return Derivs;
-}
-
-template struct Uncoupled<float>;
-template struct Uncoupled<double>;
 
 } // namespace FluidSound

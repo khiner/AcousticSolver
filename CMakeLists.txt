@@ -21,8 +21,11 @@ FetchContent_Declare(eigen
 FetchContent_Declare(libigl
     URL https://github.com/libigl/libigl/archive/refs/tags/v2.4.0.tar.gz
     SOURCE_SUBDIR cmake_disabled)
+# metal-cpp has no release tags (Apple distributes per-SDK zips), so pin the mirror
+# commit corresponding to the "macOS 27, iOS 27" drop.
 FetchContent_Declare(metalcpp
-    URL https://github.com/apple/metal-cpp/archive/refs/heads/main.tar.gz
+    URL https://github.com/apple/metal-cpp/archive/27c4382b7151d55a51692cdcb27aaa98752240de.tar.gz
+    URL_HASH SHA256=01b6e76f10c0f5b6eb44be22a3d276cd9922da62a51d4d345b70c5177d720231
     SOURCE_SUBDIR cmake_disabled)
 FetchContent_MakeAvailable(eigen libigl metalcpp)
 

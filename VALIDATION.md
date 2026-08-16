@@ -266,6 +266,60 @@ from round 2; low-QoS/E-core inversion workers (contend for the same matrix unit
 `dtrtri`-only inverses applied via `dtrmv` (worker savings exactly cancelled by the
 doubled apply cost).
 
+## Performance, round 4 (2026-08-16)
+
+A fourth pass, targeting the AMX inversion throughput that round 3 established as the
+bubble scenes' floor. Only the bubble inverse pipeline changed, so non-bubble scenes run
+identical code. GlassPour's output is byte-identical to round 3, and PaddleSplash differs
+at rel L2 2.9e-6 (the same inert-rounding class as round 3's inverse change, see below).
+Every golden verdict and error metric is unchanged, to all displayed digits.
+
+| Scene | Round 3 | Round 4 | Speedup | vs original port |
+|---|---|---|---|---|
+| PaddleSplash | 85.7s | 60.3s | 1.4× | 6.6× |
+| GlassPour | 6.2s | 5.4s | 1.1× | 6.5× |
+| all others | 322s | 315s | 1.0× | — |
+
+Total 414s → 381s (1170s → 381s, 3.1× vs the original straight translation). Standalone
+on a rested machine, PaddleSplash runs 54.0s (A/B against a round-3 build interleaved on
+the same rested machine: 81.5s → 54.0s, 1.5×).
+
+What changed — **chained endpoint inverses** (`Source/BubbleFactorPipeline.h`): when
+interval k+1 starts exactly at interval k's endpoint (no event interval skipped between
+refactors — 13,882 of 13,888 successor intervals in PaddleSplash, 33,631 of 33,652 in
+GlassPour), the two mass matrices are evaluated at the same time and differ only by the
+oscillators that died (rows/cols removed, order preserved) and were born (rows/cols
+appended) at that event — mean churn 1.7 rows in PaddleSplash. Ticket k's worker now
+derives interval k+1's T1 inverse from its own freshly inverted T2 matrix with SPD Schur
+updates (a delete-downdate via the principal-submatrix identity, then a bordered
+extension), O(N²r) BLAS for churn r instead of an O(N³) factorization. Every derived
+inverse is exactly one update away from a fresh `dpotrf`/`dpotri`, so update error never
+compounds along the chain — this is the rel L2 ~1e-6 rounding change above. Any
+non-derivable successor (schedule gap, oversized churn, failed small Cholesky) falls back
+to a from-scratch inversion. This halves the AMX factorization load (PaddleSplash worker
+busy 301s → 190s across 4 workers), which both eliminates the main thread's fetch stalls
+(20.4s → 4.4s) and un-stretches its own AMX GEMV applies (measured: a 958² `dgemv` runs
+9.4 µs idle but ~55 µs under 4 concurrent `dpotrf`/`dpotri` workers — matrix-unit
+contention, not compute, is the coupling).
+
+Also measured and deliberately *not* done this round:
+- A 4-cells-per-thread x-vectorized fused FDTD kernel (float4 loads/stores, in-register
+  halo reuse, bit-exact) is ~50% **slower** than the reference kernel (66 vs 43 µs/step
+  at 88³) — this GPU prefers many light threads, and the reference already runs within
+  ~12% of a pure-copy floor. Multi-cell threads join temporal blocking on the rejected
+  list; the fused kernel is at its traffic floor.
+- `cblas_dsymv` (half the matrix traffic in principle) is ~3× slower than `cblas_dgemv`
+  on Accelerate at these sizes — the symmetric kernel is not AMX-optimized.
+- Bubble worker counts 2, 3, and 6 (vs the default 4) are all slower on PaddleSplash:
+  fewer workers reintroduce fetch stalls faster than they relieve GEMV contention, more
+  workers do the reverse. `ACOUSTIC_BUBBLE_WORKERS=<n>` overrides the count for future
+  hardware.
+
+After this round, every scene sits at a measured floor: the GPU-bound scenes at the fused
+kernel's memory-traffic floor, PaddleSplash at the three-way AMX bandwidth equilibrium
+(worker inversions, worker updates, main-thread GEMV), and SpollingBowl/LegoDrop at the
+vendored modal ODE.
+
 ## Rerunning
 
 ```

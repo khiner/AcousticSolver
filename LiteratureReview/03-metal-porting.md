@@ -71,5 +71,5 @@ Metal's cost hierarchy: per-command-buffer commit ≫ per-encoder > per-dispatch
 
 ## Cross-cutting notes
 
-- Host↔device transfers per batch (shader data up, listener audio down) mostly disappear: `MTLStorageModeShared` buffers are the same physical memory; the remaining cost is synchronization, not copying. Eigen/libigl geometry code can write directly into shared `MTLBuffer` memory.
+- Host↔device transfers per batch (shader data up, listener audio down) mostly disappear: `MTLStorageModeShared` buffers are the same physical memory; the remaining cost is synchronization, not copying. Eigen geometry code can write directly into shared `MTLBuffer` memory.
 - WaveBlender's kernels use no shared memory, atomics, or streams, so the 32 KB threadgroup-memory limit and threadgroup-size limits don't bind; the 8×8×8 = 512-thread blocks fit the 1024 limit as-is.

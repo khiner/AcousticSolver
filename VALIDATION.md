@@ -180,8 +180,7 @@ What changed:
 - **Threadgroup shape 32×4×4** for the full-grid step kernels (SIMD-width-aligned rows;
   ~5% over 8×8×8).
 - **Fast .obj parsing** for the plain triangle meshes read per batch by the bubble scenes
-  (strtod/strtol — the same correctly-rounded conversions the general reader uses), with
-  fallback to libigl for anything outside that subset.
+  (strtod/strtol — the same correctly-rounded conversions the reference's reader uses).
 
 Measured limits (M5 Max), for future reference: the fused FDTD kernel runs within ~15% of
 a pure 9-stream copy floor at these grid sizes (the working set is SLC-resident), halving

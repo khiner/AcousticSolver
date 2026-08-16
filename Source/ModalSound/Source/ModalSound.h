@@ -13,8 +13,7 @@
 
 #include <map>
 
-#include "igl/read_triangle_mesh.h"
-#include "igl/principal_curvature.h"
+#include "Mesh.h"  // LOCAL PATCH: replaces upstream's mesh-reader and curvature headers
 
 #include "ModeData.h"
 

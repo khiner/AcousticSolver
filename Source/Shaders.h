@@ -12,10 +12,10 @@
 #include <variant>
 #include <vector>
 
-#include "igl/AABB.h"
-
+#include "AabbTree.h"
 #include "BubbleFactorPipeline.h"
 #include "FluidSound.h"
+#include "Mesh.h"
 #include "ModalSound.h"
 
 #include "FDTDCommon.h"
@@ -73,22 +73,19 @@ struct ObjectBase {
     // (NPoints, 3) boundary points to compute shader samples at, and their normals.
     void SetSamplePoints(const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &bn);
 
-    // ----- Closest point query (must be called after Tree.init()) -----
-    igl::AABB<Eigen::MatrixX<REAL>, 3> Tree;
+    // ----- Closest point query (must be called after Tree.Init()) -----
+    AabbTree<REAL> Tree;
     // For each query position in `b`, the index of the closest triangle of mesh `v`, F.
     void ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const;
     // Closest point query with additional barycentric weight computation into `w_out`.
     void ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<REAL> &w_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const;
-
-    // Reads .obj file and saves vertices and faces to `v` and `f`.
-    static bool ReadObj(const std::string &filename, Eigen::MatrixX<REAL> &v, Eigen::MatrixXi &f);
 };
 
 // Basic mono-frequency, monopole source shader used for testing.
 struct Monopole {
     Monopole(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, REAL freq_hz, REAL speed, REAL c = 343.2)
         : Obj(ShaderClass::Monopole, true, blend_rate, shader_srate, ts), FreqHz(freq_hz), Speed(speed), C(c) {
-        ObjectBase::ReadObj(mesh_file, Obj.V2, Obj.F);
+        ReadObj(mesh_file, Obj.V2, Obj.F);
     }
     void Compute(GpuBuffer &vb, int global_bid);
 
@@ -105,7 +102,7 @@ struct Speaker {
     Speaker(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, const std::string &wav_file, int direction, const std::string &anim_file)
         : Obj(ShaderClass::Speaker, true, blend_rate, shader_srate, ts), Direction(direction) {
         ReadWav(wav_file);
-        ObjectBase::ReadObj(mesh_file, Obj.V0, Obj.F);
+        ReadObj(mesh_file, Obj.V0, Obj.F);
         Obj.V2 = Obj.V0;
         if (anim_file != "") {
             Obj.AnimFile.open(anim_file);
@@ -127,7 +124,7 @@ private:
 struct Occluder {
     Occluder(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, const std::string &anim_file)
         : Obj(ShaderClass::Occluder, anim_file != "", blend_rate, shader_srate, ts) {
-        ObjectBase::ReadObj(mesh_file, Obj.V0, Obj.F);
+        ReadObj(mesh_file, Obj.V0, Obj.F);
         Obj.V2 = Obj.V0;
         if (anim_file != "") {
             Obj.AnimFile.open(anim_file);
@@ -181,9 +178,9 @@ private:
 struct Modal {
     Modal(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, const std::string &anim_file, const std::string &data_prefix, const std::string &material)
         : Obj(ShaderClass::Modal, true, blend_rate, shader_srate, ts), Solver(data_prefix, mesh_file, material, 1. / shader_srate) {
-        ObjectBase::ReadObj(mesh_file, Obj.V0, Obj.F);
+        ReadObj(mesh_file, Obj.V0, Obj.F);
         Obj.V2 = Obj.V0;
-        Obj.Tree.init(Obj.V0, Obj.F);
+        Obj.Tree.Init(Obj.V0, Obj.F);
 
         if (anim_file != "") {
             Obj.AnimFile.open(anim_file);
@@ -216,7 +213,7 @@ struct Shell {
     Shell(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, std::string anim_dir, std::string acc_dir, const std::string &map_file)
         : Obj(ShaderClass::ThinShell, true, blend_rate, shader_srate, ts), ShellAnimDir(std::move(anim_dir)), ShellAccelDir(std::move(acc_dir)),
           MegaBatchSize(100 * (Obj.NSamples - 1) + 1) { // load 100 batches of accel data at once
-        ObjectBase::ReadObj(mesh_file, Obj.V0, Obj.F);
+        ReadObj(mesh_file, Obj.V0, Obj.F);
         Obj.V2 = Obj.V0;
         ReadVertexMap(map_file);
 

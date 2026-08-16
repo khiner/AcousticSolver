@@ -1,12 +1,12 @@
 # WaveBlender Codebase Analysis (port target)
 
-Source: `../WaveBlender` — reference implementation of *WaveBlender: Practical Sound-Source Animation in Blended Domains* (Xue, Wang, Langlois, James, SIGGRAPH Asia 2024). C++17 + CUDA + Eigen 3.4 + libigl. ~1,000 lines of CUDA across the core solver and shaders, plus two CPU sub-libraries.
+Source: `../WaveBlender` — reference implementation of *WaveBlender: Practical Sound-Source Animation in Blended Domains* (Xue, Wang, Langlois, James, SIGGRAPH Asia 2024). C++17 + CUDA + Eigen 3.4. ~1,000 lines of CUDA across the core solver and shaders, plus two CPU sub-libraries.
 
 ## Architecture
 
 The simulation runs in **batches** at `blendrate` Hz (default 100 Hz, i.e. 10 ms batches). Each batch:
 
-1. **Rasterize** animated triangle meshes into the grid (`WaveBlender.cu`, CPU-side, uses `tribox.h` triangle–box overlap and libigl AABB trees), producing per-cell object IDs (`d_cell`) at batch endpoints t1/t2.
+1. **Rasterize** animated triangle meshes into the grid (`WaveBlender.cu`, CPU-side, uses `tribox.h` triangle–box overlap and AABB trees), producing per-cell object IDs (`d_cell`) at batch endpoints t1/t2.
 2. **Cavity detection** (flood fill, CPU) marks enclosed air pockets (`CAVITY_INTERIOR = 255`).
 3. **Fresh-cell extrapolation** initializes pressure/velocity in cells that switched from solid to air.
 4. **Shader evaluation**: each `Object`'s acoustic shader computes boundary-velocity (or force) time series for the batch at `shader_srate` (48/44.1 kHz) into a flat device buffer `d_shaderData`, indexed by `d_shaderMap` (sign encodes velocity-BC vs. force, value encodes cell + axis).

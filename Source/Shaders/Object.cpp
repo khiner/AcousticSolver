@@ -4,79 +4,18 @@
 #include "Parallel.h"
 #include "Shaders.h"
 
-#include "igl/barycentric_coordinates.h"
-#include "igl/read_triangle_mesh.h"
-
-#include <cstdlib>
-#include <fstream>
 #include <sstream>
 
 namespace {
-// Fast path for plain triangle meshes ("v x y z" and "f a b c" lines, as the per-batch
-// fluid meshes are). strtod/strtol are the same correctly-rounded conversions igl's
-// sscanf-based reader uses, so values are identical. Returns false, leaving the outputs
-// untouched, on any feature outside that subset.
-bool ReadObjFast(const std::string &filename, Eigen::MatrixX<REAL> &v_out, Eigen::MatrixXi &f_out) {
-    std::ifstream in{filename, std::ios::binary | std::ios::ate};
-    if (!in.good()) return false;
-    const auto size = size_t(in.tellg());
-    in.seekg(0);
-    std::string data(size, '\0');
-    in.read(data.data(), size);
-
-    std::vector<REAL> vs;
-    std::vector<int> fs;
-    const char *p = data.data();
-    const char *const end = p + size;
-    const auto skip_line = [&] {
-        while (p < end && *p != '\n') ++p;
-        if (p < end) ++p;
-    };
-    const auto at_line_end = [&] {
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r')) ++p;
-        return p == end || *p == '\n';
-    };
-    while (p < end) {
-        if (*p == 'v' && p + 1 < end && p[1] == ' ') {
-            p += 2;
-            for (int c = 0; c < 3; ++c) {
-                char *q{};
-                const double value = std::strtod(p, &q);
-                if (q == p) return false;
-                vs.push_back(REAL(value));
-                p = q;
-            }
-            if (!at_line_end()) return false; // vertex colors / 4-component positions
-            skip_line();
-        } else if (*p == 'f' && p + 1 < end && p[1] == ' ') {
-            p += 2;
-            for (int c = 0; c < 3; ++c) {
-                char *q{};
-                const long index = std::strtol(p, &q, 10);
-                if (q == p || index <= 0) return false; // relative/invalid indices
-                fs.push_back(int(index - 1));
-                p = q;
-                if (p < end && *p == '/') return false; // texture/normal face indices
-            }
-            if (!at_line_end()) return false; // quads and larger polygons
-            skip_line();
-        } else if (*p == '#' || *p == '\n' || *p == '\r' || *p == ' ' || *p == '\t' || (*p == 'v' && p + 1 < end && (p[1] == 'n' || p[1] == 't')) || *p == 'g' || *p == 's' || *p == 'o') {
-            skip_line(); // comments, blank lines, normals/texcoords, grouping
-        } else {
-            return false; // anything else (mtllib, lines, ...) takes the general path
-        }
-    }
-
-    v_out = Eigen::Map<const Eigen::Matrix<REAL, Eigen::Dynamic, 3, Eigen::RowMajor>>(vs.data(), long(vs.size()) / 3, 3);
-    f_out = Eigen::Map<const Eigen::Matrix<int, Eigen::Dynamic, 3, Eigen::RowMajor>>(fs.data(), long(fs.size()) / 3, 3);
-    return true;
+// Barycentric weights of `p` within triangle (a, b, c).
+Eigen::RowVector3<REAL> BarycentricWeights(const Eigen::RowVector3<REAL> &p, const Eigen::RowVector3<REAL> &a, const Eigen::RowVector3<REAL> &b, const Eigen::RowVector3<REAL> &c) {
+    const Eigen::RowVector3<REAL> v0 = b - a, v1 = c - a, v2 = p - a;
+    const REAL d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1), d20 = v2.dot(v0), d21 = v2.dot(v1);
+    const REAL denom = d00 * d11 - d01 * d01;
+    const REAL w1 = (d11 * d20 - d01 * d21) / denom, w2 = (d00 * d21 - d01 * d20) / denom;
+    return Eigen::RowVector3<REAL>{REAL(1) - (w1 + w2), w1, w2};
 }
 } // namespace
-
-bool ObjectBase::ReadObj(const std::string &filename, Eigen::MatrixX<REAL> &v, Eigen::MatrixXi &f) {
-    if (ReadObjFast(filename, v, f)) return true;
-    return igl::read_triangle_mesh(filename, v, f);
-}
 
 void ObjectBase::SetSamplePoints(const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &bn) {
     NPoints = b.rows();
@@ -133,12 +72,8 @@ void ObjectBase::ReadAnimation() {
 void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const {
     i_out.resize(b.rows());
     ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
-        Eigen::VectorX<REAL> sqr_d;
-        Eigen::MatrixX<REAL> p;
-        Eigen::VectorXi indices;
-        const Eigen::MatrixX<REAL> block = b.middleRows(begin, end - begin);
-        Tree.squared_distance(v, F, block, sqr_d, indices, p);
-        i_out.segment(begin, end - begin) = indices;
+        Eigen::RowVector3<REAL> closest;
+        for (size_t r = begin; r < end; ++r) Tree.ClosestPoint(v, F, b.row(r), i_out[r], closest);
     });
 }
 
@@ -146,23 +81,11 @@ void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<REAL> &w_ou
     i_out.resize(b.rows());
     w_out.resize(b.rows(), 3);
     ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
-        const auto n = end - begin;
-        Eigen::VectorX<REAL> sqr_d;
-        Eigen::MatrixX<REAL> p;
-        Eigen::VectorXi indices;
-        const Eigen::MatrixX<REAL> block = b.middleRows(begin, n);
-        Tree.squared_distance(v, F, block, sqr_d, indices, p);
-
-        Eigen::MatrixX<REAL> tri1(n, 3), tri2(n, 3), tri3(n, 3);
-        for (size_t r = 0; r < n; ++r) {
-            tri1.row(r) = v.row(F(indices[r], 0));
-            tri2.row(r) = v.row(F(indices[r], 1));
-            tri3.row(r) = v.row(F(indices[r], 2));
+        Eigen::RowVector3<REAL> closest;
+        for (size_t r = begin; r < end; ++r) {
+            int &index = i_out[r];
+            Tree.ClosestPoint(v, F, b.row(r), index, closest);
+            w_out.row(r) = BarycentricWeights(closest, v.row(F(index, 0)), v.row(F(index, 1)), v.row(F(index, 2)));
         }
-        Eigen::MatrixX<REAL> weights;
-        igl::barycentric_coordinates(p, tri1, tri2, tri3, weights);
-
-        i_out.segment(begin, n) = indices;
-        w_out.middleRows(begin, n) = weights;
     });
 }

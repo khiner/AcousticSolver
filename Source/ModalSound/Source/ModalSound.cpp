@@ -40,11 +40,11 @@ Solver::Solver(const std::string &dataPrefix, const std::string &meshFile, const
     CullNonSurfaceModes();
 
     // Read mesh and precompute curvature + inertia
-    bool success = igl::read_triangle_mesh(meshFile, _V, _F);
-    
-    Eigen::MatrixXd PD1, PD2; Eigen::VectorXd PV1, PV2;
-    igl::principal_curvature(_V, _F, PD1, PD2, PV1, PV2);
-    _curvature = (PV1 + PV2) / 2.;  // mean curvature
+    // LOCAL PATCH: ReadObj / MeanCurvature (Mesh.h). Only the mean of the two principal
+    // curvatures was ever used here.
+    ReadObj(meshFile, _V, _F);
+
+    _curvature = MeanCurvature(_V, _F);
 
     ComputeInertia();
 

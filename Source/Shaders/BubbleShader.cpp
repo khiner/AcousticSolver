@@ -34,7 +34,7 @@ void Bubbles::ReadFluidMesh() {
 
     std::cout << "Reading mesh from " << FluidMeshDir + filetag << std::endl;
     base.V1 = base.V2;
-    base.Changed = ObjectBase::ReadObj(FluidMeshDir + filetag + ".obj", base.V2, base.F); // true if ReadObj() successful, false otherwise
+    base.Changed = ReadObj(FluidMeshDir + filetag + ".obj", base.V2, base.F); // true if ReadObj() successful, false otherwise
 }
 
 // As in the reference: probably will not work on batch lengths that are non-integer multiples of 1 ms.

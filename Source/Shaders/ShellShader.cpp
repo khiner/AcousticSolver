@@ -40,7 +40,7 @@ void Shell::ReadShellAnimation() {
 
     assert(base.V2.rows() == (n_u + n_c) / 3);
     base.V1 = base.V2;
-    base.Tree.init(base.V1, base.F);
+    base.Tree.Init(base.V1, base.F);
     for (int r = 0; r < base.V2.rows(); ++r) {
         const int internal_id = VertMap[r];
         if (internal_id < (n_u + n_c) / 3) base.V2.row(r) = base.V0.row(r) + VertDisplace.row(internal_id).cast<REAL>();

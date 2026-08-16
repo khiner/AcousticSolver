@@ -22,7 +22,7 @@ Core method notes (from the PDF — these are the equations the port must reprod
 
 ## Code repositories
 
-- **WaveBlender** — https://github.com/kangruix/WaveBlender — MIT, C++17/CUDA/Eigen 3.4/libigl. Last pushed 2025-09-08, active. README's "9/8 Update" promises "a more comprehensive and useable sound rendering system later" — **not released as of 2026-08-15** (checked author's repos, Stanford pages, searches). The reference codebase is stable.
+- **WaveBlender** — https://github.com/kangruix/WaveBlender — MIT, C++17/CUDA/Eigen 3.4. Last pushed 2025-09-08, active. README's "9/8 Update" promises "a more comprehensive and useable sound rendering system later" — **not released as of 2026-08-15** (checked author's repos, Stanford pages, searches). The reference codebase is stable.
 - **FluidSound** — https://github.com/kangruix/FluidSound — MIT, C++11, Eigen-only coupled-bubble oscillator solver (implementation of Xue et al. 2023, building on Langlois 2016). **Archived (read-only) 2026-05-07**, last push 2024-12-19 — vendor/fork rather than track upstream. Note: the local WaveBlender checkout has not initialized this submodule (`git submodule update --init --recursive`).
 
 ## Direct lineage (what each shader/mechanism descends from)

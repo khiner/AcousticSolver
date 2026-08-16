@@ -13,13 +13,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -stdlib=libc++")
 
 include(FetchContent)
 
-# All three dependencies are consumed header-only. SOURCE_SUBDIR points at a
+# Both dependencies are consumed header-only. SOURCE_SUBDIR points at a
 # nonexistent directory so FetchContent_MakeAvailable skips their own CMake.
 FetchContent_Declare(eigen
     URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
-    SOURCE_SUBDIR cmake_disabled)
-FetchContent_Declare(libigl
-    URL https://github.com/libigl/libigl/archive/refs/tags/v2.4.0.tar.gz
     SOURCE_SUBDIR cmake_disabled)
 # metal-cpp has no release tags (Apple distributes per-SDK zips), so pin the mirror
 # commit corresponding to the "macOS 27, iOS 27" drop.
@@ -27,7 +24,7 @@ FetchContent_Declare(metalcpp
     URL https://github.com/apple/metal-cpp/archive/27c4382b7151d55a51692cdcb27aaa98752240de.tar.gz
     URL_HASH SHA256=01b6e76f10c0f5b6eb44be22a3d276cd9922da62a51d4d345b70c5177d720231
     SOURCE_SUBDIR cmake_disabled)
-FetchContent_MakeAvailable(eigen libigl metalcpp)
+FetchContent_MakeAvailable(eigen metalcpp)
 
 file(GLOB SHADER_SOURCES Source/Shaders/*.cpp)
 set(VENDORED_SOURCES
@@ -42,6 +39,7 @@ set_source_files_properties(${VENDORED_SOURCES} PROPERTIES COMPILE_FLAGS "-w")
 
 add_executable(${PROJECT_NAME}
     main.cpp
+    Source/Mesh.cpp
     Source/WaveBlender.cpp
     Source/Metal/MetalContext.cpp
     ${SHADER_SOURCES}
@@ -53,7 +51,6 @@ target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
     Source/ThirdParty
     Source/ModalSound/Source Source/FluidSound/Source
     ${eigen_SOURCE_DIR}
-    ${libigl_SOURCE_DIR}/include
     ${metalcpp_SOURCE_DIR}
 )
 

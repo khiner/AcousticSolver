@@ -1,8 +1,30 @@
 // Ported from WaveBlender (c) 2024 Kangrui Xue (Object.cpp) — Metal port.
+// ObjectBase geometry, animation, and closest-point implementation.
 
+#include "Parallel.h"
 #include "Shaders.h"
 
-void Object::ReadAnimation() {
+#include "igl/barycentric_coordinates.h"
+#include "igl/read_triangle_mesh.h"
+
+#include <sstream>
+
+bool ObjectBase::ReadObj(const std::string &filename, Eigen::MatrixX<REAL> &v, Eigen::MatrixXi &f) {
+    return igl::read_triangle_mesh(filename, v, f);
+}
+
+void ObjectBase::SetSamplePoints(const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &bn) {
+    NPoints = b.rows();
+    B = b;
+    BN = bn;
+
+    GpuB.Resize(B.size() * sizeof(REAL));
+    GpuBN.Resize(BN.size() * sizeof(REAL));
+    GpuB.Upload(B.data(), B.size() * sizeof(REAL));
+    GpuBN.Upload(BN.data(), BN.size() * sizeof(REAL));
+}
+
+void ObjectBase::ReadAnimation() {
     const int lookahead = NSamples - 1;
     std::string line;
 
@@ -21,8 +43,6 @@ void Object::ReadAnimation() {
         Translation1 = Translation2;
         Rotation1 = Rotation2;
     }
-
-    std::cout << T1 << ", " << T2 << std::endl;
 
     // Same fixed threshold as the reference (see its TODO)
     if (Step > 0 && (Translation2 - Translation1).norm() < 1e-6 && (Rotation2 - Rotation1).norm() < 1e-6) {
@@ -45,27 +65,39 @@ void Object::ReadAnimation() {
     Changed = true;
 }
 
-// For each query position, computes the closest point on this object's surface mesh (must be called after Tree.init()).
-// `i_out` receives the triangle index for each closest point.
-void Object::ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) {
-    Eigen::VectorX<REAL> sqr_d;
-    Eigen::MatrixX<REAL> p;
-    Tree.squared_distance(v, F, b, sqr_d, i_out, p);
+void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const {
+    i_out.resize(b.rows());
+    ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
+        Eigen::VectorX<REAL> sqr_d;
+        Eigen::MatrixX<REAL> p;
+        Eigen::VectorXi indices;
+        const Eigen::MatrixX<REAL> block = b.middleRows(begin, end - begin);
+        Tree.squared_distance(v, F, block, sqr_d, indices, p);
+        i_out.segment(begin, end - begin) = indices;
+    });
 }
 
-// Closest point query with additional barycentric weight computation into `w_out`.
-void Object::ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<REAL> &w_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) {
-    Eigen::VectorX<REAL> sqr_d;
-    Eigen::MatrixX<REAL> p;
-    Tree.squared_distance(v, F, b, sqr_d, i_out, p);
+void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<REAL> &w_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const {
+    i_out.resize(b.rows());
+    w_out.resize(b.rows(), 3);
+    ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
+        const auto n = end - begin;
+        Eigen::VectorX<REAL> sqr_d;
+        Eigen::MatrixX<REAL> p;
+        Eigen::VectorXi indices;
+        const Eigen::MatrixX<REAL> block = b.middleRows(begin, n);
+        Tree.squared_distance(v, F, block, sqr_d, indices, p);
 
-    Eigen::MatrixX<REAL> tri1(NPoints, 3);
-    Eigen::MatrixX<REAL> tri2(NPoints, 3);
-    Eigen::MatrixX<REAL> tri3(NPoints, 3);
-    for (int bid = 0; bid < NPoints; ++bid) {
-        tri1.row(bid) = v.row(F(i_out[bid], 0));
-        tri2.row(bid) = v.row(F(i_out[bid], 1));
-        tri3.row(bid) = v.row(F(i_out[bid], 2));
-    }
-    igl::barycentric_coordinates(p, tri1, tri2, tri3, w_out);
+        Eigen::MatrixX<REAL> tri1(n, 3), tri2(n, 3), tri3(n, 3);
+        for (size_t r = 0; r < n; ++r) {
+            tri1.row(r) = v.row(F(indices[r], 0));
+            tri2.row(r) = v.row(F(indices[r], 1));
+            tri3.row(r) = v.row(F(indices[r], 2));
+        }
+        Eigen::MatrixX<REAL> weights;
+        igl::barycentric_coordinates(p, tri1, tri2, tri3, weights);
+
+        i_out.segment(begin, n) = indices;
+        w_out.middleRows(begin, n) = weights;
+    });
 }

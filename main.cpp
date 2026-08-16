@@ -3,6 +3,7 @@
 
 #include "WaveBlender.h"
 
+#include "Profile.h"
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -39,21 +40,21 @@ void Run(const std::string &config_file) {
 
         const std::string shader = object_config["shader"];
         if (shader == "Monopole") {
-            solver.AddObject(offset, std::make_shared<Monopole>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], REAL(object_config["freqHz"]), REAL(object_config["speed"]), params.C));
+            solver.AddObject<Monopole>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], REAL(object_config["freqHz"]), REAL(object_config["speed"]), params.C);
         } else if (shader == "Speaker") {
-            solver.AddObject(offset, std::make_shared<Speaker>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["wavFile"], int(object_config["direction"]), object_config["animFile"]));
+            solver.AddObject<Speaker>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["wavFile"], int(object_config["direction"]), object_config["animFile"]);
         } else if (shader == "Occluder") {
-            solver.AddObject(offset, std::make_shared<Occluder>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["animFile"]));
+            solver.AddObject<Occluder>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["animFile"]);
         } else if (shader == "Bubbles") {
-            solver.AddObject(offset, std::make_shared<Bubbles>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["bubFile"], object_config["meshDir"], params.Dx));
+            solver.AddObject<Bubbles>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["bubFile"], object_config["meshDir"], params.Dx);
         } else if (shader == "Modal") {
-            solver.AddObject(offset, std::make_shared<Modal>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["animFile"], object_config["dataPrefix"], object_config["material"]));
+            solver.AddObject<Modal>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["animFile"], object_config["dataPrefix"], object_config["material"]);
         } else if (shader == "Shell") {
-            solver.AddObject(offset, std::make_shared<Shell>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["animDir"], object_config["accDir"], object_config["mapFile"]));
+            solver.AddObject<Shell>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["animDir"], object_config["accDir"], object_config["mapFile"]);
         } else if (shader == "Point") {
-            solver.AddObject(offset, std::make_shared<Point>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["impulseFile"], params.Dx));
+            solver.AddObject<PointSource>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["impulseFile"], params.Dx);
         } else if (shader == "Density") {
-            solver.AddObject(offset, std::make_shared<Density>(params.BlendRate, params.ShaderSrate, params.Ts, object_config["betaDir"]));
+            solver.AddObject<Density>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["betaDir"]);
         } else {
             throw std::runtime_error("Invalid Shader: " + shader);
         }
@@ -66,6 +67,7 @@ void Run(const std::string &config_file) {
 
     // Run simulation
     while (solver.RunBatch()) {}
+    profile::Report();
 }
 } // namespace
 

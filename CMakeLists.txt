@@ -41,7 +41,6 @@ add_executable(${PROJECT_NAME}
     main.cpp
     Source/WaveBlender.cpp
     Source/Metal/MetalContext.cpp
-    Source/FDTD/MetalSolver.cpp
     ${SHADER_SOURCES}
     ${VENDORED_SOURCES}
 )

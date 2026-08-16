@@ -16,6 +16,7 @@
 #include <stdexcept>
 
 #include "MetalContext.h"
+#include "Profile.h"
 
 namespace {
 std::string ReadFile(const std::string &path) {
@@ -63,7 +64,7 @@ MTL::ComputePipelineState *MetalContext::Pipeline(const char *name) {
     return pso;
 }
 
-void MetalContext::EnsureEncoder() {
+MTL::ComputeCommandEncoder *MetalContext::ActiveEncoder() {
     if (!CmdBuf) {
         CmdBuf = Queue->commandBuffer();
         CmdBuf->retain();
@@ -72,22 +73,23 @@ void MetalContext::EnsureEncoder() {
         Encoder = CmdBuf->computeCommandEncoder(); // serial dispatch type: in-order execution
         Encoder->retain();
     }
+    return Encoder;
 }
 
-void MetalContext::Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::initializer_list<const GpuBuffer *> buffers, const void *params, size_t params_size) {
+void MetalContext::Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params, size_t params_size) {
     if (blocks.x == 0 || blocks.y == 0 || blocks.z == 0) return;
 
-    EnsureEncoder();
-    Encoder->setComputePipelineState(Pipeline(kernel));
+    auto *encoder = ActiveEncoder();
+    encoder->setComputePipelineState(Pipeline(kernel));
 
     uint32_t index = 0;
-    for (const auto *buffer : buffers) Encoder->setBuffer(buffer->Handle(), 0, index++);
-    if (params && params_size > 0) Encoder->setBytes(params, params_size, index);
+    for (const auto &slice : buffers) encoder->setBuffer(slice.Buffer->Handle(), slice.OffsetBytes, index++);
+    if (params && params_size > 0) encoder->setBytes(params, params_size, index);
 
-    Encoder->dispatchThreadgroups(MTL::Size{blocks.x, blocks.y, blocks.z}, MTL::Size{threads.x, threads.y, threads.z});
+    encoder->dispatchThreadgroups(MTL::Size{blocks.x, blocks.y, blocks.z}, MTL::Size{threads.x, threads.y, threads.z});
 }
 
-void MetalContext::Sync() {
+void MetalContext::Flush() {
     if (Encoder) {
         Encoder->endEncoding();
         Encoder->release();
@@ -95,10 +97,25 @@ void MetalContext::Sync() {
     }
     if (CmdBuf) {
         CmdBuf->commit();
-        CmdBuf->waitUntilCompleted();
-        CmdBuf->release();
+        Committed.push_back(CmdBuf); // keeps the +1 ref from ActiveEncoder()
         CmdBuf = nullptr;
     }
+}
+
+void MetalContext::Sync() {
+    Flush();
+    if (Committed.empty()) return;
+    {
+        const profile::Scope scope{"gpu/wait"};
+        Committed.back()->waitUntilCompleted(); // in-order queue: implies all earlier command buffers completed
+    }
+    if (profile::Enabled()) {
+        auto &exec = profile::Entries()["gpu/exec"];
+        for (const auto *cb : Committed) exec.Seconds += cb->GPUEndTime() - cb->GPUStartTime();
+        exec.Count += Committed.size();
+    }
+    for (auto *cb : Committed) cb->release();
+    Committed.clear();
 }
 
 void GpuBuffer::Resize(size_t bytes) {
@@ -125,17 +142,21 @@ void GpuBuffer::Free() {
     CapacityBytes = 0;
 }
 
+void *GpuBuffer::Contents() const {
+    return Buf ? Buf->contents() : nullptr;
+}
+
 void *GpuBuffer::Data() const {
     MetalContext::Get().Sync();
-    return Buf ? Buf->contents() : nullptr;
+    return Contents();
 }
 
 void GpuBuffer::Upload(const void *src, size_t bytes, size_t dst_offset_bytes) const {
     if (bytes == 0) return;
-    std::memcpy(static_cast<char *>(Data()) + dst_offset_bytes, src, bytes);
+    std::memcpy(static_cast<char *>(Contents()) + dst_offset_bytes, src, bytes);
 }
 
 void GpuBuffer::Zero(size_t bytes) const {
     if (bytes == 0) return;
-    std::memset(Data(), 0, bytes);
+    std::memset(Contents(), 0, bytes);
 }

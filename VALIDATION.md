@@ -10,20 +10,41 @@ listener pressure output sample-for-sample. `wav/` holds paired renderings for l
 
 - All Metal kernels are compiled with **fast-math disabled** (`setFastMathEnabled(false)`),
   matching nvcc's default IEEE behavior. This is what makes bit-exact GPU comparison possible.
-- The GPU kernels mirror the CUDA kernels operation-for-operation, including launch geometry.
+- Every floating-point expression matches the CUDA reference operation-for-operation. The
+  optimized pipeline (fused velocity+pressure kernel, CPU/GPU batch overlap, transitioning-
+  cell-only beta updates, flat containers, parallel CPU loops) is **bit-identical** to a
+  straight port — verified by bit-exact self-comparison on CupPhone, GlassPour, and LegoDrop
+  against the pre-optimization build, and by the unchanged bit-exact prefix vs CUDA below.
+- Two deliberate output-observable changes, both validated:
+  1. **Fresh-cell least squares per connected component.** The reference solves one global
+     minimum-norm least-squares system per batch; the system is block-diagonal across
+     connected components of fresh cells, so solving per component is identical in exact
+     arithmetic and differs only in float rounding (while being asymptotically cheaper and
+     parallel). `ACOUSTIC_GLOBAL_LSTSQ=1` restores the reference-bit-identical global solve
+     for exactness validation.
+  2. **apply_shader write-race fix.** The reference applies all shader points in one
+     kernel launch. A velocity face can be claimed by both a regular (velocity-blend)
+     shader and a point-source force — 5,265 such collisions in FillerUp — and the two
+     threads race on the same velocity value, making output **nondeterministic run-to-run**
+     (reproduced on both the CUDA reference structure and the original Metal port). The
+     port now dispatches blend points and force points as two ordered ranges, keeping both
+     contributions with a defined order. Non-colliding faces are bit-unaffected. This fix
+     moved FillerUp from envelope-level agreement to full waveform agreement with the CUDA
+     golden (rel L2 3.4e-2 → 2.0e-4) and tightened HandShake (6.5e-2 → 2.5e-2) — most of
+     what looked like "CPU math drift" on these scenes was the race.
 
 ## What "matching" means across platforms
 
 Three regimes, in decreasing strictness:
 
-1. **Bit-exact.** The GPU solver itself matches CUDA bit-for-bit. CupPhone (static-geometry
-   phase) is identical for 4.67 of 8 simulated seconds — 412k consecutive equal samples —
-   until the first moving-geometry batch. Trumpet and TalkFan match to rel L2 ~1e-4..1e-5
-   (−73 to −95 dB) over 10+ seconds with animated geometry throughout.
+1. **Bit-exact.** The GPU solver matches CUDA bit-for-bit. CupPhone (static-geometry
+   phase) is identical for 4.66 of 8 simulated seconds — until the first moving-geometry
+   batch — including through the fused-kernel pipeline. TalkFan and Trumpet match to
+   rel L2 ~1e-4..1e-5 (−73 to −95 dB) over 10+ seconds with animated geometry throughout.
 2. **Ulp-accumulation drift.** Scenes with CPU-side per-batch math (Eigen quaternion slerp,
    fresh-cell least-squares, modal ODE stepping) pick up last-ulp ARM-vs-x86 differences from
    libm and Eigen's architecture-dependent reduction orders. These accumulate as phase drift:
-   LegoDrop −58 dB, SpollingBowl −44 dB, with correlation ≥ 0.99998 and matching spectra.
+   LegoDrop −59 dB, SpollingBowl −44 dB, with correlation ≥ 0.99998 and matching spectra.
 3. **Phase decorrelation (chaotic CPU paths).** The coupled-bubble ODE system amplifies ulp
    differences to macroscopic waveform divergence. **Control experiment**: the CPU-only
    FluidSound solver (no GPU at all), run on this machine (ARM, clang) vs the pod (x86, gcc)
@@ -36,39 +57,77 @@ Three regimes, in decreasing strictness:
 A structural port bug would fail all three gates at once (wrong energy, wrong spectrum, zero
 bit-exact prefix); nothing does.
 
-## Results (full suite, 2026-08-15)
+## Results (full suite, 2026-08-15, post-optimization)
 
 | Scene | Sources | Verdict | rel L2 | corr | RMS ratio | spec err |
 |---|---|---|---|---|---|---|
-| CupPhone | Speaker + Occluder | OK | 1.3e-5 | 1.000000 | 1.0000 | 7.6e-6 |
+| CupPhone | Speaker + Occluder | OK | 1.3e-5 | 1.000000 | 1.0000 | 7.5e-6 |
 | TalkFan | Speaker ×2 + Occluders | OK | 1.9e-5 | 1.000000 | 1.0000 | 1.1e-5 |
+| FillerUp | Point + Density | OK | 2.0e-4 | 1.000000 | 1.0000 | 2.4e-4 |
 | Trumpet | Speaker + Occluder | OK | 2.3e-4 | 1.000000 | 1.0000 | 1.1e-4 |
 | LegoDrop | Modal | OK | 1.2e-3 | 0.999999 | 0.9999 | 6.1e-4 |
 | SpollingBowl | Modal | OK | 6.3e-3 | 0.999980 | 1.0000 | 3.0e-3 |
-| FillerUp | Point + Density | OK(env) | 3.4e-2 | 0.999416 | 1.0005 | 2.6e-2 |
-| HandShake | Point + Occluders | OK(env) | 6.5e-2 | 0.997899 | 0.9990 | 4.0e-2 |
+| HandShake | Point + Occluders | OK(env) | 2.5e-2 | 0.999683 | 1.0004 | 1.8e-2 |
 | 2016Pour | Bubbles | OK(env) | 3.3e-1 | 0.946 | 0.9937 | 2.2e-1 |
 | GlassPour | Bubbles | OK(env) | 3.7e-1 | 0.931 | 0.9909 | 2.5e-1 |
 | PaddleSplash | Bubbles | OK(env) | 4.7e-1 | 0.894 | 1.0149 | 3.2e-1 |
 
-All three bubble scenes sit at exactly the divergence level the CPU-only control experiment
-predicts, with energy within ±1.5%.
+FillerUp was previously OK(env) at 3.4e-2 and HandShake at 6.5e-2 — both improved by the
+apply_shader race fix. All three bubble scenes sit at exactly the divergence level the
+CPU-only control experiment predicts, with energy within ±1.5%.
 
 ## Bugs found during validation
 
+- **apply_shader write race** (reference + original port): see "Key numerics decisions"
+  above. Detected because the optimized port is otherwise bit-reproducible run-to-run and
+  FillerUp wasn't.
 - **Upstream FluidSound UB** (`Integrators.h`): `Solver::~Solver()` deletes derived
   integrators through an `Integrator<T>*` base with no virtual destructor. Undefined
   behavior — gcc compiled it benignly, Homebrew clang 22 at -O2 compiles the delete to a
   trap (`brk #1`), which crashed GlassPour at teardown and truncated the final output batch.
   Patched in our vendored copy (marked `LOCAL PATCH`); upstream repo is archived.
 
-## Performance (M-series vs RTX 4090, same scenes)
+## Performance (Apple M5 Max vs the port's initial straight translation; same outputs)
 
-Wall-clock is near parity with the reference despite no Metal-side optimization:
-GlassPour 34s (CUDA 41s), TalkFan 126s (132s), HandShake 134s (102s), Trumpet 76s (45s),
-2016Pour 196s (127s), PaddleSplash 433s (CUDA 615s — faster than the 4090).
-The port encodes a whole batch (~1000 timesteps × 4 dispatches) into one command buffer,
-which is the only dispatch-overhead measure taken so far.
+Wall-clock, full scenes, `script/ValidateGolden` runs:
+
+| Scene | Before | After | Speedup | Dominant cost after |
+|---|---|---|---|---|
+| SpollingBowl | 61.3s | 14.5s | 4.2× | modal ODE (vendored) |
+| LegoDrop | 10.0s | 4.1s | 2.4× | GPU + modal ODE |
+| FillerUp | 90.2s | 40.8s | 2.2× | GPU |
+| TalkFan | 128.2s | 58.5s | 2.2× | GPU |
+| HandShake | 124.9s | 64.4s | 1.9× | GPU |
+| 2016Pour | 187.0s | 105.9s | 1.8× | GPU ∥ bubble ODE |
+| Trumpet | 76.8s | 43.8s | 1.8× | GPU |
+| GlassPour | 34.9s | 26.6s | 1.3× | bubble ODE (vendored) |
+| CupPhone | 56.2s | 44.0s | 1.3× | GPU |
+| PaddleSplash | 400.5s | 359.3s | 1.1× | bubble ODE (vendored) |
+
+Total 1170s → 762s (1.5×); excluding PaddleSplash, whose cost is ~93% the vendored
+serial coupled-bubble ODE, 770s → 403s (1.9×). Every scene now also beats the RTX 4090
+CUDA reference wall-clock (e.g. TalkFan 58.5s vs 132s, PaddleSplash 359s vs 615s,
+HandShake 64s vs 102s, Trumpet 44s vs 45s).
+
+What changed (all output-equivalent, see Key numerics decisions):
+
+- **CPU/GPU pipelining.** The GPU executes batch N's FDTD steps while the CPU prepares
+  batch N+1 (rasterization, shader ODE stepping, shader setup). One sync per batch, at the
+  fresh-cell velocity solve. Per-batch CPU-written GPU buffers are double-buffered.
+- **Fused GPU timestep.** The steady-state loop runs one full-grid kernel per step
+  (velocity update + next pressure update, with P/velocity ping-pong buffers) instead of
+  two, plus small apply_shader/update_beta dispatches — ~30% less memory traffic and
+  measured ~30% lower GPU time. The per-cell beta update runs only over cells actually
+  transitioning this batch. Listener sampling is folded into the grid kernels. Cell states
+  are uint8.
+- **Fresh-cell solve per connected component, in parallel** (TalkFan spent 33s here, now
+  negligible).
+- **Flat, data-oriented CPU batch phase**: lookup tables instead of std::set/map,
+  epoch-stamped face sets, parallel triangle rasterization and closest-point queries,
+  time-windowed impulse queries (FillerUp scans 366k impulses), strtof-based Density
+  parsing, and no per-minibatch GPU syncs in the bubble shader.
+
+Profiling: `ACOUSTIC_PROFILE=1` prints per-phase wall time and GPU-busy time at exit.
 
 ## Rerunning
 
@@ -76,5 +135,7 @@ which is the only dispatch-overhead measure taken so far.
 script/Build                       # build (Homebrew LLVM, C++23)
 script/ValidateGolden              # all scenes with golden data
 script/ValidateGolden GlassPour    # one scene
+ACOUSTIC_PROFILE=1 build/AcousticSolver Scenes/<scene>/config.json   # phase timing
+ACOUSTIC_GLOBAL_LSTSQ=1 ...        # reference-bit-identical fresh-cell solve
 script/generate_golden_outputs.sh root@<pod-ip> <port>   # regenerate goldens (CUDA host)
 ```

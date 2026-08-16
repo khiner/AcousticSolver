@@ -12,35 +12,43 @@
 
 #define PML_WIDTH 8
 
-struct StepPressureParams {
-    float tb;
+// ----- Core FDTD step kernels -----
+// The batch's step kernels share one argument table:
+//   0:P(in) 1:Px 2:Py 3:Pz 4:Vx(in) 5:Vy(in) 6:Vz(in) 7:Beta 8:Cell 9:PmlNp 10:PmlDp
+//   11:PmlNv 12:PmlDv 13:ShaderData 14:ShaderMap 15:ListenerCids 16:ListenerOut
+//   17:FdtdBatchParams (setBytes, once per batch) 18:FdtdStepParams (setBytes, once per step)
+//   19:ApplyShaderRange (setBytes, per apply_shader dispatch) 20:BetaTransitions
+//   21:P(out) 22:Vx(out) 23:Vy(out) 24:Vz(out)
+// The in/out field slots ping-pong per fused step, everything else binds once per batch.
+#define FDTD_BATCH_PARAMS_INDEX 17
+#define FDTD_STEP_PARAMS_INDEX 18
+#define FDTD_APPLY_RANGE_INDEX 19
+
+struct FdtdBatchParams {
     float RHO_CC_dt;
     float inv_dx;
+    float inv_RHO_dt;
     int Nx;
     int Ny;
     int Nz;
-};
-struct ApplyShaderParams {
     int N_shader_samples;
-    int N_shader_points;
-    float inv_RHO_dt;
-    int Nx;
-    int Ny;
-    int Nz;
-    float ss;
+    int N_listeners;
+    int N_transitions; // cells changing solidity this batch (see update_beta)
 };
-struct StepVelocityParams {
-    float inv_RHO_dt;
-    float inv_dx;
-    int Nx;
-    int Ny;
-    int Nz;
+struct FdtdStepParams {
+    float tb; // normalized blending time (0, 1]
+    float ss; // fractional shader sample index (for interpolation)
+    int s; // FDTD sample index within the batch (listener output slot)
 };
-struct SampleListenerParams {
-    int cid;
-    int s;
+// Shader-point range for one apply_shader dispatch. Velocity-blend points and force
+// points dispatch separately (blend first): a face claimed by both — possible between a
+// regular shader and a point source — then updates in a defined order instead of racing.
+struct ApplyShaderRange {
+    int start;
+    int end;
 };
 
+// ----- Fresh cells + shader re-init -----
 struct PrepareFreshCellParams {
     int N_shader_samples;
     int N_shader_points;
@@ -63,6 +71,7 @@ struct ShaderReInitParams {
     int N_shader_points;
 };
 
+// ----- Acoustic shaders -----
 struct MonopoleParams {
     int global_bid;
     float freqHz;

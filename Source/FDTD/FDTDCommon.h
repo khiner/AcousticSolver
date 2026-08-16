@@ -2,7 +2,7 @@
 
 // Ported from WaveBlender (c) 2024 Kangrui Xue (FDTDCommon.h). Global FDTD simulation parameters.
 
-#include "Shaders.h"
+using REAL = float;
 
 enum class BlendScheme {
     NoBlend,

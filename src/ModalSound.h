@@ -1,161 +1,114 @@
-/** (c) 2024 Kangrui Xue, (c) 2023 Jui-Hsien Wang. Adapted from ModalSound / openpbso (MIT) — see NOTICE.md.
- *
- * \file ModalSound.h
- * \brief Public interface for ModalSound; declares ImpactRecord, ImpulseSeries, and Solver classes
- *
- * Based on code by Jui-Hsien Wang (https://github.com/jhwang7628/openpbso)
- *
- * TODO: in general, this library is still pretty barebones (and in need of cleanup)
- */
+#pragma once
 
-#ifndef MODAL_SOUND_H
-#define MODAL_SOUND_H
+// (c) 2024 Kangrui Xue, (c) 2023 Jui-Hsien Wang. Adapted from ModalSound / openpbso (MIT) — see NOTICE.md.
+// Modal vibration of a rigid body, driven by recorded contact impulses.
+//
+// Based on code by Jui-Hsien Wang (https://github.com/jhwang7628/openpbso)
+//
+// TODO: in general, this library is still pretty barebones (and in need of cleanup)
 
-#include <map>
+#include <Eigen/Dense>
 
-#include "Mesh.h" // LOCAL PATCH: replaces upstream's mesh-reader and curvature headers
-
-#include "ModeData.h"
+#include <algorithm>
+#include <cmath>
+#include <numbers>
+#include <string>
+#include <vector>
 
 namespace ModalSound {
 
-/**
- * \struct ImpactRecord
- * \brief Stores impact data needed for modal force and acceleration noise calculation
- */
 struct ImpactRecord {
-    Eigen::Vector3d impactVector;
-    Eigen::Vector3d impactPosition; // in object space
-    double timestamp;
-    double supportLength = 0.01; // tau
-    double contactSpeed = 0.;
-    double gamma = 1.; // TODO: better default, gamma = pi * norm(J) / (2 tau)
-    int appliedVertex;
+    Eigen::Vector3d ImpactVector;
+    Eigen::Vector3d ImpactPosition; // In object space
+    double Timestamp{0};
+    double SupportLength{0.01}; // tau
+    double ContactSpeed{0};
+    double Gamma{1.}; // TODO: better default, gamma = pi * norm(J) / (2 tau)
+    int AppliedVertex{0};
 };
 
-/**
- * \struct ImpulseSeries
- * \brief Stores a series of ImpactRecords, with functionality for filtering by time
- */
-class ImpulseSeries {
-public:
-    // Vertex index should be for surface triangle mesh (not volumetric tetrahedral mesh)
-    void AddImpulse(const ImpactRecord &record) {
-        _lastImpulseTime = record.timestamp;
-        _firstImpulseTime = std::min<double>(_firstImpulseTime, record.timestamp);
-        _impulses.push_back(record);
+struct ImpulseSeries {
+    // The vertex index must be into the surface triangle mesh, not the volumetric tet mesh.
+    void Add(const ImpactRecord &record) {
+        LastTime = record.Timestamp;
+        FirstTime = std::min(FirstTime, record.Timestamp);
+        Records.push_back(record);
     }
 
-    void GetForces(const double &timeStart, std::vector<ImpactRecord> &records) {
-        if (timeStart > _lastImpulseTime && timeStart < _firstImpulseTime) { return; } // TODO: refactor (this appears in ModalShader.cu)
+    // The impacts whose support contains `time`, with their impulse vectors scaled by the
+    // half-sine contact profile.
+    void GetForces(double time, std::vector<ImpactRecord> &out) const {
+        if (time > LastTime && time < FirstTime) return; // TODO: refactor (this also appears in the modal shader)
 
-        records.clear();
-        const int N_impulses = _impulses.size();
-        for (int frame_idx = 0; frame_idx < N_impulses; ++frame_idx) {
-            const ImpactRecord &record = _impulses.at(frame_idx);
-            if (timeStart >= record.timestamp && timeStart < record.timestamp + record.supportLength)
-                records.push_back(record);
+        out.clear();
+        for (const auto &record : Records) {
+            if (time >= record.Timestamp && time < record.Timestamp + record.SupportLength) out.push_back(record);
         }
+        for (auto &r : out) {
+            const double j = r.ImpactVector.norm();
+            r.ImpactVector = (r.ImpactVector / j) * r.Gamma;
 
-        const int N = records.size();
-        for (int frame_idx = 0; frame_idx < N; ++frame_idx) {
-            ImpactRecord &r = records[frame_idx];
-            const double j = r.impactVector.norm();
-            r.impactVector = (r.impactVector / j) * r.gamma;
-
-            double S = 0.; // TODO: refactor (this appears in ModalShader.cu)
-            if (timeStart <= r.timestamp + r.supportLength && timeStart >= r.timestamp)
-                S = std::sin(M_PI * (timeStart - r.timestamp) / r.supportLength);
-            r.impactVector *= S;
+            double s = 0.; // TODO: refactor (this also appears in the modal shader)
+            if (time <= r.Timestamp + r.SupportLength && time >= r.Timestamp) s = std::sin(std::numbers::pi * (time - r.Timestamp) / r.SupportLength);
+            r.ImpactVector *= s;
         }
     }
 
+    // Drops impulses whose contact speed is too low to be audible.
     void Filter() {
-        const double IMPULSE_VEL_THRESHOLD = 0.05;
-        for (std::vector<ImpactRecord>::iterator it = _impulses.begin(); it < _impulses.end();) {
-            if (abs(it->contactSpeed) < IMPULSE_VEL_THRESHOLD) {
-                it = _impulses.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        static constexpr double VelocityThreshold{0.05};
+        std::erase_if(Records, [](const ImpactRecord &r) { return std::abs(r.ContactSpeed) < VelocityThreshold; });
 
-        // update cached fields
-        if (!_impulses.empty()) {
-            _firstImpulseTime = _impulses.at(0).timestamp;
-            _lastImpulseTime = (_impulses.size() == 1) ? _firstImpulseTime + 1e-8 :
-                                                         _impulses.at(_impulses.size() - 1).timestamp;
+        if (Records.empty()) {
+            FirstTime = LastTime = 0.;
         } else {
-            _firstImpulseTime = 0.0;
-            _lastImpulseTime = 0.0;
+            FirstTime = Records.front().Timestamp;
+            LastTime = Records.size() == 1 ? FirstTime + 1e-8 : Records.back().Timestamp;
         }
     }
-    double firstImpulseTime() const { return _firstImpulseTime; }
-    double lastImpulseTime() const { return _lastImpulseTime; }
 
-    std::vector<ImpactRecord> _impulses;
-
-protected:
-    double _firstImpulseTime;
-    double _lastImpulseTime;
+    std::vector<ImpactRecord> Records;
+    double FirstTime{0}, LastTime{0};
 };
 
-/**
- * \class Solver
- * \brief
- */
-class Solver {
-public:
-    /** Constructor */
-    Solver(const std::string &dataPrefix, const std::string &meshFile, const std::string &matName, double dt);
+struct Solver {
+    Solver(const std::string &data_prefix, const std::string &mesh_file, const std::string &material_name, double dt);
 
-    /** Timesteps modal oscillators */
-    double step(double time);
+    // Timesteps the modal oscillators, returning their summed modal acceleration.
+    double Step(double time);
 
-    // void loadState(const std::string &stateFile);
-    // void saveState(const std::string &stateFile);
+    Eigen::MatrixXd EigenVectorsNormal; // Eigenvectors projected onto the vertex normal, N_S x M
+    Eigen::MatrixXd Normals;
 
-    // Make these public for now
-    Eigen::MatrixXd _eigenVectorsNormal; //!< eigenvectors projected to vertex normal direction, dim: N_S * M
-    Eigen::MatrixXd _normals;
+    Eigen::VectorXd QDotCPlus; // Modal velocity
+    Eigen::VectorXd QDDotC; // Modal acceleration
 
-    Eigen::VectorXd _qDot_c_plus; //!< modal velocity
-    Eigen::VectorXd _qDDot_c; //!< modal acceleration
+    ImpulseSeries Impulses;
 
-    ImpulseSeries _impulseSeries;
-
-    Eigen::Matrix3d _Inertia;
-    Eigen::Vector3d _centerOfMass;
-    double _mass = 0.;
-
-    Eigen::Matrix3d _I_Inv;
+    Eigen::Matrix3d Inertia, InvInertia;
+    Eigen::Vector3d CenterOfMass;
+    double Mass{0};
 
 private:
     void CullNonSurfaceModes();
-    double EffectiveMass(const Eigen::Vector3d &x, const Eigen::Vector3d &n);
-    double EstimateContactTimeScale(int vertex_a, double contactSpeed, const Eigen::Vector3d &impulse_a);
+    double EffectiveMass(const Eigen::Vector3d &x, const Eigen::Vector3d &n) const;
+    double EstimateContactTimeScale(int vertex, double contact_speed, const Eigen::Vector3d &impulse) const;
     void ComputeInertia();
     void LoadImpulses();
 
-    double _dt = 0.;
-    std::string _dataPrefix;
-    std::string _matName = "ABS Plastic";
+    double Dt{0};
+    std::string DataPrefix;
+    std::string MaterialName{"ABS Plastic"};
 
-    Eigen::VectorXd _eigenValues; // eigenvalues from modal analysis (omega^2 * density)
-    Eigen::MatrixXd _eigenVectors; // dim: 3 * N_V * M before culling, 3 * N_S * M after culling
+    Eigen::VectorXd EigenValues; // From modal analysis (omega^2 * density)
+    Eigen::MatrixXd EigenVectors; // 3 * N_V x M before culling, 3 * N_S x M after
 
-    Eigen::Matrix<double, Eigen::Dynamic, 3> _V;
-    // Eigen::Matrix<double, Eigen::Dynamic, 3> _FN;
-    Eigen::Matrix<int, Eigen::Dynamic, 3> _F;
+    Eigen::Matrix<double, Eigen::Dynamic, 3> V;
+    Eigen::Matrix<int, Eigen::Dynamic, 3> F;
 
-    Eigen::VectorXd _curvature;
+    Eigen::VectorXd Curvature;
 
-    Eigen::VectorXd _q_p; //!< previous displacement
-    Eigen::VectorXd _q_c; //!< current displacement
-    Eigen::VectorXd _q_n; //!< next displacement
-    Eigen::VectorXd _q_nn; //!< next next displacement
+    Eigen::VectorXd QPrev, QCur, QNext, QNextNext; // Displacement at t-1, t, t+1, t+2
 };
 
 } // namespace ModalSound
-
-#endif // #ifndef MODAL_SOUND_H

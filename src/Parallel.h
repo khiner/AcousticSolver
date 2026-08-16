@@ -4,9 +4,10 @@
 // iterations are independent and write disjoint (or identical) values, so results
 // are bit-identical to the serial loop.
 
+#include <dispatch/dispatch.h>
+
 #include <algorithm>
 #include <cstddef>
-#include <dispatch/dispatch.h>
 #include <thread>
 
 // Calls fn(begin, end) on contiguous chunks covering [0, n). Runs serially when the

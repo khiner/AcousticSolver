@@ -1,31 +1,32 @@
 // Ported from WaveBlender (c) 2024 Kangrui Xue (Object.cpp) — Metal port.
 // ObjectBase geometry, animation, and closest-point implementation.
 
-#include "Parallel.h"
 #include "Shaders.h"
+
+#include "Parallel.h"
 
 #include <sstream>
 
 namespace {
 // Barycentric weights of `p` within triangle (a, b, c).
-Eigen::RowVector3<REAL> BarycentricWeights(const Eigen::RowVector3<REAL> &p, const Eigen::RowVector3<REAL> &a, const Eigen::RowVector3<REAL> &b, const Eigen::RowVector3<REAL> &c) {
-    const Eigen::RowVector3<REAL> v0 = b - a, v1 = c - a, v2 = p - a;
-    const REAL d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1), d20 = v2.dot(v0), d21 = v2.dot(v1);
-    const REAL denom = d00 * d11 - d01 * d01;
-    const REAL w1 = (d11 * d20 - d01 * d21) / denom, w2 = (d00 * d21 - d01 * d20) / denom;
-    return Eigen::RowVector3<REAL>{REAL(1) - (w1 + w2), w1, w2};
+Eigen::RowVector3<real> BarycentricWeights(const Eigen::RowVector3<real> &p, const Eigen::RowVector3<real> &a, const Eigen::RowVector3<real> &b, const Eigen::RowVector3<real> &c) {
+    const Eigen::RowVector3<real> v0 = b - a, v1 = c - a, v2 = p - a;
+    const real d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1), d20 = v2.dot(v0), d21 = v2.dot(v1);
+    const real denom = d00 * d11 - d01 * d01;
+    const real w1 = (d11 * d20 - d01 * d21) / denom, w2 = (d00 * d21 - d01 * d20) / denom;
+    return Eigen::RowVector3<real>{real(1) - (w1 + w2), w1, w2};
 }
 } // namespace
 
-void ObjectBase::SetSamplePoints(const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &bn) {
+void ObjectBase::SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn) {
     NPoints = b.rows();
     B = b;
     BN = bn;
 
-    GpuB.Resize(B.size() * sizeof(REAL));
-    GpuBN.Resize(BN.size() * sizeof(REAL));
-    GpuB.Upload(B.data(), B.size() * sizeof(REAL));
-    GpuBN.Upload(BN.data(), BN.size() * sizeof(REAL));
+    GpuB.Resize(B.size() * sizeof(real));
+    GpuBN.Resize(BN.size() * sizeof(real));
+    GpuB.Upload(B.data(), B.size() * sizeof(real));
+    GpuBN.Upload(BN.data(), BN.size() * sizeof(real));
 }
 
 void ObjectBase::ReadAnimation() {
@@ -53,13 +54,12 @@ void ObjectBase::ReadAnimation() {
         Changed = false;
         return;
     }
-    // Scale Rot Trans
     const Eigen::Quaterniond quat1{Rotation1[0], Rotation1[1], Rotation1[2], Rotation1[3]};
     const Eigen::Quaterniond quat2{Rotation2[0], Rotation2[1], Rotation2[2], Rotation2[3]};
 
     const double alpha = ((Step + lookahead) * Dt + Ts - T1) / (T2 - T1);
-    const Eigen::Quaternion<REAL> quat = quat1.slerp(alpha, quat2).cast<REAL>();
-    const Eigen::Vector3<REAL> translation = ((1. - alpha) * Translation1 + alpha * Translation2).cast<REAL>();
+    const Eigen::Quaternion<real> quat = quat1.slerp(alpha, quat2).cast<real>();
+    const Eigen::Vector3<real> translation = ((1. - alpha) * Translation1 + alpha * Translation2).cast<real>();
 
     V1 = V2;
     for (int r = 0; r < V2.rows(); ++r) {
@@ -69,19 +69,19 @@ void ObjectBase::ReadAnimation() {
     Changed = true;
 }
 
-void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const {
+void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &v) const {
     i_out.resize(b.rows());
     ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
-        Eigen::RowVector3<REAL> closest;
+        Eigen::RowVector3<real> closest;
         for (size_t r = begin; r < end; ++r) Tree.ClosestPoint(v, F, b.row(r), i_out[r], closest);
     });
 }
 
-void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<REAL> &w_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const {
+void ObjectBase::ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<real> &w_out, const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &v) const {
     i_out.resize(b.rows());
     w_out.resize(b.rows(), 3);
     ParallelChunks(b.rows(), 256, [&](size_t begin, size_t end) {
-        Eigen::RowVector3<REAL> closest;
+        Eigen::RowVector3<real> closest;
         for (size_t r = begin; r < end; ++r) {
             int &index = i_out[r];
             Tree.ClosestPoint(v, F, b.row(r), index, closest);

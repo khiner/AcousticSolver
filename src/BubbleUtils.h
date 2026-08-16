@@ -1,87 +1,40 @@
-/** (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
- *
- * \file BubbleUtils.h
- * \brief Declares Bubble struct and associated BubbleUtils helper functions (e.g., loading Bubble data from file)
- */
+#pragma once
 
-#ifndef _FS_BUBBLE_UTILS_H
-#define _FS_BUBBLE_UTILS_H
-
-#define _USE_MATH_DEFINES // needed for M_PI in Visual Studio
-#include <math.h>
-
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
+// (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
+// A single physical bubble of a fluid simulation, and reading a bubble file from disk.
 
 #include <map>
+#include <string>
 #include <vector>
 
 namespace FluidSound {
 
-/** */
-enum EventType { ENTRAIN,
-                 MERGE,
-                 SPLIT,
-                 COLLAPSE };
-
-/**
- * \struct Bubble
- * \brief Represents a single, physical bubble within a fluid simulation
- *
- * Initialization handled by loadBubbleFile()
- */
-template<typename T>
-struct Bubble {
-    int bubID = -1; //!< global, unique ID
-    T radius = 0.; //!< effective radius
-
-    double startTime = -1.;
-    EventType startType; //!< start event (entrain, merge, or split)
-    double endTime = -1.;
-    EventType endType; //!< end event (merge, split, or collapse)
-
-    /** \brief IDs of parent Bubbles that this Bubble merges or splits from */
-    std::vector<int> prevBubIDs;
-
-    /** \brief IDs of child Bubbles that this Bubble merges or splits into */
-    std::vector<int> nextBubIDs;
-
-    // solve data (NOTE: does not include Bubble start and end times)
-    std::vector<double> solveTimes;
-    std::vector<T> w0, x, y, z;
-
-    bool hasSolveData() const { return !solveTimes.empty(); }
+enum class EventType {
+    Entrain,
+    Merge,
+    Split,
+    Collapse,
 };
 
-/**
- * \class BubbleUtils
- * \brief Helper functions for Bubble I/O, comparisons between Bubbles, etc.
- */
-template<typename T>
-class BubbleUtils {
-public:
-    /**
-     * \brief Loads entire bubble file from disk
-     * \param[out] bubMap   map from bubble ID to Bubble object
-     * \param[in]  bubFile  path to bubble file
-     */
-    static void loadBubbleFile(std::map<int, Bubble<T>> &bubMap, const std::string &bubFile);
+template<typename T> struct Bubble {
+    int Id{-1};
+    T Radius{0}; // Effective radius
 
-    /**
-     * \brief Given a list of bubble IDs, returns the ID of the largest bubble in that list
-     * \param[in]  bubIDs  vector of bubble IDs to consider
-     * \param[in]  bubMap  map from bubble ID to Bubble object
-     * \return  ID of largest bubble
-     */
-    static int largestBubbleID(const std::vector<int> &bubIDs, const std::map<int, Bubble<T>> &bubMap);
+    double StartTime{-1};
+    EventType StartType{}; // Entrain, merge, or split
+    double EndTime{-1};
+    EventType EndType{}; // Merge, split, or collapse
 
-private:
-    /** \private Parses input file stream data for a single Bubble */
-    static void _parseBubble(std::pair<int, Bubble<T>> &bubPair, std::ifstream &in);
+    std::vector<int> PrevIds; // Bubbles this one merges or splits from
+    std::vector<int> NextIds; // Bubbles this one merges or splits into
+
+    // Solve data (the bubble's own start and end times are not among these)
+    std::vector<double> SolveTimes;
+    std::vector<T> W0, X, Y, Z;
 };
+
+template<typename T> void LoadBubbleFile(std::map<int, Bubble<T>> &out, const std::string &filename);
+
+template<typename T> int LargestBubbleId(const std::vector<int> &ids, const std::map<int, Bubble<T>> &bubbles);
 
 } // namespace FluidSound
-
-#endif // #ifndef _FS_BUBBLE_UTILS_H

@@ -1,85 +1,44 @@
-/** (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
- *
- * \file FluidSound.h
- * \brief Public interface for FluidSound library; declares Solver class
- *
- * Based on code from Timothy Langlois and Ryan Aronson. Thanks to Zhehao Li for reviewing!
- */
+#pragma once
 
-#ifndef FLUID_SOUND_H
-#define FLUID_SOUND_H
+// (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
+// High-level manager for bubble-based water sound synthesis.
+//
+// Based on code from Timothy Langlois and Ryan Aronson. Thanks to Zhehao Li for reviewing!
 
-#include <set>
-
+#include "BubbleUtils.h"
 #include "Integrators.h"
+
+#include <memory>
 
 namespace FluidSound {
 
-/**
- * \class Solver
- * \brief High-level manager for bubble-based water sound synthesis
- */
-template<typename T>
-class Solver {
-public:
-    /**
-     * \brief Constructor: reads Bubble data from file and initializes Oscillators
-     * \param[in]  bubFile  path to bubble tracking file
-     * \param[in]  dt       timestep size
-     * \param[in]  scheme   coupling scheme (0 - uncoupled, 1 - coupled)
-     * \param[in]  ts       simulation start time (default 0.)
-     */
-    Solver(const std::string &bubFile, double dt, int scheme, double ts = 0.);
+template<typename T> struct Solver {
+    // Reads bubble data from `bubble_file` and initializes the oscillators.
+    // `scheme` selects the coupling scheme (0 uncoupled, 1 coupled), `ts` the simulation
+    // start time.
+    Solver(const std::string &bubble_file, double dt, int scheme, double ts = 0.);
 
-    /** \brief Timesteps Oscillator vibrations */
-    T step();
+    // Timesteps the oscillator vibrations, returning their summed volume acceleration.
+    T Step();
 
-    // void loadState(const std::string &stateFile);
-    // void saveState(const std::string &stateFile);
-
-    /** \brief Returns vector of ALL Oscillators, sorted by start time */
-    std::vector<Oscillator<T>> &oscillators() { return _oscillators; }
-
-    /** \brief Returns vector of sorted event times (i.e., when bubbles are added or removed) */
-    const std::vector<double> &eventTimes() { return _eventTimes; }
-
-    /** LOCAL PATCH (perf): exposes the integrator so a precomputed-factor provider can be
-     *  installed (see BubbleFactorPipeline.h). */
-    Integrator<T> *integrator() { return _integrator; }
-
-    /** \brief Prints timings from Integrator */
-    void printTimings() {
-        std::cout << "K,C,F time: " << _integrator->coeff_time.count() << std::endl;
-        std::cout << "M^-1 time:  " << _integrator->mass_time.count() << std::endl;
-        std::cout << "Solve time: " << _integrator->solve_time.count() << std::endl;
-    }
-
-    ~Solver() { delete _integrator; }
+    std::vector<Oscillator<T>> Oscillators; // All oscillators, sorted by start time
+    std::vector<double> EventTimes; // Sorted event times, i.e. when to refactor the mass matrix
+    // The integrator, exposed so a precomputed-factor provider can be installed
+    // (see BubbleFactorPipeline.h).
+    std::unique_ptr<Integrator<T>> Integ;
 
 private:
-    double _dt = 0.; //!< timestep size
-    double _ts = 0.; //!< simulation start time
-    int _step = 0; //!< current time step
+    // Chains bubbles together into oscillators.
+    void MakeOscillators(const std::map<int, Bubble<T>> &bubbles);
 
-    Integrator<T> *_integrator;
+    double Dt{0}; // Timestep size
+    double Ts{0}; // Simulation start time
+    int StepIndex{0};
 
-    std::vector<Oscillator<T> *> _coupled_osc;
-    std::vector<Oscillator<T> *> _uncoupled_osc;
-    std::vector<Oscillator<T> *> _total_osc; // LOCAL PATCH (perf): coupled + uncoupled, rebuilt only when they change
+    std::vector<Oscillator<T> *> CoupledOsc, UncoupledOsc;
+    std::vector<Oscillator<T> *> TotalOsc; // Coupled + uncoupled, rebuilt only when they change
 
-    std::vector<Oscillator<T>> _oscillators; //!< vector of ALL Oscillators, sorted by start time
-    int _osID = 0; //!< current _oscillators index
-
-    std::vector<double> _eventTimes; //!< vector of sorted event times (i.e., when to refactor the mass matrix)
-    int _evID = 0; //!< current _eventTimes index
-
-    /**
-     * \private Given bubble data, chains Bubbles together to form Oscillators
-     * \param[in]  bubMap  map from Bubble IDs to Bubble objects
-     */
-    void _makeOscillators(const std::map<int, Bubble<T>> &bubMap);
+    int OscIndex{0}, EventIndex{0}; // Cursors into Oscillators and EventTimes
 };
 
 } // namespace FluidSound
-
-#endif // #ifndef FLUID_SOUND_H

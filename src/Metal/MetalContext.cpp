@@ -9,16 +9,16 @@
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 
+#include "KernelParams.h"
+#include "MetalContext.h"
+#include "Profile.h"
+
 #include <algorithm>
 #include <cstring>
 #include <format>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-
-#include "KernelParams.h"
-#include "MetalContext.h"
-#include "Profile.h"
 
 namespace {
 std::string ReadFile(const std::string &path) {
@@ -60,7 +60,7 @@ MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool fold_ap
 
     const profile::Scope scope{"startup/pipeline_create"};
     auto *constants = MTL::FunctionConstantValues::alloc()->init();
-    constants->setConstantValue(&fold_apply, MTL::DataTypeBool, NS::UInteger{FOLD_APPLY_FC_INDEX});
+    constants->setConstantValue(&fold_apply, MTL::DataTypeBool, NS::UInteger{FoldApplyFcIndex});
     NS::Error *fn_error{nullptr};
     auto *fn = Library->newFunction(NS::String::string(name, NS::UTF8StringEncoding), constants, &fn_error);
     constants->release();

@@ -35,12 +35,12 @@ void Run(const std::string &config_file) {
 
     // Parse object parameters
     for (const auto &object_config : config["objects"]) {
-        const std::vector<REAL> offset_values = object_config["offset"];
-        const Eigen::Vector3<REAL> offset{offset_values[0], offset_values[1], offset_values[2]};
+        const std::vector<real> offset_values = object_config["offset"];
+        const Eigen::Vector3<real> offset{offset_values[0], offset_values[1], offset_values[2]};
 
         const std::string shader = object_config["shader"];
         if (shader == "Monopole") {
-            solver.AddObject<Monopole>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], REAL(object_config["freqHz"]), REAL(object_config["speed"]), params.C);
+            solver.AddObject<Monopole>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], real(object_config["freqHz"]), real(object_config["speed"]), params.C);
         } else if (shader == "Speaker") {
             solver.AddObject<Speaker>(offset, params.BlendRate, params.ShaderSrate, params.Ts, object_config["meshFile"], object_config["wavFile"], int(object_config["direction"]), object_config["animFile"]);
         } else if (shader == "Occluder") {
@@ -65,7 +65,6 @@ void Run(const std::string &config_file) {
         solver.AddListener(listener_config["format"], listener_config["position"], listener_config["output"]);
     }
 
-    // Run simulation
     while (solver.RunBatch()) {}
     profile::Report();
 }

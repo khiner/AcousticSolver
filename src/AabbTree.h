@@ -4,12 +4,12 @@
 // The split rule (median barycenter rank along the box's longest axis) and the child-visit
 // order mirror the reference implementation, so queries resolve to the triangle it picks.
 
+#include <Eigen/Core>
+
 #include <algorithm>
 #include <limits>
 #include <numeric>
 #include <vector>
-
-#include <Eigen/Core>
 
 template<typename Scalar> struct AabbTree {
     using Vertices = Eigen::MatrixX<Scalar>;

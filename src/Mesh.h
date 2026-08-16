@@ -1,9 +1,9 @@
 #pragma once
 
+#include <Eigen/Core>
+
 #include <string>
 #include <vector>
-
-#include <Eigen/Core>
 
 // Reads a Wavefront .obj into flat, row-major positions and vertex indices, ignoring every
 // line but `v` and `f`. Returns false if the file cannot be opened or a `v`/`f` line is

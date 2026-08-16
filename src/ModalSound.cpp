@@ -1,283 +1,245 @@
-/** (c) 2024 Kangrui Xue, (c) 2023 Jui-Hsien Wang. Adapted from ModalSound / openpbso (MIT) — see NOTICE.md.
- *
- * \file ModalSound.cpp
- * \brief Implements Solver class
- *
- * Based on code by Jui-Hsien Wang (https://github.com/jhwang7628/openpbso)
- *
- * TODO: in general, this library is still pretty barebones (and in need of cleanup)
- */
+// (c) 2024 Kangrui Xue, (c) 2023 Jui-Hsien Wang. Adapted from ModalSound / openpbso (MIT) — see NOTICE.md.
+//
+// Based on code by Jui-Hsien Wang (https://github.com/jhwang7628/openpbso)
 
 #include "ModalSound.h"
 
+#include "Mesh.h"
+#include "ModeData.h"
+
+#include <map>
+#include <stdexcept>
+
 namespace ModalSound {
 
-Solver::Solver(const std::string &dataPrefix, const std::string &meshFile, const std::string &matName, double dt) : _dt(dt), _dataPrefix(dataPrefix), _matName(matName) {
-    // First, read the modes into ModeData struct
-    ModeData modeData;
-    std::string const modeFile = dataPrefix + ".modes";
-    modeData.read(modeFile.c_str());
+namespace {
+// Default ABS plastic.
+struct ModalMaterial {
+    int Id{0};
+    double Alpha{30.};
+    double Beta{1e-6};
+    double Density{1070.}; // Assumed constant and uniform
+    double YoungsModulus{1.4e9};
+    double PoissonRatio{0.35};
 
-    const int N_modes = modeData.numModes();
-    const int N_DOF = modeData.numDOF();
+    double OneMinusNu2OverE() const { return (1. - std::pow(PoissonRatio, 2)) / YoungsModulus; }
+    double Xi(double omega) const { return 0.5 * (Alpha / omega + Beta * omega); } // Eq. 10, xi in [0, 1]
+    double OmegaD(double omega) const { return omega * std::sqrt(1. - std::pow(Xi(omega), 2)); } // Eq. 12
+};
 
-    // Copy data into Eigen matrices / vectors
-    _eigenValues.resize(N_modes);
-    _eigenVectors.resize(N_DOF, N_modes);
-    for (int m_idx = 0; m_idx < N_modes; ++m_idx) {
-        _eigenValues(m_idx) = modeData.omegaSquared(m_idx);
-        for (int d_idx = 0; d_idx < N_DOF; ++d_idx) {
-            _eigenVectors(d_idx, m_idx) = modeData.mode(m_idx).at(d_idx);
-        }
+// TODO: support other materials
+ModalMaterial MaterialByName(const std::string &name) {
+    if (name != "Glass") return {};
+    return {.Id = 1, .Alpha = 1., .Beta = 1e-7, .Density = 2600., .YoungsModulus = 6.2e10, .PoissonRatio = 0.2};
+}
+} // namespace
+
+Solver::Solver(const std::string &data_prefix, const std::string &mesh_file, const std::string &material_name, double dt)
+    : Dt(dt), DataPrefix(data_prefix), MaterialName(material_name) {
+    ModeData mode_data;
+    mode_data.Read(data_prefix + ".modes");
+
+    const int n_modes = mode_data.OmegaSquared.size();
+    const int n_dof = n_modes > 0 ? mode_data.Modes[0].size() : 0;
+
+    EigenValues.resize(n_modes);
+    EigenVectors.resize(n_dof, n_modes);
+    for (int m = 0; m < n_modes; ++m) {
+        EigenValues(m) = mode_data.OmegaSquared.at(m);
+        for (int d = 0; d < n_dof; ++d) EigenVectors(d, m) = mode_data.Modes.at(m).at(d);
     }
     CullNonSurfaceModes();
 
-    // Read mesh and precompute curvature + inertia
-    // LOCAL PATCH: ReadObj / MeanCurvature (Mesh.h). Only the mean of the two principal
-    // curvatures was ever used here.
-    ReadObj(meshFile, _V, _F);
-
-    _curvature = MeanCurvature(_V, _F);
+    ReadObj(mesh_file, V, F);
+    Curvature = MeanCurvature(V, F);
 
     ComputeInertia();
-
-    // Load acceleration noise impulses
     LoadImpulses();
 
-    // Initialize modal dynamics vectors
-    _q_p.setZero(N_modes);
-    _q_c.setZero(N_modes);
-    _q_n.setZero(N_modes);
-    _q_nn.setZero(N_modes);
+    QPrev.setZero(n_modes);
+    QCur.setZero(n_modes);
+    QNext.setZero(n_modes);
+    QNextNext.setZero(n_modes);
 
-    _qDot_c_plus.setZero(N_modes);
-    _qDDot_c.setZero(N_modes);
+    QDotCPlus.setZero(n_modes);
+    QDDotC.setZero(n_modes);
 }
 
-namespace {
+double Solver::Step(double time) {
+    std::vector<ImpactRecord> active;
+    Impulses.GetForces(time, active);
 
-struct ModalMaterial // Default ABS Plastic
-{
-    int id = 0;
-    double alpha = 30.;
-    double beta = 1e-6;
-    double density = 1070.0; // assuming we always have constant, uniform density
-    double youngsModulus = 1.4e9;
-    double poissonRatio = 0.35;
-
-    double one_minus_nu2_over_E() const { return (1.0 - std::pow(poissonRatio, 2)) / youngsModulus; }
-    double xi(const double &omega_i) const { return 0.5 * (alpha / omega_i + beta * omega_i); } // eq. 10, xi = [0, 1]
-    double omega_di(const double &omega_i) const { return omega_i * sqrt(1.0 - pow(xi(omega_i), 2)); } // eq. 12.
-};
-
-} // namespace
-
-double Solver::step(double time) {
-    std::vector<ImpactRecord> activeImpacts;
-    Eigen::VectorXd forceTimestep;
-
-    _impulseSeries.GetForces(time, activeImpacts);
-
-    // Get force in modal space
-    forceTimestep.setZero(_eigenVectors.cols());
-    const int N_records = activeImpacts.size();
-
-    // For each impact within this timestep, add forces to the corresponding modes
-    for (int rec_idx = 0; rec_idx < N_records; ++rec_idx) {
-        const Eigen::Vector3d force = activeImpacts[rec_idx].impactVector;
-        const int &vertexID = activeImpacts[rec_idx].appliedVertex;
-
-        forceTimestep += _eigenVectors.row(3 * vertexID + 0) * force[0] + _eigenVectors.row(3 * vertexID + 1) * force[1] + _eigenVectors.row(3 * vertexID + 2) * force[2];
+    // Force in modal space: for each impact within this timestep, add forces to the corresponding modes
+    Eigen::VectorXd force = Eigen::VectorXd::Zero(EigenVectors.cols());
+    for (const auto &impact : active) {
+        const Eigen::Vector3d &j = impact.ImpactVector;
+        const int vertex = impact.AppliedVertex;
+        force += EigenVectors.row(3 * vertex + 0) * j[0] + EigenVectors.row(3 * vertex + 1) * j[1] + EigenVectors.row(3 * vertex + 2) * j[2];
     }
 
-    // TODO: support other materials
-    ModalMaterial material;
-    if (_matName == "Glass") {
-        material.id = 1;
-        material.alpha = 1.;
-        material.beta = 1e-7;
-        material.density = 2600.0;
-        material.youngsModulus = 6.2e10;
-        material.poissonRatio = 0.2;
-    }
+    const auto material = MaterialByName(MaterialName);
 
-    // Compute filter coefficients for time step
-    const int N_modes = _eigenVectors.cols();
-    Eigen::VectorXd _coeff_qNew = Eigen::VectorXd::Zero(N_modes);
-    Eigen::VectorXd _coeff_qOld = Eigen::VectorXd::Zero(N_modes);
-    Eigen::VectorXd _coeff_Q = Eigen::VectorXd::Zero(N_modes);
-    for (int i = 0; i < N_modes; i++) {
-        double const omega = std::sqrt(_eigenValues[i] / material.density);
-        double const omega_di = material.omega_di(omega);
+    // Filter coefficients for this time step
+    const int n_modes = EigenVectors.cols();
+    Eigen::VectorXd coeff_q_new = Eigen::VectorXd::Zero(n_modes);
+    Eigen::VectorXd coeff_q_old = Eigen::VectorXd::Zero(n_modes);
+    Eigen::VectorXd coeff_q = Eigen::VectorXd::Zero(n_modes);
+    for (int i = 0; i < n_modes; ++i) {
+        const double omega = std::sqrt(EigenValues[i] / material.Density);
+        const double omega_d = material.OmegaD(omega);
 
-        double const xi = material.xi(omega);
-        double const _epsilon = std::exp(-xi * omega * _dt);
-        double const _theta = omega_di * _dt;
-        double const _gamma = std::asin(xi);
+        const double xi = material.Xi(omega);
+        const double epsilon = std::exp(-xi * omega * Dt);
+        const double theta = omega_d * Dt;
+        const double gamma = std::asin(xi);
 
-        _coeff_qNew[i] = 2. * _epsilon * std::cos(_theta);
-        _coeff_qOld[i] = _epsilon * _epsilon;
-        _coeff_Q[i] = 2. / (3. * omega * omega_di) * (_epsilon * std::cos(_theta + _gamma) - _epsilon * _epsilon * std::cos(2. * _theta + _gamma)) / material.density;
+        coeff_q_new[i] = 2. * epsilon * std::cos(theta);
+        coeff_q_old[i] = epsilon * epsilon;
+        coeff_q[i] = 2. / (3. * omega * omega_d) * (epsilon * std::cos(theta + gamma) - epsilon * epsilon * std::cos(2. * theta + gamma)) / material.Density;
     }
 
     // Step the system
-    _q_nn = _coeff_qNew.cwiseProduct(_q_n) - _coeff_qOld.cwiseProduct(_q_c) + _coeff_Q.cwiseProduct(forceTimestep);
+    QNextNext = coeff_q_new.cwiseProduct(QNext) - coeff_q_old.cwiseProduct(QCur) + coeff_q.cwiseProduct(force);
 
-    _qDot_c_plus = (_q_n - _q_c) / _dt;
-    _qDDot_c = (_q_n + _q_p - 2.0 * _q_c) / (_dt * _dt);
+    QDotCPlus = (QNext - QCur) / Dt;
+    QDDotC = (QNext + QPrev - 2. * QCur) / (Dt * Dt);
 
-    // Update pointers
-    _q_p = _q_c;
-    _q_c = _q_n;
-    _q_n = _q_nn;
+    QPrev = QCur;
+    QCur = QNext;
+    QNext = QNextNext;
 
-    return _qDDot_c.sum();
+    return QDDotC.sum();
 }
 
 void Solver::CullNonSurfaceModes() {
-    std::ifstream geoFile(_dataPrefix + ".geo.txt");
-    int mapSize;
-    geoFile >> mapSize;
+    std::ifstream geo_file{DataPrefix + ".geo.txt"};
+    int map_size;
+    geo_file >> map_size;
 
     int tet_idx, surf_idx;
     double nx, ny, nz, area;
-    std::map<int, int> idxMap;
+    std::map<int, int> surf_of_tet;
     std::vector<Eigen::Vector3d> normals;
-    while (geoFile >> tet_idx >> surf_idx >> nx >> ny >> nz >> area) {
-        idxMap.insert(std::pair<int, int>(tet_idx, surf_idx));
-        normals.push_back(Eigen::Vector3d({nx, ny, nz}));
+    while (geo_file >> tet_idx >> surf_idx >> nx >> ny >> nz >> area) {
+        surf_of_tet.insert({tet_idx, surf_idx});
+        normals.emplace_back(nx, ny, nz);
     }
 
-    const int N_surfaceVertices = idxMap.size();
-    const int N_volumeVertices = _eigenVectors.rows() / 3;
-    const int N_modes = _eigenVectors.cols();
+    const int n_surface_vertices = surf_of_tet.size();
+    const int n_volume_vertices = EigenVectors.rows() / 3;
+    const int n_modes = EigenVectors.cols();
 
-    Eigen::MatrixXd culledEigenVectors(N_surfaceVertices * 3, N_modes);
-    _eigenVectorsNormal.resize(N_surfaceVertices, N_modes);
-    _normals.resize(N_surfaceVertices, 3);
-    for (int vol_idx = 0; vol_idx < N_volumeVertices; ++vol_idx) {
-        if (idxMap.count(vol_idx) == 0) { continue; }
+    Eigen::MatrixXd culled(n_surface_vertices * 3, n_modes);
+    EigenVectorsNormal.resize(n_surface_vertices, n_modes);
+    Normals.resize(n_surface_vertices, 3);
+    for (int vol = 0; vol < n_volume_vertices; ++vol) {
+        const auto it = surf_of_tet.find(vol);
+        if (it == surf_of_tet.end()) continue;
 
-        const int surf_idx = idxMap[vol_idx];
-        _normals.row(surf_idx) = normals[surf_idx];
+        const int surf = it->second;
+        Normals.row(surf) = normals[surf];
 
-        culledEigenVectors.row(surf_idx * 3 + 0) = _eigenVectors.row(vol_idx * 3 + 0);
-        culledEigenVectors.row(surf_idx * 3 + 1) = _eigenVectors.row(vol_idx * 3 + 1);
-        culledEigenVectors.row(surf_idx * 3 + 2) = _eigenVectors.row(vol_idx * 3 + 2);
-        _eigenVectorsNormal.row(surf_idx) = _eigenVectors.row(vol_idx * 3 + 0) * normals[surf_idx][0] + _eigenVectors.row(vol_idx * 3 + 1) * normals[surf_idx][1] + _eigenVectors.row(vol_idx * 3 + 2) * normals[surf_idx][2];
+        culled.row(surf * 3 + 0) = EigenVectors.row(vol * 3 + 0);
+        culled.row(surf * 3 + 1) = EigenVectors.row(vol * 3 + 1);
+        culled.row(surf * 3 + 2) = EigenVectors.row(vol * 3 + 2);
+        EigenVectorsNormal.row(surf) = EigenVectors.row(vol * 3 + 0) * normals[surf][0] + EigenVectors.row(vol * 3 + 1) * normals[surf][1] + EigenVectors.row(vol * 3 + 2) * normals[surf][2];
     }
 
-    _eigenVectors = culledEigenVectors;
+    EigenVectors = culled;
 }
 
-double Solver::EffectiveMass(const Eigen::Vector3d &x, const Eigen::Vector3d &n) {
-    const Eigen::Vector3d r = x - _centerOfMass; // mass center = volume center
+double Solver::EffectiveMass(const Eigen::Vector3d &x, const Eigen::Vector3d &n) const {
+    const Eigen::Vector3d r = x - CenterOfMass; // Mass center = volume center
     const Eigen::Vector3d r_cross_n = r.cross(n.normalized());
-    const Eigen::Vector3d premult = _I_Inv * r_cross_n;
-    double const one_over_m_corr = r_cross_n.dot(premult);
-    return 1. / (1. / _mass + one_over_m_corr);
+    const Eigen::Vector3d premult = InvInertia * r_cross_n;
+    const double one_over_m_corr = r_cross_n.dot(premult);
+    return 1. / (1. / Mass + one_over_m_corr);
 }
 
-double Solver::EstimateContactTimeScale(int vertex_a, double contactSpeed, const Eigen::Vector3d &impulse_a) {
-    const ModalMaterial material_a;
-    const Eigen::Vector3d x_a = _V.row(vertex_a);
-    const double m = EffectiveMass(x_a, impulse_a);
-    double const one_over_r = _curvature(vertex_a);
-    const double one_over_E = material_a.one_minus_nu2_over_E();
+double Solver::EstimateContactTimeScale(int vertex, double contact_speed, const Eigen::Vector3d &impulse) const {
+    const ModalMaterial material;
+    const Eigen::Vector3d x = V.row(vertex);
+    const double m = EffectiveMass(x, impulse);
+    const double one_over_r = Curvature(vertex);
+    const double one_over_e = material.OneMinusNu2OverE();
 
-    return 2.87 * std::pow(std::pow(m * one_over_E, 2) * std::fabs(one_over_r / contactSpeed), 0.2);
+    return 2.87 * std::pow(std::pow(m * one_over_e, 2) * std::fabs(one_over_r / contact_speed), 0.2);
 }
 
 void Solver::LoadImpulses() {
-    std::ifstream inFile(_dataPrefix + ".impulses.txt");
+    std::ifstream in{DataPrefix + ".impulses.txt"};
 
-    int objectID = -1, objectID_old = -1, count = 0;
-    char pairOrder, impulseType;
-    ImpactRecord buffer, buffer_old;
-    while (inFile >> buffer.timestamp >> objectID >> buffer.appliedVertex >> buffer.contactSpeed >> buffer.impactVector[0] >> buffer.impactVector[1] >> buffer.impactVector[2] >> pairOrder >> impulseType) {
-        if (objectID == 0) {
-            if (impulseType == 'C') {
-                buffer.supportLength = EstimateContactTimeScale(buffer.appliedVertex, buffer.contactSpeed, buffer.impactVector); // TODO: factor out
-                buffer.impactPosition = _V.row(buffer.appliedVertex);
-                buffer.gamma = M_PI * buffer.impactVector.norm() / 2. / buffer.supportLength;
-                _impulseSeries.AddImpulse(buffer); // assumes point impulse
-            }
-            // Was `"..." + impulseType`, which offsets the literal by the char's value and reads out of bounds.
-            else { throw std::runtime_error(std::string("Unsupported impulse type: ") + impulseType); }
-        }
-        buffer_old = buffer;
-        objectID_old = objectID;
-        count++;
+    int object_id = -1;
+    char pair_order, impulse_type;
+    ImpactRecord record;
+    while (in >> record.Timestamp >> object_id >> record.AppliedVertex >> record.ContactSpeed >> record.ImpactVector[0] >> record.ImpactVector[1] >> record.ImpactVector[2] >> pair_order >> impulse_type) {
+        if (object_id != 0) continue;
+
+        // Was `"..." + impulseType`, which offsets the literal by the char's value and reads out of bounds.
+        if (impulse_type != 'C') throw std::runtime_error(std::string{"Unsupported impulse type: "} + impulse_type);
+
+        record.SupportLength = EstimateContactTimeScale(record.AppliedVertex, record.ContactSpeed, record.ImpactVector); // TODO: factor out
+        record.ImpactPosition = V.row(record.AppliedVertex);
+        record.Gamma = std::numbers::pi * record.ImpactVector.norm() / 2. / record.SupportLength;
+        Impulses.Add(record); // Assumes a point impulse
     }
-    _impulseSeries.Filter();
+    Impulses.Filter();
 }
 
-/** */
 void Solver::ComputeInertia() {
-    // Read tetrahedral mesh
-    std::ifstream inFile(_dataPrefix + ".tet", std::ios::in | std::ios::binary);
+    std::ifstream in{DataPrefix + ".tet", std::ios::in | std::ios::binary};
 
-    int Nverts, Ntets;
-    Eigen::MatrixXd V;
-    Eigen::MatrixXi T;
+    int n_verts, n_tets;
+    Eigen::MatrixXd v;
+    Eigen::MatrixXi t;
 
-    Eigen::Vector3d Vbuf;
-    Eigen::Vector4i Tbuf;
-    inFile.read(reinterpret_cast<char *>(&Nverts), sizeof(int)); // first 4 bytes empty -- skip ahead
-    inFile.read(reinterpret_cast<char *>(&Nverts), sizeof(int));
-    V.resize(Nverts, 3);
-    for (int i = 0; i < Nverts; i++) {
-        inFile.read(reinterpret_cast<char *>(Vbuf.data()), 3 * sizeof(double));
-        V.row(i) = Vbuf;
+    Eigen::Vector3d v_buf;
+    Eigen::Vector4i t_buf;
+    in.read(reinterpret_cast<char *>(&n_verts), sizeof(int)); // First 4 bytes empty: skip ahead
+    in.read(reinterpret_cast<char *>(&n_verts), sizeof(int));
+    v.resize(n_verts, 3);
+    for (int i = 0; i < n_verts; ++i) {
+        in.read(reinterpret_cast<char *>(v_buf.data()), 3 * sizeof(double));
+        v.row(i) = v_buf;
     }
-    inFile.read(reinterpret_cast<char *>(&Ntets), sizeof(int));
-    T.resize(Ntets, 4);
-    for (int i = 0; i < Ntets; i++) {
-        inFile.read(reinterpret_cast<char *>(Tbuf.data()), 4 * sizeof(int));
-        T.row(i) = Tbuf;
-    }
-
-    Eigen::VectorXd volumes = Eigen::VectorXd::Zero(Nverts); // volume (scale by density to get mass)
-    for (int i = 0; i < Ntets; i++) {
-        Eigen::Vector3d const p1 = V.row(T(i, 0));
-        Eigen::Vector3d const p2 = V.row(T(i, 1));
-        Eigen::Vector3d const p3 = V.row(T(i, 2));
-        Eigen::Vector3d const p4 = V.row(T(i, 3));
-
-        Eigen::Vector3d const ad = p2 - p1;
-        Eigen::Vector3d const bd = p3 - p1;
-        Eigen::Vector3d const cd = p4 - p1;
-
-        double const vol = (std::abs(ad.dot(bd.cross(cd))) / 6.) * 0.25;
-
-        volumes[T(i, 0)] += vol;
-        volumes[T(i, 1)] += vol;
-        volumes[T(i, 2)] += vol;
-        volumes[T(i, 3)] += vol;
+    in.read(reinterpret_cast<char *>(&n_tets), sizeof(int));
+    t.resize(n_tets, 4);
+    for (int i = 0; i < n_tets; ++i) {
+        in.read(reinterpret_cast<char *>(t_buf.data()), 4 * sizeof(int));
+        t.row(i) = t_buf;
     }
 
-    double totalVolume = 0.;
-    _centerOfMass = Eigen::Vector3d::Zero();
-    for (int i = 0; i < Nverts; i++) {
-        totalVolume += volumes[i];
-        _centerOfMass += volumes[i] * V.row(i);
-    }
-    _centerOfMass /= totalVolume; // mass center
+    Eigen::VectorXd volumes = Eigen::VectorXd::Zero(n_verts); // Scale by density to get mass
+    for (int i = 0; i < n_tets; ++i) {
+        const Eigen::Vector3d p1 = v.row(t(i, 0)), p2 = v.row(t(i, 1)), p3 = v.row(t(i, 2)), p4 = v.row(t(i, 3));
+        const Eigen::Vector3d ad = p2 - p1, bd = p3 - p1, cd = p4 - p1;
+        const double vol = (std::abs(ad.dot(bd.cross(cd))) / 6.) * 0.25;
 
-    _Inertia = Eigen::Matrix3d::Zero();
-    for (int i = 0; i < Nverts; i++) {
-        Eigen::Vector3d ri = V.row(i);
-        ri -= _centerOfMass;
-        Eigen::Matrix3d Tmp;
-        Tmp << volumes[i] * (ri[1] * ri[1] + ri[2] * ri[2]), -volumes[i] * ri[0] * ri[1], -volumes[i] * ri[0] * ri[2],
+        for (int c = 0; c < 4; ++c) volumes[t(i, c)] += vol;
+    }
+
+    double total_volume = 0.;
+    CenterOfMass = Eigen::Vector3d::Zero();
+    for (int i = 0; i < n_verts; ++i) {
+        total_volume += volumes[i];
+        CenterOfMass += volumes[i] * v.row(i);
+    }
+    CenterOfMass /= total_volume;
+
+    Inertia = Eigen::Matrix3d::Zero();
+    for (int i = 0; i < n_verts; ++i) {
+        Eigen::Vector3d ri = v.row(i);
+        ri -= CenterOfMass;
+        Eigen::Matrix3d tmp;
+        tmp << volumes[i] * (ri[1] * ri[1] + ri[2] * ri[2]), -volumes[i] * ri[0] * ri[1], -volumes[i] * ri[0] * ri[2],
             -volumes[i] * ri[1] * ri[0], volumes[i] * (ri[0] * ri[0] + ri[2] * ri[2]), -volumes[i] * ri[1] * ri[2],
             -volumes[i] * ri[2] * ri[0], -volumes[i] * ri[2] * ri[1], volumes[i] * (ri[0] * ri[0] + ri[1] * ri[1]);
-        _Inertia += Tmp;
+        Inertia += tmp;
     }
 
-    ModalMaterial const material_a;
-    _I_Inv = (_Inertia * material_a.density).inverse();
-    _mass = totalVolume * material_a.density;
+    const ModalMaterial material;
+    InvInertia = (Inertia * material.Density).inverse();
+    Mass = total_volume * material.Density;
 }
 
 } // namespace ModalSound

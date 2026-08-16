@@ -1,283 +1,232 @@
-/** (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
- *
- * \file FluidSound.cpp
- * \brief Implements Solver class
- */
+// (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
 
 #include "FluidSound.h"
 
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <numbers>
+#include <set>
+#include <stdexcept>
+
 namespace FluidSound {
 
-/** */
-template<typename T>
-Solver<T>::Solver(const std::string &bubFile, double dt, int scheme, double ts) : _dt(dt), _ts(ts) {
-    std::map<int, Bubble<T>> allBubbles;
+template<typename T> Solver<T>::Solver(const std::string &bubble_file, double dt, int scheme, double ts) : Dt(dt), Ts(ts) {
+    std::map<int, Bubble<T>> bubbles;
 
-    std::cout << "Reading bubble data from \"" << bubFile << "\"" << std::endl;
-    BubbleUtils<T>::loadBubbleFile(allBubbles, bubFile);
+    std::cout << "Reading bubble data from \"" << bubble_file << "\"" << std::endl;
+    LoadBubbleFile(bubbles, bubble_file);
 
-    _makeOscillators(allBubbles);
-    std::cout << "Total number of oscillators = " << _oscillators.size() << std::endl;
+    MakeOscillators(bubbles);
+    std::cout << "Total number of oscillators = " << Oscillators.size() << std::endl;
 
-    switch (scheme) {
-        case 1: _integrator = new Coupled_Direct<T>(dt); break;
-        default: _integrator = new Uncoupled<T>(dt); break;
-    }
+    if (scheme == 1) Integ = std::make_unique<CoupledDirect<T>>(dt);
+    else Integ = std::make_unique<Uncoupled<T>>(dt);
 }
 
-/** */
-template<typename T>
-T Solver<T>::step() {
-    double const time = _dt * _step + _ts;
+template<typename T> T Solver<T>::Step() {
+    const double time = Dt * StepIndex + Ts;
 
-    bool lists_changed = false; // LOCAL PATCH (perf): tracks whether _total_osc needs rebuilding
+    bool lists_changed = false; // Whether TotalOsc needs rebuilding
 
-    // Check if any events (e.g., Bubbles added or removed) will occurr during this timestep
-    while (_evID < _eventTimes.size() && time >= _eventTimes[_evID]) {
-        if (time < _eventTimes[_evID + 1]) {
+    // Check whether any events (bubbles added or removed) occur during this timestep
+    while (EventIndex < EventTimes.size() && time >= EventTimes[EventIndex]) {
+        if (time < EventTimes[EventIndex + 1]) {
             lists_changed = true;
-            double const time1 = _eventTimes[_evID];
-            double const time2 = _eventTimes[_evID + 1];
+            const double time1 = EventTimes[EventIndex], time2 = EventTimes[EventIndex + 1];
 
-            // Check if any Oscillators have ended by time1. We uncouple them from the bubble cloud but
-            //    continue timestepping their oscillations (until they die out) to avoid discontinuities.
+            // Oscillators that have ended by time1 uncouple from the bubble cloud, but keep
+            // timestepping (until they die out) to avoid discontinuities.
             int coupled_idx = 0;
-            for (Oscillator<T> *osc : _coupled_osc) {
-                if (time1 >= osc->endTime) {
-                    _uncoupled_osc.push_back(osc);
+            for (Oscillator<T> *osc : CoupledOsc) {
+                if (time1 >= osc->EndTime) {
+                    UncoupledOsc.push_back(osc);
                     continue;
                 }
-                _coupled_osc[coupled_idx] = osc;
-                coupled_idx++;
+                CoupledOsc[coupled_idx++] = osc;
             }
-            _coupled_osc.resize(coupled_idx);
+            CoupledOsc.resize(coupled_idx);
 
-            // Of uncoupled Oscillators, check if any have decayed sufficiently by time1.
-            //   These Oscillators are fully removed.
+            // Uncoupled oscillators that have decayed sufficiently by time1 are fully removed.
             int uncoupled_idx = 0;
-            for (Oscillator<T> *osc : _uncoupled_osc) {
-                if (osc->is_dead()) {
-                    continue;
-                }
-                _uncoupled_osc[uncoupled_idx] = osc;
-                uncoupled_idx++;
+            for (Oscillator<T> *osc : UncoupledOsc) {
+                if (osc->IsDead()) continue;
+                UncoupledOsc[uncoupled_idx++] = osc;
             }
-            _uncoupled_osc.resize(uncoupled_idx);
+            UncoupledOsc.resize(uncoupled_idx);
 
-            // Check if any Oscillators will start between time1 and time2.
-            //    NOTE: _oscillators sorted by increasing startTime.
-            while (_osID < _oscillators.size() && time >= _oscillators[_osID].startTime &&
-                   _oscillators[_osID].startTime < time2) {
-                // NOLINTNEXTLINE(misc-const-correctness) pointee cannot be const: osc is stored in _coupled_osc, a vector of non-const pointers
-                Oscillator<T> *const osc = &(_oscillators[_osID]);
-                if (time1 < osc->endTime) {
-                    _coupled_osc.push_back(osc);
-                }
-                _osID++;
+            // Oscillators starting between time1 and time2 (Oscillators is sorted by start time)
+            while (OscIndex < Oscillators.size() && time >= Oscillators[OscIndex].StartTime && Oscillators[OscIndex].StartTime < time2) {
+                // NOLINTNEXTLINE(misc-const-correctness) pointee cannot be const: osc is stored in CoupledOsc, a vector of non-const pointers
+                Oscillator<T> *const osc = &Oscillators[OscIndex];
+                if (time1 < osc->EndTime) CoupledOsc.push_back(osc);
+                ++OscIndex;
             }
 
-            // Prepare _integrator for timestepping: transfer data + refactor mass matrix
-            _integrator->updateData(_coupled_osc, _uncoupled_osc, time1, time2);
-            _integrator->refactor();
+            // Prepare the integrator for timestepping: transfer data + refactor the mass matrix
+            Integ->UpdateData(CoupledOsc, UncoupledOsc, time1, time2);
+            Integ->Refactor();
         }
-        _evID++;
+        ++EventIndex;
     }
-    _step++;
+    ++StepIndex;
 
-    // LOCAL PATCH (perf): the coupled/uncoupled lists only change in the event branch
-    // above, so the concatenated list is rebuilt only then
-    if (lists_changed || _total_osc.size() != _coupled_osc.size() + _uncoupled_osc.size()) {
-        _total_osc.assign(_coupled_osc.begin(), _coupled_osc.end());
-        _total_osc.insert(_total_osc.end(), _uncoupled_osc.begin(), _uncoupled_osc.end());
+    // The coupled/uncoupled lists only change in the event branch above, so the
+    // concatenated list is rebuilt only then.
+    if (lists_changed || TotalOsc.size() != CoupledOsc.size() + UncoupledOsc.size()) {
+        TotalOsc.assign(CoupledOsc.begin(), CoupledOsc.end());
+        TotalOsc.insert(TotalOsc.end(), UncoupledOsc.begin(), UncoupledOsc.end());
     }
-    const std::vector<Oscillator<T> *> &total_osc = _total_osc;
-    size_t const N_total = total_osc.size();
+    const size_t n_total = TotalOsc.size();
+    if (n_total == 0) return 0.;
 
-    if (N_total == 0) { return 0.; }
-    // if (N_total > 1024) { throw std::runtime_error("Too many bubbles for coupling!"); }
+    Integ->Step(time);
 
-    _integrator->step(time);
+    // Unpack the integrator's states back into the oscillators
+    T total_response = 0.;
+    for (size_t i = 0; i < n_total; ++i) {
+        TotalOsc[i]->State(0) = Integ->States(i);
+        TotalOsc[i]->State(1) = Integ->States(i + n_total);
 
-    // Unpack _integrator->States() to update Oscillator states accordingly
-    T total_response = 0.0;
-    for (int i = 0; i < N_total; i++) {
-        total_osc[i]->state(0) = _integrator->States()(i);
-        total_osc[i]->state(1) = _integrator->States()(i + N_total);
-
-        total_osc[i]->accel = _integrator->Derivs()(i + N_total);
-        total_response += total_osc[i]->accel;
+        TotalOsc[i]->Accel = Integ->Derivs(i + n_total);
+        total_response += TotalOsc[i]->Accel;
     }
-    if (std::abs(total_response) > 100.) { throw std::runtime_error("Instability detected!"); }
+    if (std::abs(total_response) > 100.) throw std::runtime_error("Instability detected!");
 
     return total_response;
 }
 
-/** */
-template<typename T>
-void Solver<T>::_makeOscillators(const std::map<int, Bubble<T>> &bubMap) {
-    _oscillators.clear();
-    std::set<double> eventTimesSet;
+template<typename T> void Solver<T>::MakeOscillators(const std::map<int, Bubble<T>> &bubbles) {
+    Oscillators.clear();
+    std::set<double> event_times;
+    std::set<int> used_ids;
 
-    std::set<int> usedBubIDs;
-    // LOCAL PATCH (perf): const auto& matches the map's value type (pair<const int, ...>),
-    // so iterating no longer deep-copies every Bubble
-    for (const auto &bubPair : bubMap) // Loop over all bubbles
-    {
-        // Skip if bubble has already been used
-        if (usedBubIDs.count(bubPair.first)) continue;
+    for (const auto &[id, bubble] : bubbles) {
+        if (used_ids.count(id)) continue;
 
-        int curBubID = bubPair.first;
-        const Bubble<T> *curBub = &bubPair.second;
+        int cur_id = id;
+        const Bubble<T> *cur = &bubble;
 
-        // Initialize Oscillator - we will set its data as we go
         Oscillator<T> osc;
-        osc.startTime = curBub->startTime;
+        osc.StartTime = cur->StartTime;
 
-        // Temporary buffers for solve data and force data
-        std::vector<double> solveTimes;
+        std::vector<double> solve_times;
         std::vector<T> s_radii, s_w0, s_x, s_y, s_z;
-        std::vector<T> Cvals; // precomputed damping coefficient
-        std::vector<T> forceTimes, f_cutoffs, f_weights;
+        std::vector<T> c_vals; // Precomputed damping coefficient
+        std::vector<T> force_times, f_cutoffs, f_weights;
 
         while (true) {
-            bool lastBub = true;
-            usedBubIDs.insert(curBubID);
+            bool last = true;
+            used_ids.insert(cur_id);
 
-            // Add the solve data for this bubble (if there is any)
-            solveTimes.insert(solveTimes.end(), curBub->solveTimes.begin(), curBub->solveTimes.end());
-            s_radii.insert(s_radii.end(), curBub->solveTimes.size(), curBub->radius);
-            s_w0.insert(s_w0.end(), curBub->w0.begin(), curBub->w0.end());
-            s_x.insert(s_x.end(), curBub->x.begin(), curBub->x.end());
-            s_y.insert(s_y.end(), curBub->y.begin(), curBub->y.end());
-            s_z.insert(s_z.end(), curBub->z.begin(), curBub->z.end());
+            solve_times.insert(solve_times.end(), cur->SolveTimes.begin(), cur->SolveTimes.end());
+            s_radii.insert(s_radii.end(), cur->SolveTimes.size(), cur->Radius);
+            s_w0.insert(s_w0.end(), cur->W0.begin(), cur->W0.end());
+            s_x.insert(s_x.end(), cur->X.begin(), cur->X.end());
+            s_y.insert(s_y.end(), cur->Y.begin(), cur->Y.end());
+            s_z.insert(s_z.end(), cur->Z.begin(), cur->Z.end());
 
-            osc.bubIDs.push_back(curBubID);
+            osc.BubbleIds.push_back(cur_id);
 
-            // ----- Handle bubble start event: forcing logic -----
-            std::pair<T, T> force(0., 0.);
+            // ----- Bubble start event: forcing logic -----
+            std::pair<T, T> force{0., 0.};
+            if (cur->StartType == EventType::Split) {
+                if (bubbles.at(cur->PrevIds.at(0)).Radius >= cur->Radius) force = Oscillator<T>::CzerskiJetForcing(cur->Radius);
+            } else if (cur->StartType == EventType::Merge && cur->PrevIds.size() == 2) { // TODO: cleanup this code
+                bool all_merge = true;
+                for (const int parent_id : cur->PrevIds) all_merge = all_merge && bubbles.at(parent_id).EndType == EventType::Merge;
 
-            if (curBub->startType == EventType::SPLIT) {
-                int const parentBubID = curBub->prevBubIDs.at(0);
-                if (bubMap.at(parentBubID).radius >= curBub->radius) {
-                    force = Oscillator<T>::CzerskiJetForcing(curBub->radius);
-                }
-            } else if (curBub->startType == EventType::MERGE) // TODO: cleanup this code
-            {
-                if (curBub->prevBubIDs.size() == 2) {
-                    bool allMerge = true;
-                    for (int const parentBubID : curBub->prevBubIDs) {
-                        allMerge = allMerge && (bubMap.at(parentBubID).endType == EventType::MERGE);
-                    }
+                if (all_merge) {
+                    T r1 = bubbles.at(cur->PrevIds.at(0)).Radius;
+                    T r2 = bubbles.at(cur->PrevIds.at(1)).Radius;
 
-                    if (allMerge) {
-                        int const p1 = curBub->prevBubIDs.at(0);
-                        int const p2 = curBub->prevBubIDs.at(1);
+                    if (r1 + r2 > cur->Radius) {
+                        T v1 = 4. / 3. * std::numbers::pi * r1 * r1 * r1;
+                        T v2 = 4. / 3. * std::numbers::pi * r2 * r2 * r2;
+                        const T vn = 4. / 3. * std::numbers::pi * cur->Radius * cur->Radius * cur->Radius;
 
-                        T r1 = bubMap.at(p1).radius;
-                        T r2 = bubMap.at(p2).radius;
+                        const T diff = v1 + v2 - vn;
+                        if (diff <= std::max(v1, v2)) {
+                            if (v1 > v2) v1 -= diff;
+                            else v2 -= diff;
 
-                        if (r1 + r2 > curBub->radius) {
-                            T v1 = 4. / 3. * M_PI * r1 * r1 * r1;
-                            T v2 = 4. / 3. * M_PI * r2 * r2 * r2;
-                            T vn = 4. / 3. * M_PI * curBub->radius * curBub->radius * curBub->radius;
+                            r1 = std::pow(3. / 4. / std::numbers::pi * v1, 1. / 3.);
+                            r2 = std::pow(3. / 4. / std::numbers::pi * v2, 1. / 3.);
 
-                            T diff = v1 + v2 - vn;
-                            if (diff <= std::max(v1, v2)) {
-                                if (v1 > v2) {
-                                    v1 -= diff;
-                                } else {
-                                    v2 -= diff;
-                                }
-
-                                r1 = std::pow(3. / 4. / M_PI * v1, 1. / 3.);
-                                r2 = std::pow(3. / 4. / M_PI * v2, 1. / 3.);
-
-                                force = Oscillator<T>::MergeForcing(curBub->radius, r1, r2);
-                            }
-                        } else {
-                            force = Oscillator<T>::MergeForcing(curBub->radius, r1, r2);
+                            force = Oscillator<T>::MergeForcing(cur->Radius, r1, r2);
                         }
+                    } else {
+                        force = Oscillator<T>::MergeForcing(cur->Radius, r1, r2);
                     }
                 }
-            } else if (curBub->startType == EventType::ENTRAIN) {
-                force = Oscillator<T>::CzerskiJetForcing(curBub->radius);
+            } else if (cur->StartType == EventType::Entrain) {
+                force = Oscillator<T>::CzerskiJetForcing(cur->Radius);
             }
-            forceTimes.push_back(curBub->startTime);
+            force_times.push_back(cur->StartTime);
             f_cutoffs.push_back(force.first);
             f_weights.push_back(force.second);
 
-            // ----- Handle bubble end event: chaining logic -----
-            if (curBub->endType == EventType::MERGE) {
-                const Bubble<T> &nextBub = bubMap.at(curBub->nextBubIDs.at(0));
-                int const largestParent = BubbleUtils<T>::largestBubbleID(nextBub.prevBubIDs, bubMap);
-
-                if (largestParent == curBubID) {
-                    lastBub = false;
-                    curBubID = curBub->nextBubIDs.at(0);
-                    curBub = &bubMap.at(curBubID);
+            // ----- Bubble end event: chaining logic -----
+            if (cur->EndType == EventType::Merge) {
+                const Bubble<T> &next = bubbles.at(cur->NextIds.at(0));
+                if (LargestBubbleId(next.PrevIds, bubbles) == cur_id) {
+                    last = false;
+                    cur_id = cur->NextIds.at(0);
+                    cur = &bubbles.at(cur_id);
                 }
-            } else if (curBub->endType == EventType::SPLIT) {
-                // Sort children in order of size
+            } else if (cur->EndType == EventType::Split) {
+                // Children in order of size
                 std::multimap<T, int, std::greater<>> children;
-                for (int const childID : curBub->nextBubIDs) {
-                    children.insert(std::make_pair(bubMap.at(childID).radius, childID));
-                }
-                // Continue this bubble to the largest child bubble where this is the largest parent
-                for (auto &child : children) {
-                    if (usedBubIDs.count(child.second)) continue;
+                for (const int child_id : cur->NextIds) children.insert({bubbles.at(child_id).Radius, child_id});
 
-                    int const largestParent = BubbleUtils<T>::largestBubbleID(bubMap.at(child.second).prevBubIDs, bubMap);
-                    if (largestParent == curBubID) {
-                        lastBub = false;
-                        curBubID = child.second;
-                        curBub = &bubMap.at(curBubID);
+                // Continue into the largest child bubble for which this is the largest parent
+                for (const auto &[radius, child_id] : children) {
+                    if (used_ids.count(child_id)) continue;
+
+                    if (LargestBubbleId(bubbles.at(child_id).PrevIds, bubbles) == cur_id) {
+                        last = false;
+                        cur_id = child_id;
+                        cur = &bubbles.at(cur_id);
                         break;
                     }
                 }
             }
-            if (lastBub) { break; }
+            if (last) break;
         }
-        // End this Oscillator; next, we decide whether or not to keep it
-        osc.endTime = curBub->endTime;
+        // End this oscillator, then decide whether to keep it
+        osc.EndTime = cur->EndTime;
 
-        // Filter out if there is not enough solve data
-        if (solveTimes.empty()) { continue; }
-        // Filter out high freqency Oscillators
-        if (*std::max_element(s_w0.begin(), s_w0.end()) > 2 * M_PI * 18000.) { continue; }
-        // Filter out short blips
-        if (osc.endTime - osc.startTime < 3 * 2 * M_PI / s_w0[0]) { continue; }
+        if (solve_times.empty()) continue; // Not enough solve data
+        if (*std::max_element(s_w0.begin(), s_w0.end()) > 2 * std::numbers::pi * 18000.) continue; // Too high frequency
+        if (osc.EndTime - osc.StartTime < 3 * 2 * std::numbers::pi / s_w0[0]) continue; // Short blip
 
-        // Transfer solve data from temporary buffers to this Oscillator
-        for (int i = 0; i < solveTimes.size(); i++) {
-            Cvals.push_back(2. * Oscillator<T>::calcBeta(s_radii[i], s_w0[i]));
-        }
-        osc.solveTimes = solveTimes;
-        osc.solveData.resize(6, solveTimes.size());
+        c_vals.reserve(solve_times.size());
+        for (size_t i = 0; i < solve_times.size(); ++i) c_vals.push_back(2. * Oscillator<T>::CalcBeta(s_radii[i], s_w0[i]));
 
-        osc.solveData.row(0) = Eigen::Map<Eigen::VectorX<T>>(s_radii.data(), s_radii.size());
-        osc.solveData.row(1) = Eigen::Map<Eigen::VectorX<T>>(s_w0.data(), s_w0.size());
-        osc.solveData.row(2) = Eigen::Map<Eigen::VectorX<T>>(s_x.data(), s_x.size());
-        osc.solveData.row(3) = Eigen::Map<Eigen::VectorX<T>>(s_y.data(), s_y.size());
-        osc.solveData.row(4) = Eigen::Map<Eigen::VectorX<T>>(s_z.data(), s_z.size());
-        osc.solveData.row(5) = Eigen::Map<Eigen::VectorX<T>>(Cvals.data(), Cvals.size());
+        osc.SolveTimes = solve_times;
+        osc.SolveData.resize(6, solve_times.size());
+        osc.SolveData.row(0) = Eigen::Map<Eigen::VectorX<T>>(s_radii.data(), s_radii.size());
+        osc.SolveData.row(1) = Eigen::Map<Eigen::VectorX<T>>(s_w0.data(), s_w0.size());
+        osc.SolveData.row(2) = Eigen::Map<Eigen::VectorX<T>>(s_x.data(), s_x.size());
+        osc.SolveData.row(3) = Eigen::Map<Eigen::VectorX<T>>(s_y.data(), s_y.size());
+        osc.SolveData.row(4) = Eigen::Map<Eigen::VectorX<T>>(s_z.data(), s_z.size());
+        osc.SolveData.row(5) = Eigen::Map<Eigen::VectorX<T>>(c_vals.data(), c_vals.size());
 
-        osc.forceData.resize(3, forceTimes.size());
-        osc.forceData.row(0) = Eigen::Map<Eigen::VectorX<T>>(forceTimes.data(), forceTimes.size());
-        osc.forceData.row(1) = Eigen::Map<Eigen::VectorX<T>>(f_cutoffs.data(), f_cutoffs.size());
-        osc.forceData.row(2) = Eigen::Map<Eigen::VectorX<T>>(f_weights.data(), f_weights.size());
+        osc.ForceData.resize(3, force_times.size());
+        osc.ForceData.row(0) = Eigen::Map<Eigen::VectorX<T>>(force_times.data(), force_times.size());
+        osc.ForceData.row(1) = Eigen::Map<Eigen::VectorX<T>>(f_cutoffs.data(), f_cutoffs.size());
+        osc.ForceData.row(2) = Eigen::Map<Eigen::VectorX<T>>(f_weights.data(), f_weights.size());
 
-        // Finally, add this Oscillator
-        _oscillators.push_back(osc);
-        eventTimesSet.insert(osc.startTime);
-        eventTimesSet.insert(osc.endTime);
+        Oscillators.push_back(osc);
+        event_times.insert(osc.StartTime);
+        event_times.insert(osc.EndTime);
+    }
 
-    } // END for (const std::pair<int, Bubble>& bubPair : bubMap)
-
-    std::sort(_oscillators.begin(), _oscillators.end());
-    _eventTimes.assign(eventTimesSet.begin(), eventTimesSet.end());
+    std::sort(Oscillators.begin(), Oscillators.end());
+    EventTimes.assign(event_times.begin(), event_times.end());
 }
 
-template class Solver<float>;
-template class Solver<double>;
+template struct Solver<float>;
+template struct Solver<double>;
 
 } // namespace FluidSound

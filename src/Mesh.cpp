@@ -1,14 +1,14 @@
 #include "Mesh.h"
 
+#include <Eigen/Eigenvalues>
+#include <Eigen/Geometry>
+#include <Eigen/SVD>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <utility>
-
-#include <Eigen/Eigenvalues>
-#include <Eigen/Geometry>
-#include <Eigen/SVD>
 
 bool ReadObjData(const std::string &filename, std::vector<double> &vs, std::vector<int> &fs) {
     std::ifstream in{filename, std::ios::binary | std::ios::ate};

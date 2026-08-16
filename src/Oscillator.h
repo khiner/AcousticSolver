@@ -1,103 +1,73 @@
-﻿/** (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
- *
- * \file Oscillator.h
- * \brief Declares Oscillator struct, including computation of forcing and damping terms
- */
+#pragma once
 
-#ifndef _FS_OSCILLATOR_H
-#define _FS_OSCILLATOR_H
+// (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
+// One bubble oscillator, plus its forcing and damping models.
 
 #include <Eigen/Dense>
 
-#include "BubbleUtils.h"
+#include <utility>
+#include <vector>
 
 namespace FluidSound {
 
-/**
- * \class Oscillator
- * \brief Represents a single oscillator, \f$ \ddot{v}(t) + 2\beta \dot{v}(t) + \omega_0^2 v(t) = p(t) / m \f$
- *
- * Whereas the Bubble struct corresponds to physical bubbles, the Oscillator struct is more of a
- *   mathematical abstraction, meant to interface efficiently with the Integrator class
- */
-template<typename T>
-struct Oscillator {
-    /** \brief vector of IDs of Bubbles belonging to this Oscillator, sorted by increasing start time */
-    std::vector<int> bubIDs;
+// A single oscillator, v''(t) + 2 beta v'(t) + w0^2 v(t) = p(t) / m.
+// Where a Bubble is a physical bubble, an Oscillator is the mathematical abstraction the
+// Integrator consumes: one chain of bubbles followed through its merges and splits.
+template<typename T> struct Oscillator {
+    std::vector<int> BubbleIds; // By increasing start time
 
-    double startTime = -1.;
-    double endTime = -1.;
+    double StartTime{-1}, EndTime{-1};
 
-    /** \brief current volume displacement and volume velocity state vector: [v v'] */
-    Eigen::Vector2<T> state = {0., 0.};
-    T accel = 0.; /**< \brief current volume acceleration : v'' */
+    Eigen::Vector2<T> State{0., 0.}; // Current volume displacement and volume velocity, [v v']
+    T Accel{0}; // Current volume acceleration, v''
 
-    std::vector<double> solveTimes; //!< times [ t(0) ... t(N) ] corresponding to solveData
-    Eigen::Array<T, 6, Eigen::Dynamic> solveData;
-    /**< \brief For indices (0, ..., N), solveData is given by:
-     * [[ r(0)  ... r(N)  ]
-     *  [ ω0(0) ... ω0(N) ]
-     *  [ x(0)  ... x(N)  ]
-     *  [ y(0)  ... y(N)  ]
-     *  [ z(0)  ... z(N)  ]
-     *  [ 2β(0) ... 2β(N) ]]
-     */
+    std::vector<double> SolveTimes; // Times [t(0) ... t(N)] of SolveData's columns
+    // For indices (0, ..., N), SolveData is:
+    //   [[ r(0)  ... r(N)  ]
+    //    [ w0(0) ... w0(N) ]
+    //    [ x(0)  ... x(N)  ]
+    //    [ y(0)  ... y(N)  ]
+    //    [ z(0)  ... z(N)  ]
+    //    [ 2b(0) ... 2b(N) ]]
+    Eigen::Array<T, 6, Eigen::Dynamic> SolveData;
 
-    /** \brief Returns array of linearly interpolated solve data at specified time
-     *  LOCAL PATCH (perf): cursor-explicit static, shared with the factor-precompute
-     *  workers (see BubbleFactorPipeline.h). */
-    static Eigen::Array<T, 6, 1> interpAt(const Oscillator<T> &osc, double time, int &idx) {
-        if (time >= osc.solveTimes.back()) {
-            return osc.solveData.col(osc.solveTimes.size() - 1);
-        } else if (time <= osc.solveTimes[0]) {
-            return osc.solveData.col(0);
-        }
+    // For indices (0, ..., F), ForceData is:
+    //   [[ force_time(0) ... force_time(F) ]
+    //    [ cutoff(0)     ... cutoff(F)     ]
+    //    [ weight(0)     ... weight(F)     ]]
+    // Every forcing model has the form F(t) = (t < cutoff) * weight * t * t, where t is
+    // relative to the force start time: t = time - force_time.
+    Eigen::Array<T, 3, Eigen::Dynamic> ForceData;
 
-        while (time < osc.solveTimes[idx]) { idx--; }
-        while (idx < osc.solveTimes.size() - 1 && time > osc.solveTimes[idx + 1]) { idx++; }
+    // Linearly interpolated solve data at `time`, walking `idx` to the bracketing column.
+    // The cursor is explicit so the factor-precompute workers can carry their own
+    // (see BubbleFactorPipeline.h).
+    static Eigen::Array<T, 6, 1> InterpAt(const Oscillator &osc, double time, int &idx) {
+        if (time >= osc.SolveTimes.back()) return osc.SolveData.col(osc.SolveTimes.size() - 1);
+        if (time <= osc.SolveTimes[0]) return osc.SolveData.col(0);
 
-        double const alpha = (time - osc.solveTimes[idx]) / (osc.solveTimes[idx + 1] - osc.solveTimes[idx]);
-        return (1. - alpha) * osc.solveData.col(idx) + alpha * osc.solveData.col(idx + 1);
+        while (time < osc.SolveTimes[idx]) --idx;
+        while (idx + 1 < int(osc.SolveTimes.size()) && time > osc.SolveTimes[idx + 1]) ++idx;
+
+        const double alpha = (time - osc.SolveTimes[idx]) / (osc.SolveTimes[idx + 1] - osc.SolveTimes[idx]);
+        return (1. - alpha) * osc.SolveData.col(idx) + alpha * osc.SolveData.col(idx + 1);
     }
-    Eigen::Array<T, 6, 1> interp(double time) { return interpAt(*this, time, _idx); }
+    Eigen::Array<T, 6, 1> Interp(double time) { return InterpAt(*this, time, Idx); }
 
-    /** \brief Returns true if this Oscillator has decayed sufficiently */
-    bool is_dead() const { return state.norm() < 1e-10; }
+    bool IsDead() const { return State.norm() < 1e-10; }
 
-    bool operator<(const Oscillator<T> &osc) const { return startTime < osc.startTime; }
+    bool operator<(const Oscillator &osc) const { return StartTime < osc.StartTime; }
 
-    Eigen::Array<T, 3, Eigen::Dynamic> forceData;
-    /**< \brief For indices (0, ..., F), forceData is given by:
-     * [[ forceTime(0) ... forceTime(F) ]
-     *  [ cutoff(0)    ... cutoff(F)    ]
-     *  [ weight(0)    ... weight(F)    ]]
-     *
-     * All forcing functions have the form F(t) = (t < cutoff) * weight * t * t
-     *  (where t is relative to the force start time : t = time - forceTime)
-     */
-
-    /**
-     * \brief Neck collapse forcing model from Czerksi/Deane [2008; 2010]
-     * \param[in]  radius  bubble equilibrium radius
-     * \return  (cutoff, weight) pair
-     */
+    // Neck collapse forcing model from Czerski/Deane [2008; 2010], as a (cutoff, weight) pair.
     static std::pair<T, T> CzerskiJetForcing(T radius);
-
-    /**
-     * \brief Neck expansion forcing model from [Czerski 2011]
-     * \param[in]  radius  bubble equilibrium radius
-     * \param[in]  r1, r2  radii of parent bubbles
-     * \return  (cutoff, weight) pair
-     */
+    // Neck expansion forcing model from [Czerski 2011] for a bubble of `radius` born from
+    // parents of radii `r1` and `r2`, as a (cutoff, weight) pair.
     static std::pair<T, T> MergeForcing(T radius, T r1, T r2);
-
-    /** \brief Damping via radiative, viscous, and thermal effects */
-    static T calcBeta(T radius, T w0);
+    // Damping via radiative, viscous, and thermal effects.
+    static T CalcBeta(T radius, T w0);
 
 private:
-    int _idx = 0;
+    int Idx{0};
 };
 
 } // namespace FluidSound
-
-#endif // _FS_OSCILLATOR_H

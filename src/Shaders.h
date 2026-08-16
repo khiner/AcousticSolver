@@ -7,19 +7,18 @@
 // classes. See the .cpp files associated with each sound source for implementation
 // details. GPU kernels live in FDTD/Kernels.metal.
 
+#include "AabbTree.h"
+#include "BubbleFactorPipeline.h"
+#include "FDTDCommon.h"
+#include "FluidSound.h"
+#include "Mesh.h"
+#include "MetalContext.h"
+#include "ModalSound.h"
+
 #include <fstream>
 #include <string>
 #include <variant>
 #include <vector>
-
-#include "AabbTree.h"
-#include "BubbleFactorPipeline.h"
-#include "FluidSound.h"
-#include "Mesh.h"
-#include "ModalSound.h"
-
-#include "FDTDCommon.h"
-#include "MetalContext.h"
 
 enum class ShaderClass {
     Monopole,
@@ -49,41 +48,40 @@ struct ObjectBase {
     double Ts; // simulation start time
     int NSamples; // number of shader samples in time (i.e., the batchsize)
 
-    Eigen::MatrixX<REAL> V0; // original, non-animated surface mesh vertex positions
+    Eigen::MatrixX<real> V0; // original, non-animated surface mesh vertex positions
     Eigen::MatrixXi F; // surface mesh faces
 
     // Current and next surface mesh vertex positions.
     // (Due to how we rasterize, we need to "look ahead" to the next triangle mesh.)
-    Eigen::MatrixX<REAL> V1, V2;
+    Eigen::MatrixX<real> V1, V2;
 
     // B and BN are the set of all boundary positions and corresponding boundary normals
-    // to compute shader samples at. \see SetSamplePoints()
-    Eigen::Matrix<REAL, Eigen::Dynamic, 3, Eigen::RowMajor> B, BN;
+    // to compute shader samples at. See SetSamplePoints().
+    Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> B, BN;
     GpuBuffer GpuB, GpuBN;
 
     // ----- Animation -----
     double T1{0}, T2{0}; // animation keyframe endpoint times
-    Eigen::Vector3d Translation1, Translation2; // translation vectors
+    Eigen::Vector3d Translation1, Translation2;
     Eigen::Vector4d Rotation1, Rotation2; // rotation quaternions
-    std::ifstream AnimFile; // animation file stream
+    std::ifstream AnimFile;
 
-    void ReadAnimation(); // reads animation data for current Step
+    void ReadAnimation();
 
-    // Sets the shader sample points for the current batch:
-    // (NPoints, 3) boundary points to compute shader samples at, and their normals.
-    void SetSamplePoints(const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &bn);
+    // Sets this batch's (NPoints, 3) boundary sample points and their normals.
+    void SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn);
 
     // ----- Closest point query (must be called after Tree.Init()) -----
-    AabbTree<REAL> Tree;
+    AabbTree<real> Tree;
     // For each query position in `b`, the index of the closest triangle of mesh `v`, F.
-    void ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const;
-    // Closest point query with additional barycentric weight computation into `w_out`.
-    void ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<REAL> &w_out, const Eigen::MatrixX<REAL> &b, const Eigen::MatrixX<REAL> &v) const;
+    void ClosestPoint(Eigen::VectorXi &i_out, const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &v) const;
+    // As above, plus barycentric weights into `w_out`.
+    void ClosestPoint(Eigen::VectorXi &i_out, Eigen::MatrixX<real> &w_out, const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &v) const;
 };
 
 // Basic mono-frequency, monopole source shader used for testing.
 struct Monopole {
-    Monopole(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, REAL freq_hz, REAL speed, REAL c = 343.2)
+    Monopole(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, real freq_hz, real speed, real c = 343.2)
         : Obj(ShaderClass::Monopole, true, blend_rate, shader_srate, ts), FreqHz(freq_hz), Speed(speed), C(c) {
         ReadObj(mesh_file, Obj.V2, Obj.F);
     }
@@ -92,9 +90,9 @@ struct Monopole {
     ObjectBase Obj;
 
 private:
-    REAL FreqHz; // source frequency
-    REAL Speed; // source speed (x-direction)
-    REAL C; // speed of sound
+    real FreqHz;
+    real Speed; // x-direction
+    real C; // speed of sound
 };
 
 // Speaker shader for pre-recorded input audio.
@@ -142,7 +140,7 @@ struct Occluder {
 
 // Bubble-based water sound shader.
 struct Bubbles {
-    Bubbles(int blend_rate, int shader_srate, double ts, const std::string &bub_file, std::string fluid_mesh_dir, REAL dx = 0.)
+    Bubbles(int blend_rate, int shader_srate, double ts, const std::string &bub_file, std::string fluid_mesh_dir, real dx = 0.)
         : Obj(ShaderClass::Bubbles, true, blend_rate, shader_srate, ts), Solver(bub_file, 1. / shader_srate, 1, ts),
           FactorPipeline(std::make_unique<BubbleFactorPipeline>(Solver, 1. / shader_srate, ts)), Dx(dx), FluidMeshDir(std::move(fluid_mesh_dir)) {
         ReadFluidMesh();
@@ -152,18 +150,18 @@ struct Bubbles {
     ObjectBase Obj;
 
 private:
-    FluidSound::Solver<double> Solver; // solver for timestepping bubble oscillations
+    FluidSound::Solver<double> Solver;
     std::unique_ptr<BubbleFactorPipeline> FactorPipeline; // precomputes mass-matrix factorizations (declared after Solver: destroyed first)
-    REAL Dx; // FDTD cell size (for flux normalization)
+    real Dx; // FDTD cell size (for flux normalization)
 
-    std::string FluidMeshDir; // path to directory containing fluid meshes
+    std::string FluidMeshDir;
     void ReadFluidMesh();
 
-    std::vector<int> ActiveOscIds; // IDs of active oscillators during current batch
+    std::vector<int> ActiveOscIds; // Active during the current batch
 
     // --- Host (CPU) ---
-    std::vector<REAL> BubData;
-    Eigen::MatrixX<REAL> BubVels;
+    std::vector<real> BubData;
+    Eigen::MatrixX<real> BubVels;
 
     // --- Device (GPU) ---
     // GpuBubData and GpuBubVels hold one slot per minibatch (uploads must not overwrite
@@ -171,7 +169,7 @@ private:
     GpuBuffer GpuBubData;
     GpuBuffer BubToBoundary;
     GpuBuffer GpuBubVels;
-    GpuBuffer Flux; // for flux normalization
+    GpuBuffer Flux;
 };
 
 // Modal sound (plus acceleration noise) shader for vibrating rigid bodies.
@@ -192,15 +190,15 @@ struct Modal {
     ObjectBase Obj;
 
 private:
-    ModalSound::Solver Solver; // solver for timestepping modal vibrations
+    ModalSound::Solver Solver;
     Eigen::Vector3d AccelSum{Eigen::Vector3d::Zero()};
 
-    void SetModeToBoundary(Eigen::MatrixX<REAL> &mode_to_boundary) const;
+    void SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary) const;
 
     // --- Host (CPU) ---
-    Eigen::MatrixX<REAL> ModeToBoundary1, ModeToBoundary2;
-    Eigen::MatrixX<REAL> ModeVels;
-    Eigen::MatrixX<REAL> AccelNoise;
+    Eigen::MatrixX<real> ModeToBoundary1, ModeToBoundary2;
+    Eigen::MatrixX<real> ModeVels;
+    Eigen::MatrixX<real> AccelNoise;
 
     // --- Device (GPU) ---
     GpuBuffer GpuModeToBoundary1, GpuModeToBoundary2;
@@ -228,8 +226,8 @@ struct Shell {
     ObjectBase Obj;
 
 private:
-    std::string ShellAnimDir; // directory containing shell animation data
-    std::string ShellAccelDir; // directory containing shell vertex acceleration data
+    std::string ShellAnimDir;
+    std::string ShellAccelDir; // Per-vertex acceleration data
     void ReadShellAnimation();
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> VertDisplace;
@@ -240,7 +238,7 @@ private:
     std::vector<int> VertMap; // mapping from original (mesh) vertex indices to internal re-ordered indices
 
     // --- Host (CPU) ---
-    Eigen::Matrix<REAL, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> BatchVels;
+    Eigen::Matrix<real, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> BatchVels;
     int MegaBatchSize{0};
 
     // (No device buffers because we copy BatchVels directly to the shader data buffer.)
@@ -249,7 +247,7 @@ private:
 // Point force shader. (Named PointSource rather than Point to avoid colliding with the
 // legacy ::Point that Apple's MacTypes.h defines at global scope.)
 struct PointSource {
-    PointSource(int blend_rate, int shader_srate, double ts, const std::string &impulse_file, REAL dx)
+    PointSource(int blend_rate, int shader_srate, double ts, const std::string &impulse_file, real dx)
         : Obj(ShaderClass::Point, true, blend_rate, shader_srate, ts), Dx(dx) {
         ReadImpulses(impulse_file);
         GetActiveImpulseList();
@@ -259,7 +257,7 @@ struct PointSource {
     ObjectBase Obj;
 
 private:
-    REAL Dx; // FDTD cell size
+    real Dx; // FDTD cell size
 
     void ReadImpulses(const std::string &filename);
     void GetActiveImpulseList();
@@ -267,8 +265,8 @@ private:
     // --- All impulse data ---
     std::vector<double> Times; // impact times
     std::vector<double> Tau; // Hertz contact timescale
-    std::vector<Eigen::Vector3<REAL>> DV; // body's velocity change
-    std::vector<Eigen::Vector3<REAL>> Positions; // impact positions
+    std::vector<Eigen::Vector3<real>> DV; // body's velocity change
+    std::vector<Eigen::Vector3<real>> Positions;
 
     // Impulse indices sorted by start time, for windowed active-impulse queries.
     std::vector<int> IdsByTime;
@@ -276,8 +274,8 @@ private:
 
     // --- Host (CPU) ---
     std::vector<int> ActiveImpulseIds; // ascending index order (fixes row order, and thus rounding)
-    std::vector<REAL> ImpulseData;
-    Eigen::MatrixX<REAL> ImpulseVels;
+    std::vector<real> ImpulseData;
+    Eigen::MatrixX<real> ImpulseVels;
 
     // --- Device (GPU) ---
     GpuBuffer GpuImpulseData;

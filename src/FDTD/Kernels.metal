@@ -1,608 +1,600 @@
-/** Metal port of WaveBlender's CUDA kernels (GPUSolver.cu, WaveBlender.cu, Shaders/*.cu).
- *
- * \file Kernels.metal
- *
- * Compiled at runtime with KernelParams.h prepended (see MetalContext.cpp).
- * Every floating-point expression matches the CUDA reference operation-for-operation
- * (fast-math is off), so per-cell results are bit-exact against the reference given
- * identical inputs. The step kernels share one persistent argument table (see
- * KernelParams.h) and sequence into a batch in WaveBlender::RunFdtd.
- *
- * References:
- *   [Xue et al. 2024] WaveBlender: Practical Sound-Source Animation in Blended Domains.
- */
+// Metal port of WaveBlender's CUDA kernels (GPUSolver.cu, WaveBlender.cu, Shaders/*.cu).
+//
+// Compiled at runtime with KernelParams.h prepended (see MetalContext.cpp).
+// Every floating-point expression matches the CUDA reference operation-for-operation
+// (fast-math is off), so per-cell results are bit-exact against the reference given
+// identical inputs. The step kernels share one persistent argument table (see
+// KernelParams.h) and sequence into a batch in WaveBlender::RunFdtd.
+//
+// References:
+//   [Xue et al. 2024] WaveBlender: Practical Sound-Source Animation in Blended Domains.
 
 #include <metal_stdlib>
 using namespace metal;
 
-typedef float REAL;
+using real = float;
 
 // Fold the pending boundary application into the velocity updates. When false, the host
-// runs standalone apply_shader dispatches and the mask logic below compiles out.
-constant bool FOLD_APPLY [[function_constant(FOLD_APPLY_FC_INDEX)]];
+// runs standalone ApplyShader dispatches and the mask logic below compiles out.
+constant bool FoldApply [[function_constant(FoldApplyFcIndex)]];
 
-constant int X_DIR = 0;
-constant int Y_DIR = 1;
-constant int Z_DIR = 2;
-constant float PI_F = 3.14159265358979323846f;
+constant int XDir = 0;
+constant int YDir = 1;
+constant int ZDir = 2;
+constant float Pi = 3.14159265358979323846f;
 
-inline int CID(int i, int j, int k, int Nx, int Ny) { return ((Ny * Nx) * k + Nx * j + i); }
+inline int Cid(int i, int j, int k, int nx, int ny) { return (ny * nx) * k + nx * j + i; }
 
 // ============================== Core FDTD (GPUSolver.cu) ==============================
 
-/** \brief Beta from a cell's blending state (see CELL_* in KernelParams.h) at blending
- *         time tb, with the reference's cubic-smoothstep arithmetic. */
-inline REAL beta_of(uchar state, REAL tb) {
-    if (state == CELL_AIR) return 0.f;
-    if (state == CELL_SOLID) return 1.f;
-    if (state == CELL_RISING) return 3.f * tb * tb - 2.f * tb * tb * tb;
-    REAL t = 1.f - tb;
+// Beta from a cell's blending state (see the Cell* constants in KernelParams.h) at
+// blending time `tb`, with the reference's cubic-smoothstep arithmetic.
+inline real BetaOf(uchar state, real tb) {
+    if (state == CellAir) return 0.f;
+    if (state == CellSolid) return 1.f;
+    if (state == CellRising) return 3.f * tb * tb - 2.f * tb * tb * tb;
+    real t = 1.f - tb;
     return 3.f * t * t - 2.f * t * t * t;
 }
 
-/** \brief Beta at batch start, for the fresh-cell prologue kernels: exactly 0 or 1, as
- *         transitioning cells still hold last batch's endpoint. */
-inline REAL beta0_of(uchar state) {
-    return (state == CELL_SOLID || state == CELL_FALLING) ? 1.f : 0.f;
+// Beta at batch start, for the fresh-cell prologue kernels: exactly 0 or 1, as
+// transitioning cells still hold the last batch's endpoint.
+inline real Beta0Of(uchar state) {
+    return (state == CellSolid || state == CellFalling) ? 1.f : 0.f;
 }
 
-/** \brief Pressure update kernel (Eq. 8a from [Xue et al. 2024]) */
-kernel void step_pressure(device REAL *d_p [[buffer(0)]],
-                          device REAL *d_px [[buffer(1)]], device REAL *d_py [[buffer(2)]], device REAL *d_pz [[buffer(3)]],
-                          device const REAL *d_vx [[buffer(4)]], device const REAL *d_vy [[buffer(5)]], device const REAL *d_vz [[buffer(6)]],
-                          device const REAL *d_pmlN [[buffer(9)]], device const REAL *d_pmlD [[buffer(10)]],
-                          constant FdtdBatchParams &B [[buffer(FDTD_BATCH_PARAMS_INDEX)]],
-                          uint3 tid [[thread_position_in_grid]]) {
+// Pressure update kernel (Eq. 8a from [Xue et al. 2024])
+kernel void StepPressure(device real *p [[buffer(0)]],
+                         device real *px [[buffer(1)]], device real *py [[buffer(2)]], device real *pz [[buffer(3)]],
+                         device const real *vx [[buffer(4)]], device const real *vy [[buffer(5)]], device const real *vz [[buffer(6)]],
+                         device const real *pml_n [[buffer(9)]], device const real *pml_d [[buffer(10)]],
+                         constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
+                         uint3 tid [[thread_position_in_grid]]) {
     int i = tid.x, j = tid.y, k = tid.z;
-    if (i >= B.Nx || j >= B.Ny || k >= B.Nz) return;
-    int cid = CID(i, j, k, B.Nx, B.Ny);
+    if (i >= batch.Nx || j >= batch.Ny || k >= batch.Nz) return;
+    int cid = Cid(i, j, k, batch.Nx, batch.Ny);
 
-    // Distance to closest domain boundary
-    int min_xdist = min(i, B.Nx - 1 - i);
-    int min_ydist = min(j, B.Ny - 1 - j);
-    int min_zdist = min(k, B.Nz - 1 - k);
+    // Distance to the closest domain boundary
+    int min_xdist = min(i, batch.Nx - 1 - i);
+    int min_ydist = min(j, batch.Ny - 1 - j);
+    int min_zdist = min(k, batch.Nz - 1 - k);
 
     // Individual components of divergence
-    REAL vx = d_vx[cid];
-    REAL vx_L = (i > 0) ? d_vx[CID(i - 1, j, k, B.Nx, B.Ny)] : 0.f; // LEFT
-    REAL vy = d_vy[cid];
-    REAL vy_D = (j > 0) ? d_vy[CID(i, j - 1, k, B.Nx, B.Ny)] : 0.f; // DOWN
-    REAL vz = d_vz[cid];
-    REAL vz_F = (k > 0) ? d_vz[CID(i, j, k - 1, B.Nx, B.Ny)] : 0.f; // FRONT
+    real vx_c = vx[cid];
+    real vx_l = (i > 0) ? vx[Cid(i - 1, j, k, batch.Nx, batch.Ny)] : 0.f; // LEFT
+    real vy_c = vy[cid];
+    real vy_d = (j > 0) ? vy[Cid(i, j - 1, k, batch.Nx, batch.Ny)] : 0.f; // DOWN
+    real vz_c = vz[cid];
+    real vz_f = (k > 0) ? vz[Cid(i, j, k - 1, batch.Nx, batch.Ny)] : 0.f; // FRONT
 
-    REAL divx = (vx - vx_L) * B.inv_dx;
-    REAL divy = (vy - vy_D) * B.inv_dx;
-    REAL divz = (vz - vz_F) * B.inv_dx;
+    real divx = (vx_c - vx_l) * batch.InvDx;
+    real divy = (vy_c - vy_d) * batch.InvDx;
+    real divz = (vz_c - vz_f) * batch.InvDx;
 
-    if (min_xdist < PML_WIDTH || min_ydist < PML_WIDTH || min_zdist < PML_WIDTH) { // Inside PML: split pressure update
-        REAL px = d_px[cid], py = d_py[cid], pz = d_pz[cid];
+    if (min_xdist < PmlWidth || min_ydist < PmlWidth || min_zdist < PmlWidth) { // Inside the PML: split pressure update
+        real px_c = px[cid], py_c = py[cid], pz_c = pz[cid];
 
-        px = (d_pmlN[min_xdist] * px - B.RHO_CC_dt * divx) * d_pmlD[min_xdist];
-        py = (d_pmlN[min_ydist] * py - B.RHO_CC_dt * divy) * d_pmlD[min_ydist];
-        pz = (d_pmlN[min_zdist] * pz - B.RHO_CC_dt * divz) * d_pmlD[min_zdist];
+        px_c = (pml_n[min_xdist] * px_c - batch.RhoCcDt * divx) * pml_d[min_xdist];
+        py_c = (pml_n[min_ydist] * py_c - batch.RhoCcDt * divy) * pml_d[min_ydist];
+        pz_c = (pml_n[min_zdist] * pz_c - batch.RhoCcDt * divz) * pml_d[min_zdist];
 
-        d_px[cid] = px;
-        d_py[cid] = py;
-        d_pz[cid] = pz;
-        d_p[cid] = px + py + pz;
-    } else { // Otherwise, regular pressure update
-        d_p[cid] = d_p[cid] - B.RHO_CC_dt * (divx + divy + divz);
+        px[cid] = px_c;
+        py[cid] = py_c;
+        pz[cid] = pz_c;
+        p[cid] = px_c + py_c + pz_c;
+    } else {
+        p[cid] = p[cid] - batch.RhoCcDt * (divx + divy + divz);
     }
 }
 
-/** \brief Interpolated shader value for shader-data row `bid` at the step's fractional
- *         sample index. */
-inline REAL shader_value(int bid, device const REAL *d_shaderData, constant FdtdBatchParams &B, constant FdtdStepParams &S) {
-    REAL frac = (bid * B.N_shader_samples) + S.ss; // fractional index in d_shaderData memory
-    int floor_ = int(frac), ceil_ = floor_ + 1;
-    return (ceil_ - frac) * d_shaderData[floor_] + (frac - floor_) * d_shaderData[ceil_];
+// Interpolated shader value for shader-data row `bid` at the step's fractional sample index.
+inline real ShaderValue(int bid, device const real *shader_data, constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
+    real frac = (bid * batch.NShaderSamples) + step.SampleFrac; // Fractional index into shader_data
+    int lo = int(frac), hi = lo + 1;
+    return (hi - frac) * shader_data[lo] + (frac - lo) * shader_data[hi];
 }
 
-/** \brief Standalone boundary application (Eq. 8b boundary-conditions term), dispatched
- *         before the velocity update of the step it belongs to. */
-kernel void apply_shader(device REAL *d_vx [[buffer(4)]], device REAL *d_vy [[buffer(5)]], device REAL *d_vz [[buffer(6)]],
-                         device const uchar *d_state [[buffer(8)]],
-                         device const REAL *d_shaderData [[buffer(13)]], device const int *d_shaderMap [[buffer(14)]],
-                         constant FdtdBatchParams &B [[buffer(FDTD_BATCH_PARAMS_INDEX)]],
-                         constant FdtdStepParams &S [[buffer(FDTD_STEP_PARAMS_INDEX)]],
-                         constant ApplyShaderRange &R [[buffer(FDTD_APPLY_RANGE_INDEX)]],
-                         uint tid [[thread_position_in_grid]]) {
-    int global_bid = tid + R.start;
-    if (global_bid >= R.end) return;
+// Standalone boundary application (the Eq. 8b boundary-conditions term), dispatched before
+// the velocity update of the step it belongs to.
+kernel void ApplyShader(device real *vx [[buffer(4)]], device real *vy [[buffer(5)]], device real *vz [[buffer(6)]],
+                        device const uchar *state [[buffer(8)]],
+                        device const real *shader_data [[buffer(13)]], device const int *shader_map [[buffer(14)]],
+                        constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
+                        constant FdtdStepParams &step [[buffer(FdtdStepParamsIndex)]],
+                        constant ApplyShaderRange &range [[buffer(FdtdApplyRangeIndex)]],
+                        uint tid [[thread_position_in_grid]]) {
+    int global_bid = tid + range.Start;
+    if (global_bid >= range.End) return;
 
-    // Decode shader map
-    bool isForce = d_shaderMap[global_bid] < 0; // isForce is encoded via the sign of d_shaderMap[cid]
-    int dir = (!isForce) ? d_shaderMap[global_bid] % 3 : (-d_shaderMap[global_bid]) % 3; // direction
-    int cid = (!isForce) ? d_shaderMap[global_bid] / 3 : (-d_shaderMap[global_bid]) / 3; // cell index
+    // Decode the shader map. is_force is encoded via the sign of shader_map[cid].
+    bool is_force = shader_map[global_bid] < 0;
+    int dir = (!is_force) ? shader_map[global_bid] % 3 : (-shader_map[global_bid]) % 3;
+    int cid = (!is_force) ? shader_map[global_bid] / 3 : (-shader_map[global_bid]) / 3;
 
-    int i = cid % B.Nx;
-    int j = (cid / B.Nx) % B.Ny;
-    int k = (cid / B.Nx) / B.Ny;
+    int i = cid % batch.Nx;
+    int j = (cid / batch.Nx) % batch.Ny;
+    int k = (cid / batch.Nx) / batch.Ny;
 
-    REAL val = shader_value(global_bid, d_shaderData, B, S);
+    real val = ShaderValue(global_bid, shader_data, batch, step);
 
-    // Update velocity
-    if (dir == X_DIR) {
-        REAL betax = max(beta_of(d_state[cid], S.tb), beta_of(d_state[CID(i + 1, j, k, B.Nx, B.Ny)], S.tb));
-        if (!isForce) d_vx[cid] += betax * (val - d_vx[cid]);
-        else d_vx[cid] += (1.f - betax) * val * B.inv_RHO_dt;
-    } else if (dir == Y_DIR) {
-        REAL betay = max(beta_of(d_state[cid], S.tb), beta_of(d_state[CID(i, j + 1, k, B.Nx, B.Ny)], S.tb));
-        if (!isForce) d_vy[cid] += betay * (val - d_vy[cid]);
-        else d_vy[cid] += (1.f - betay) * val * B.inv_RHO_dt;
-    } else if (dir == Z_DIR) {
-        REAL betaz = max(beta_of(d_state[cid], S.tb), beta_of(d_state[CID(i, j, k + 1, B.Nx, B.Ny)], S.tb));
-        if (!isForce) d_vz[cid] += betaz * (val - d_vz[cid]);
-        else d_vz[cid] += (1.f - betaz) * val * B.inv_RHO_dt;
+    if (dir == XDir) {
+        real betax = max(BetaOf(state[cid], step.Tb), BetaOf(state[Cid(i + 1, j, k, batch.Nx, batch.Ny)], step.Tb));
+        if (!is_force) vx[cid] += betax * (val - vx[cid]);
+        else vx[cid] += (1.f - betax) * val * batch.InvRhoDt;
+    } else if (dir == YDir) {
+        real betay = max(BetaOf(state[cid], step.Tb), BetaOf(state[Cid(i, j + 1, k, batch.Nx, batch.Ny)], step.Tb));
+        if (!is_force) vy[cid] += betay * (val - vy[cid]);
+        else vy[cid] += (1.f - betay) * val * batch.InvRhoDt;
+    } else if (dir == ZDir) {
+        real betaz = max(BetaOf(state[cid], step.Tb), BetaOf(state[Cid(i, j, k + 1, batch.Nx, batch.Ny)], step.Tb));
+        if (!is_force) vz[cid] += betaz * (val - vz[cid]);
+        else vz[cid] += (1.f - betaz) * val * batch.InvRhoDt;
     }
 }
 
-/** \brief The ShaderFaces row-id planes (layout macros in KernelParams.h). */
-inline device const int *face_bids(device const uchar *d_faceMask, int G) {
-    return (device const int *)(d_faceMask + SHADER_FACES_BIDS_OFFSET(G));
+// The ShaderFaces row-id planes (layout in KernelParams.h).
+inline device const int *FaceBids(device const uchar *face_mask, int g) {
+    return (device const int *)(face_mask + ShaderFacesBidsOffset(g));
 }
 
-/** \brief Whether this threadgroup's tile can read a nonzero face mask. */
-inline bool tile_flagged(device const uchar *d_faceMask, int G, constant FdtdBatchParams &B, uint3 tgid) {
-    int ntx = (B.Nx + FDTD_TGX - 1) / FDTD_TGX, nty = (B.Ny + FDTD_TGY - 1) / FDTD_TGY;
-    return d_faceMask[SHADER_FACES_TILES_OFFSET(G) + FDTD_TILE_INDEX(tgid.x, tgid.y, tgid.z, ntx, nty)] != 0;
+// Whether this threadgroup's tile can read a nonzero face mask.
+inline bool TileFlagged(device const uchar *face_mask, int g, constant FdtdBatchParams &batch, uint3 tgid) {
+    int ntx = (batch.Nx + FdtdTgX - 1) / FdtdTgX, nty = (batch.Ny + FdtdTgY - 1) / FdtdTgY;
+    return face_mask[ShaderFacesTilesOffset(g) + FdtdTileIndex(tgid.x, tgid.y, tgid.z, ntx, nty)] != 0;
 }
 
-/** \brief The pending boundary application for the face at `cid` in direction `dir`,
- *         folded into a velocity read. Same arithmetic as apply_shader. */
-inline REAL apply_pending(REAL v, REAL beta_face, int dir, int cid, uchar mask,
-                          device const int *d_faceBids, device const REAL *d_shaderData,
-                          constant FdtdBatchParams &B, constant FdtdStepParams &S) {
-    int G = B.Nx * B.Ny * B.Nz;
-    if (FOLD_APPLY && (mask & (1u << dir))) { // pending blend
-        REAL val = shader_value(d_faceBids[dir * G + cid], d_shaderData, B, S);
+// The pending boundary application for the face at `cid` in direction `dir`, folded into a
+// velocity read. Same arithmetic as ApplyShader.
+inline real ApplyPending(real v, real beta_face, int dir, int cid, uchar mask,
+                         device const int *face_bids, device const real *shader_data,
+                         constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
+    int g = batch.Nx * batch.Ny * batch.Nz;
+    if (FoldApply && (mask & (1u << dir))) { // Pending blend
+        real val = ShaderValue(face_bids[dir * g + cid], shader_data, batch, step);
         v += beta_face * (val - v);
     }
-    if (FOLD_APPLY && (mask & (1u << (dir + 3)))) { // pending force
-        REAL val = shader_value(d_faceBids[(3 + dir) * G + cid], d_shaderData, B, S);
-        v += (1.f - beta_face) * val * B.inv_RHO_dt;
+    if (FoldApply && (mask & (1u << (dir + 3)))) { // Pending force
+        real val = ShaderValue(face_bids[(3 + dir) * g + cid], shader_data, batch, step);
+        v += (1.f - beta_face) * val * batch.InvRhoDt;
     }
     return v;
 }
 
-/** \brief One face's blended velocity update (Eq. 8b from [Xue et al. 2024]), for the
- *         face stored at cell (i, j, k). Shared by step_velocity and the fused step so
- *         both compile identical arithmetic. */
-inline REAL face_velocity_x(int i, int j, int k, device const REAL *d_p, device const REAL *d_vx, device const uchar *d_state,
-                            uchar mask, device const int *d_faceBids, device const REAL *d_shaderData,
-                            device const REAL *d_pmlN, device const REAL *d_pmlD,
-                            constant FdtdBatchParams &B, constant FdtdStepParams &S) {
-    int cid = CID(i, j, k, B.Nx, B.Ny);
-    int min_xdist = min(i + 1, B.Nx - i - 1);
-    REAL p = d_p[cid];
-    REAL p_R = (i < B.Nx - 1) ? d_p[CID(i + 1, j, k, B.Nx, B.Ny)] : 0.f; // RIGHT
-    REAL beta = beta_of(d_state[cid], S.tb);
-    REAL beta_R = (i < B.Nx - 1) ? beta_of(d_state[CID(i + 1, j, k, B.Nx, B.Ny)], S.tb) : 1.f;
-    REAL gradx = (p_R - p) * B.inv_dx;
-    REAL betax = max(beta, beta_R);
-    REAL v = apply_pending(d_vx[cid], betax, X_DIR, cid, mask, d_faceBids, d_shaderData, B, S);
-    // pmlN = 1. and pmlD = 1. / (1. + damping) if outside PML layer
-    return (d_pmlN[min_xdist] * v - (1.f - betax) * B.inv_RHO_dt * gradx) * d_pmlD[min_xdist];
+// One face's blended velocity update (Eq. 8b from [Xue et al. 2024]), for the face stored
+// at cell (i, j, k). Shared by StepVelocity and the fused step so both compile identical
+// arithmetic.
+inline real FaceVelocityX(int i, int j, int k, device const real *p, device const real *vx, device const uchar *state,
+                          uchar mask, device const int *face_bids, device const real *shader_data,
+                          device const real *pml_n, device const real *pml_d,
+                          constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
+    int cid = Cid(i, j, k, batch.Nx, batch.Ny);
+    int min_xdist = min(i + 1, batch.Nx - i - 1);
+    real p_c = p[cid];
+    real p_r = (i < batch.Nx - 1) ? p[Cid(i + 1, j, k, batch.Nx, batch.Ny)] : 0.f; // RIGHT
+    real beta = BetaOf(state[cid], step.Tb);
+    real beta_r = (i < batch.Nx - 1) ? BetaOf(state[Cid(i + 1, j, k, batch.Nx, batch.Ny)], step.Tb) : 1.f;
+    real gradx = (p_r - p_c) * batch.InvDx;
+    real betax = max(beta, beta_r);
+    real v = ApplyPending(vx[cid], betax, XDir, cid, mask, face_bids, shader_data, batch, step);
+    // pml_n = 1. and pml_d = 1. / (1. + damping) outside the PML layer
+    return (pml_n[min_xdist] * v - (1.f - betax) * batch.InvRhoDt * gradx) * pml_d[min_xdist];
 }
-inline REAL face_velocity_y(int i, int j, int k, device const REAL *d_p, device const REAL *d_vy, device const uchar *d_state,
-                            uchar mask, device const int *d_faceBids, device const REAL *d_shaderData,
-                            device const REAL *d_pmlN, device const REAL *d_pmlD,
-                            constant FdtdBatchParams &B, constant FdtdStepParams &S) {
-    int cid = CID(i, j, k, B.Nx, B.Ny);
-    int min_ydist = min(j + 1, B.Ny - j - 1);
-    REAL p = d_p[cid];
-    REAL p_U = (j < B.Ny - 1) ? d_p[CID(i, j + 1, k, B.Nx, B.Ny)] : 0.f; // UP
-    REAL beta = beta_of(d_state[cid], S.tb);
-    REAL beta_U = (j < B.Ny - 1) ? beta_of(d_state[CID(i, j + 1, k, B.Nx, B.Ny)], S.tb) : 1.f;
-    REAL grady = (p_U - p) * B.inv_dx;
-    REAL betay = max(beta, beta_U);
-    REAL v = apply_pending(d_vy[cid], betay, Y_DIR, cid, mask, d_faceBids, d_shaderData, B, S);
-    return (d_pmlN[min_ydist] * v - (1.f - betay) * B.inv_RHO_dt * grady) * d_pmlD[min_ydist];
+inline real FaceVelocityY(int i, int j, int k, device const real *p, device const real *vy, device const uchar *state,
+                          uchar mask, device const int *face_bids, device const real *shader_data,
+                          device const real *pml_n, device const real *pml_d,
+                          constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
+    int cid = Cid(i, j, k, batch.Nx, batch.Ny);
+    int min_ydist = min(j + 1, batch.Ny - j - 1);
+    real p_c = p[cid];
+    real p_u = (j < batch.Ny - 1) ? p[Cid(i, j + 1, k, batch.Nx, batch.Ny)] : 0.f; // UP
+    real beta = BetaOf(state[cid], step.Tb);
+    real beta_u = (j < batch.Ny - 1) ? BetaOf(state[Cid(i, j + 1, k, batch.Nx, batch.Ny)], step.Tb) : 1.f;
+    real grady = (p_u - p_c) * batch.InvDx;
+    real betay = max(beta, beta_u);
+    real v = ApplyPending(vy[cid], betay, YDir, cid, mask, face_bids, shader_data, batch, step);
+    return (pml_n[min_ydist] * v - (1.f - betay) * batch.InvRhoDt * grady) * pml_d[min_ydist];
 }
-inline REAL face_velocity_z(int i, int j, int k, device const REAL *d_p, device const REAL *d_vz, device const uchar *d_state,
-                            uchar mask, device const int *d_faceBids, device const REAL *d_shaderData,
-                            device const REAL *d_pmlN, device const REAL *d_pmlD,
-                            constant FdtdBatchParams &B, constant FdtdStepParams &S) {
-    int cid = CID(i, j, k, B.Nx, B.Ny);
-    int min_zdist = min(k + 1, B.Nz - k - 1);
-    REAL p = d_p[cid];
-    REAL p_B = (k < B.Nz - 1) ? d_p[CID(i, j, k + 1, B.Nx, B.Ny)] : 0.f; // BACK
-    REAL beta = beta_of(d_state[cid], S.tb);
-    REAL beta_B = (k < B.Nz - 1) ? beta_of(d_state[CID(i, j, k + 1, B.Nx, B.Ny)], S.tb) : 1.f;
-    REAL gradz = (p_B - p) * B.inv_dx;
-    REAL betaz = max(beta, beta_B);
-    REAL v = apply_pending(d_vz[cid], betaz, Z_DIR, cid, mask, d_faceBids, d_shaderData, B, S);
-    return (d_pmlN[min_zdist] * v - (1.f - betaz) * B.inv_RHO_dt * gradz) * d_pmlD[min_zdist];
+inline real FaceVelocityZ(int i, int j, int k, device const real *p, device const real *vz, device const uchar *state,
+                          uchar mask, device const int *face_bids, device const real *shader_data,
+                          device const real *pml_n, device const real *pml_d,
+                          constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
+    int cid = Cid(i, j, k, batch.Nx, batch.Ny);
+    int min_zdist = min(k + 1, batch.Nz - k - 1);
+    real p_c = p[cid];
+    real p_b = (k < batch.Nz - 1) ? p[Cid(i, j, k + 1, batch.Nx, batch.Ny)] : 0.f; // BACK
+    real beta = BetaOf(state[cid], step.Tb);
+    real beta_b = (k < batch.Nz - 1) ? BetaOf(state[Cid(i, j, k + 1, batch.Nx, batch.Ny)], step.Tb) : 1.f;
+    real gradz = (p_b - p_c) * batch.InvDx;
+    real betaz = max(beta, beta_b);
+    real v = ApplyPending(vz[cid], betaz, ZDir, cid, mask, face_bids, shader_data, batch, step);
+    return (pml_n[min_zdist] * v - (1.f - betaz) * batch.InvRhoDt * gradz) * pml_d[min_zdist];
 }
 
-/** \brief Blended velocity update kernel: pressure gradient term (Eq. 8b from [Xue et al. 2024]),
- *         with the pending boundary application folded into the velocity reads. Also
- *         samples the pressure field at listener cells into the listener output buffer. */
-kernel void step_velocity(device const REAL *d_p [[buffer(0)]],
-                          device REAL *d_vx [[buffer(4)]], device REAL *d_vy [[buffer(5)]], device REAL *d_vz [[buffer(6)]],
-                          device const uchar *d_faceMask [[buffer(7)]], device const uchar *d_state [[buffer(8)]],
-                          device const REAL *d_pmlN [[buffer(11)]], device const REAL *d_pmlD [[buffer(12)]],
-                          device const REAL *d_shaderData [[buffer(13)]],
-                          device const int *d_listenerCids [[buffer(15)]], device REAL *d_listenerOut [[buffer(16)]],
-                          constant FdtdBatchParams &B [[buffer(FDTD_BATCH_PARAMS_INDEX)]],
-                          constant FdtdStepParams &S [[buffer(FDTD_STEP_PARAMS_INDEX)]],
-                          uint3 tid [[thread_position_in_grid]],
-                          uint3 tgid [[threadgroup_position_in_grid]]) {
+// Blended velocity update kernel: the pressure gradient term (Eq. 8b from [Xue et al. 2024]),
+// with the pending boundary application folded into the velocity reads. Also samples the
+// pressure field at listener cells into the listener output buffer.
+kernel void StepVelocity(device const real *p [[buffer(0)]],
+                         device real *vx [[buffer(4)]], device real *vy [[buffer(5)]], device real *vz [[buffer(6)]],
+                         device const uchar *face_mask [[buffer(7)]], device const uchar *state [[buffer(8)]],
+                         device const real *pml_n [[buffer(11)]], device const real *pml_d [[buffer(12)]],
+                         device const real *shader_data [[buffer(13)]],
+                         device const int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
+                         constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
+                         constant FdtdStepParams &step [[buffer(FdtdStepParamsIndex)]],
+                         uint3 tid [[thread_position_in_grid]],
+                         uint3 tgid [[threadgroup_position_in_grid]]) {
     int i = tid.x, j = tid.y, k = tid.z;
-    if (i >= B.Nx || j >= B.Ny || k >= B.Nz) return;
-    int cid = CID(i, j, k, B.Nx, B.Ny);
-    int G = B.Nx * B.Ny * B.Nz;
-    device const int *d_faceBids = face_bids(d_faceMask, G);
-    uchar mask_c = (FOLD_APPLY && tile_flagged(d_faceMask, G, B, tgid)) ? d_faceMask[cid] : 0;
+    if (i >= batch.Nx || j >= batch.Ny || k >= batch.Nz) return;
+    int cid = Cid(i, j, k, batch.Nx, batch.Ny);
+    int g = batch.Nx * batch.Ny * batch.Nz;
+    device const int *face_bids = FaceBids(face_mask, g);
+    uchar mask_c = (FoldApply && TileFlagged(face_mask, g, batch, tgid)) ? face_mask[cid] : 0;
 
-    d_vx[cid] = face_velocity_x(i, j, k, d_p, d_vx, d_state, mask_c, d_faceBids, d_shaderData, d_pmlN, d_pmlD, B, S);
-    d_vy[cid] = face_velocity_y(i, j, k, d_p, d_vy, d_state, mask_c, d_faceBids, d_shaderData, d_pmlN, d_pmlD, B, S);
-    d_vz[cid] = face_velocity_z(i, j, k, d_p, d_vz, d_state, mask_c, d_faceBids, d_shaderData, d_pmlN, d_pmlD, B, S);
+    vx[cid] = FaceVelocityX(i, j, k, p, vx, state, mask_c, face_bids, shader_data, pml_n, pml_d, batch, step);
+    vy[cid] = FaceVelocityY(i, j, k, p, vy, state, mask_c, face_bids, shader_data, pml_n, pml_d, batch, step);
+    vz[cid] = FaceVelocityZ(i, j, k, p, vz, state, mask_c, face_bids, shader_data, pml_n, pml_d, batch, step);
 
     // Listener sampling (p is unchanged by the velocity update)
-    for (int l = 0; l < B.N_listeners; ++l) {
-        if (cid == d_listenerCids[l]) d_listenerOut[S.s * B.N_listeners + l] = d_p[cid];
+    for (int l = 0; l < batch.NListeners; ++l) {
+        if (cid == listener_cids[l]) listener_out[step.SampleIndex * batch.NListeners + l] = p[cid];
     }
 }
 
-/** \brief Fused step: velocity update at step s, with step s's pending boundary
- *         application folded into the velocity reads, followed by the pressure update at
- *         step s + 1, in one full-grid pass. Each thread computes all six face velocities
- *         its cell's divergence needs (the three lower faces recompute bit-identically in
- *         their owning threads via the shared face_velocity_* functions), writes its own
- *         three, then updates its pressure from the fresh divergence.
- *
- *         Reads p(s) and v from the in slots and writes p(s+1) and v(s) to the out slots
- *         (the host ping-pongs the bindings per step) — neighbor reads would otherwise
- *         race in-kernel writes. Listener slot S.s samples p(s), the pre-update
- *         pressure. */
-kernel void step_velocity_pressure(device const REAL *d_p [[buffer(0)]],
-                                   device REAL *d_px [[buffer(1)]], device REAL *d_py [[buffer(2)]], device REAL *d_pz [[buffer(3)]],
-                                   device const REAL *d_vx [[buffer(4)]], device const REAL *d_vy [[buffer(5)]], device const REAL *d_vz [[buffer(6)]],
-                                   device const uchar *d_faceMask [[buffer(7)]], device const uchar *d_state [[buffer(8)]],
-                                   device const REAL *d_pmlNp [[buffer(9)]], device const REAL *d_pmlDp [[buffer(10)]],
-                                   device const REAL *d_pmlNv [[buffer(11)]], device const REAL *d_pmlDv [[buffer(12)]],
-                                   device const REAL *d_shaderData [[buffer(13)]],
-                                   device const int *d_listenerCids [[buffer(15)]], device REAL *d_listenerOut [[buffer(16)]],
-                                   device REAL *d_p_out [[buffer(21)]],
-                                   device REAL *d_vx_out [[buffer(22)]], device REAL *d_vy_out [[buffer(23)]], device REAL *d_vz_out [[buffer(24)]],
-                                   constant FdtdBatchParams &B [[buffer(FDTD_BATCH_PARAMS_INDEX)]],
-                                   constant FdtdStepParams &S [[buffer(FDTD_STEP_PARAMS_INDEX)]],
-                                   uint3 tid [[thread_position_in_grid]],
-                                   uint3 tgid [[threadgroup_position_in_grid]]) {
+// Fused step: the velocity update at step s, with step s's pending boundary application
+// folded into the velocity reads, followed by the pressure update at step s + 1, in one
+// full-grid pass. Each thread computes all six face velocities its cell's divergence needs
+// (the three lower faces recompute bit-identically in their owning threads via the shared
+// FaceVelocity* functions), writes its own three, then updates its pressure from the fresh
+// divergence.
+//
+// Reads p(s) and v from the in slots and writes p(s+1) and v(s) to the out slots (the host
+// ping-pongs the bindings per step) — neighbor reads would otherwise race in-kernel writes.
+// Listener slot step.SampleIndex samples p(s), the pre-update pressure.
+kernel void StepVelocityPressure(device const real *p [[buffer(0)]],
+                                 device real *px [[buffer(1)]], device real *py [[buffer(2)]], device real *pz [[buffer(3)]],
+                                 device const real *vx [[buffer(4)]], device const real *vy [[buffer(5)]], device const real *vz [[buffer(6)]],
+                                 device const uchar *face_mask [[buffer(7)]], device const uchar *state [[buffer(8)]],
+                                 device const real *pml_np [[buffer(9)]], device const real *pml_dp [[buffer(10)]],
+                                 device const real *pml_nv [[buffer(11)]], device const real *pml_dv [[buffer(12)]],
+                                 device const real *shader_data [[buffer(13)]],
+                                 device const int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
+                                 device real *p_out [[buffer(21)]],
+                                 device real *vx_out [[buffer(22)]], device real *vy_out [[buffer(23)]], device real *vz_out [[buffer(24)]],
+                                 constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
+                                 constant FdtdStepParams &step [[buffer(FdtdStepParamsIndex)]],
+                                 uint3 tid [[thread_position_in_grid]],
+                                 uint3 tgid [[threadgroup_position_in_grid]]) {
     int i = tid.x, j = tid.y, k = tid.z;
-    if (i >= B.Nx || j >= B.Ny || k >= B.Nz) return;
-    int cid = CID(i, j, k, B.Nx, B.Ny);
-    int G = B.Nx * B.Ny * B.Nz;
-    device const int *d_faceBids = face_bids(d_faceMask, G);
+    if (i >= batch.Nx || j >= batch.Ny || k >= batch.Nz) return;
+    int cid = Cid(i, j, k, batch.Nx, batch.Ny);
+    int g = batch.Nx * batch.Ny * batch.Nz;
+    device const int *face_bids = FaceBids(face_mask, g);
 
     // Face masks for this cell and its lower halo, skipped wholesale for tiles without
     // shader faces in reach
-    uchar mask_c = 0, mask_L = 0, mask_D = 0, mask_F = 0;
-    if (FOLD_APPLY && tile_flagged(d_faceMask, G, B, tgid)) {
-        mask_c = d_faceMask[cid];
-        if (i > 0) mask_L = d_faceMask[cid - 1];
-        if (j > 0) mask_D = d_faceMask[cid - B.Nx];
-        if (k > 0) mask_F = d_faceMask[cid - B.Nx * B.Ny];
+    uchar mask_c = 0, mask_l = 0, mask_d = 0, mask_f = 0;
+    if (FoldApply && TileFlagged(face_mask, g, batch, tgid)) {
+        mask_c = face_mask[cid];
+        if (i > 0) mask_l = face_mask[cid - 1];
+        if (j > 0) mask_d = face_mask[cid - batch.Nx];
+        if (k > 0) mask_f = face_mask[cid - batch.Nx * batch.Ny];
     }
 
     // ----- Velocity update at step s: this cell's faces, plus the lower faces its
     // divergence needs -----
-    REAL vx = face_velocity_x(i, j, k, d_p, d_vx, d_state, mask_c, d_faceBids, d_shaderData, d_pmlNv, d_pmlDv, B, S);
-    REAL vy = face_velocity_y(i, j, k, d_p, d_vy, d_state, mask_c, d_faceBids, d_shaderData, d_pmlNv, d_pmlDv, B, S);
-    REAL vz = face_velocity_z(i, j, k, d_p, d_vz, d_state, mask_c, d_faceBids, d_shaderData, d_pmlNv, d_pmlDv, B, S);
-    REAL vx_L = (i > 0) ? face_velocity_x(i - 1, j, k, d_p, d_vx, d_state, mask_L, d_faceBids, d_shaderData, d_pmlNv, d_pmlDv, B, S) : 0.f; // LEFT
-    REAL vy_D = (j > 0) ? face_velocity_y(i, j - 1, k, d_p, d_vy, d_state, mask_D, d_faceBids, d_shaderData, d_pmlNv, d_pmlDv, B, S) : 0.f; // DOWN
-    REAL vz_F = (k > 0) ? face_velocity_z(i, j, k - 1, d_p, d_vz, d_state, mask_F, d_faceBids, d_shaderData, d_pmlNv, d_pmlDv, B, S) : 0.f; // FRONT
+    real vx_c = FaceVelocityX(i, j, k, p, vx, state, mask_c, face_bids, shader_data, pml_nv, pml_dv, batch, step);
+    real vy_c = FaceVelocityY(i, j, k, p, vy, state, mask_c, face_bids, shader_data, pml_nv, pml_dv, batch, step);
+    real vz_c = FaceVelocityZ(i, j, k, p, vz, state, mask_c, face_bids, shader_data, pml_nv, pml_dv, batch, step);
+    real vx_l = (i > 0) ? FaceVelocityX(i - 1, j, k, p, vx, state, mask_l, face_bids, shader_data, pml_nv, pml_dv, batch, step) : 0.f; // LEFT
+    real vy_d = (j > 0) ? FaceVelocityY(i, j - 1, k, p, vy, state, mask_d, face_bids, shader_data, pml_nv, pml_dv, batch, step) : 0.f; // DOWN
+    real vz_f = (k > 0) ? FaceVelocityZ(i, j, k - 1, p, vz, state, mask_f, face_bids, shader_data, pml_nv, pml_dv, batch, step) : 0.f; // FRONT
 
-    REAL p_s = d_p[cid]; // p(s), for the listener sample
-    d_vx_out[cid] = vx;
-    d_vy_out[cid] = vy;
-    d_vz_out[cid] = vz;
+    real p_s = p[cid]; // p(s), for the listener sample
+    vx_out[cid] = vx_c;
+    vy_out[cid] = vy_c;
+    vz_out[cid] = vz_c;
 
-    for (int l = 0; l < B.N_listeners; ++l) {
-        if (cid == d_listenerCids[l]) d_listenerOut[S.s * B.N_listeners + l] = p_s;
+    for (int l = 0; l < batch.NListeners; ++l) {
+        if (cid == listener_cids[l]) listener_out[step.SampleIndex * batch.NListeners + l] = p_s;
     }
 
     // ----- Pressure update at step s + 1 (Eq. 8a), from the fresh face velocities -----
-    int min_xdist = min(i, B.Nx - 1 - i);
-    int min_ydist = min(j, B.Ny - 1 - j);
-    int min_zdist = min(k, B.Nz - 1 - k);
+    int min_xdist = min(i, batch.Nx - 1 - i);
+    int min_ydist = min(j, batch.Ny - 1 - j);
+    int min_zdist = min(k, batch.Nz - 1 - k);
 
-    REAL divx = (vx - vx_L) * B.inv_dx;
-    REAL divy = (vy - vy_D) * B.inv_dx;
-    REAL divz = (vz - vz_F) * B.inv_dx;
+    real divx = (vx_c - vx_l) * batch.InvDx;
+    real divy = (vy_c - vy_d) * batch.InvDx;
+    real divz = (vz_c - vz_f) * batch.InvDx;
 
-    if (min_xdist < PML_WIDTH || min_ydist < PML_WIDTH || min_zdist < PML_WIDTH) { // Inside PML: split pressure update
-        REAL px = d_px[cid], py = d_py[cid], pz = d_pz[cid];
+    if (min_xdist < PmlWidth || min_ydist < PmlWidth || min_zdist < PmlWidth) { // Inside the PML: split pressure update
+        real px_c = px[cid], py_c = py[cid], pz_c = pz[cid];
 
-        px = (d_pmlNp[min_xdist] * px - B.RHO_CC_dt * divx) * d_pmlDp[min_xdist];
-        py = (d_pmlNp[min_ydist] * py - B.RHO_CC_dt * divy) * d_pmlDp[min_ydist];
-        pz = (d_pmlNp[min_zdist] * pz - B.RHO_CC_dt * divz) * d_pmlDp[min_zdist];
+        px_c = (pml_np[min_xdist] * px_c - batch.RhoCcDt * divx) * pml_dp[min_xdist];
+        py_c = (pml_np[min_ydist] * py_c - batch.RhoCcDt * divy) * pml_dp[min_ydist];
+        pz_c = (pml_np[min_zdist] * pz_c - batch.RhoCcDt * divz) * pml_dp[min_zdist];
 
-        d_px[cid] = px;
-        d_py[cid] = py;
-        d_pz[cid] = pz;
-        d_p_out[cid] = px + py + pz;
-    } else { // Otherwise, regular pressure update
-        d_p_out[cid] = p_s - B.RHO_CC_dt * (divx + divy + divz);
+        px[cid] = px_c;
+        py[cid] = py_c;
+        pz[cid] = pz_c;
+        p_out[cid] = px_c + py_c + pz_c;
+    } else {
+        p_out[cid] = p_s - batch.RhoCcDt * (divx + divy + divz);
     }
 }
 
 // ====================== Fresh cells + shader re-init (WaveBlender.cu) ======================
 
-/** \brief Computes a_n, required to enforce Neumann boundary conditions for fresh cell */
-kernel void prepare_fresh_cell(device REAL *d_ax [[buffer(0)]], device REAL *d_ay [[buffer(1)]], device REAL *d_az [[buffer(2)]],
-                               device const REAL *d_shaderData [[buffer(3)]], device const int *d_shaderMap [[buffer(4)]],
-                               constant PrepareFreshCellParams &P [[buffer(5)]],
-                               uint tid [[thread_position_in_grid]]) {
+// Computes a_n, required to enforce Neumann boundary conditions for a fresh cell.
+kernel void PrepareFreshCell(device real *ax [[buffer(0)]], device real *ay [[buffer(1)]], device real *az [[buffer(2)]],
+                             device const real *shader_data [[buffer(3)]], device const int *shader_map [[buffer(4)]],
+                             constant PrepareFreshCellParams &params [[buffer(5)]],
+                             uint tid [[thread_position_in_grid]]) {
     int global_bid = tid;
-    if (global_bid >= P.N_shader_points) return;
+    if (global_bid >= params.NShaderPoints) return;
 
-    // Decode shader map
-    if (d_shaderMap[global_bid] < 0) return; // Skip if isForce
-    int dir = d_shaderMap[global_bid] % 3;
-    int cid = d_shaderMap[global_bid] / 3;
+    // Decode the shader map
+    if (shader_map[global_bid] < 0) return; // Skip if is_force
+    int dir = shader_map[global_bid] % 3;
+    int cid = shader_map[global_bid] / 3;
 
-    // Decode shader values
-    int floor_ = (global_bid * P.N_shader_samples);
-    REAL vb0 = d_shaderData[floor_];
-    REAL vb0_dt = (1.f - P.incr) * d_shaderData[floor_] + (P.incr)*d_shaderData[floor_ + 1];
+    int base = (global_bid * params.NShaderSamples);
+    real vb0 = shader_data[base];
+    real vb0_dt = (1.f - params.Incr) * shader_data[base] + (params.Incr)*shader_data[base + 1];
 
-    REAL a_0 = (vb0_dt - vb0) * P.inv_dt;
-    if (dir == X_DIR) d_ax[cid] = a_0;
-    else if (dir == Y_DIR) d_ay[cid] = a_0;
-    else if (dir == Z_DIR) d_az[cid] = a_0;
+    real a_0 = (vb0_dt - vb0) * params.InvDt;
+    if (dir == XDir) ax[cid] = a_0;
+    else if (dir == YDir) ay[cid] = a_0;
+    else if (dir == ZDir) az[cid] = a_0;
 }
 
-/** \brief Eq. 13 from [Xue et al. 2024] */
-kernel void fresh_cell_pressure(device REAL *d_p [[buffer(0)]],
-                                device const REAL *d_ax [[buffer(1)]], device const REAL *d_ay [[buffer(2)]], device const REAL *d_az [[buffer(3)]],
-                                device const uchar *d_state [[buffer(4)]],
-                                constant FreshCellPressureParams &P [[buffer(5)]],
-                                uint3 tid [[thread_position_in_grid]]) {
-    int i = tid.x + PML_WIDTH;
-    int j = tid.y + PML_WIDTH;
-    int k = tid.z + PML_WIDTH;
+// Eq. 13 from [Xue et al. 2024]
+kernel void FreshCellPressure(device real *p [[buffer(0)]],
+                              device const real *ax [[buffer(1)]], device const real *ay [[buffer(2)]], device const real *az [[buffer(3)]],
+                              device const uchar *state [[buffer(4)]],
+                              constant FreshCellPressureParams &params [[buffer(5)]],
+                              uint3 tid [[thread_position_in_grid]]) {
+    int i = tid.x + PmlWidth;
+    int j = tid.y + PmlWidth;
+    int k = tid.z + PmlWidth;
 
-    if (i >= P.Nx - 1 - PML_WIDTH || j >= P.Ny - 1 - PML_WIDTH || k >= P.Nz - 1 - PML_WIDTH) return;
-    int cid = CID(i, j, k, P.Nx, P.Ny);
+    if (i >= params.Nx - 1 - PmlWidth || j >= params.Ny - 1 - PmlWidth || k >= params.Nz - 1 - PmlWidth) return;
+    int cid = Cid(i, j, k, params.Nx, params.Ny);
 
     int neighbor_cids[6] = {
-        CID(i - 1, j, k, P.Nx, P.Ny), CID(i + 1, j, k, P.Nx, P.Ny), // left, right
-        CID(i, j - 1, k, P.Nx, P.Ny), CID(i, j + 1, k, P.Nx, P.Ny), // down, up
-        CID(i, j, k - 1, P.Nx, P.Ny), CID(i, j, k + 1, P.Nx, P.Ny) // front, back
+        Cid(i - 1, j, k, params.Nx, params.Ny), Cid(i + 1, j, k, params.Nx, params.Ny), // left, right
+        Cid(i, j - 1, k, params.Nx, params.Ny), Cid(i, j + 1, k, params.Nx, params.Ny), // down, up
+        Cid(i, j, k - 1, params.Nx, params.Ny), Cid(i, j, k + 1, params.Nx, params.Ny) // front, back
     };
-    REAL p_fresh = 0.f;
-    int N_air = 0;
+    real p_fresh = 0.f;
+    int n_air = 0;
     for (int n = 0; n < 6; n++) {
-        if (beta0_of(d_state[neighbor_cids[n]]) >= 1.f) continue; // neighboring cell is solid
+        if (Beta0Of(state[neighbor_cids[n]]) >= 1.f) continue; // Neighboring cell is solid
 
         int dir = n / 3;
-        REAL sign = (n % 2 == 0) ? 1.f : -1.f;
+        real sign = (n % 2 == 0) ? 1.f : -1.f;
         int vid = (n % 2 == 0) ? neighbor_cids[n] : cid;
 
-        if (dir == X_DIR) p_fresh += d_p[neighbor_cids[n]] - sign * P.rho_dx * d_ax[vid];
-        else if (dir == Y_DIR) p_fresh += d_p[neighbor_cids[n]] - sign * P.rho_dx * d_ay[vid];
-        else if (dir == Z_DIR) p_fresh += d_p[neighbor_cids[n]] - sign * P.rho_dx * d_az[vid];
-        N_air += 1;
+        if (dir == XDir) p_fresh += p[neighbor_cids[n]] - sign * params.RhoDx * ax[vid];
+        else if (dir == YDir) p_fresh += p[neighbor_cids[n]] - sign * params.RhoDx * ay[vid];
+        else if (dir == ZDir) p_fresh += p[neighbor_cids[n]] - sign * params.RhoDx * az[vid];
+        n_air += 1;
     }
-    if (N_air > 0) p_fresh /= N_air;
+    if (n_air > 0) p_fresh /= n_air;
 
-    REAL beta = beta0_of(d_state[cid]);
-    d_p[cid] = (1.f - beta) * d_p[cid] + beta * p_fresh;
+    real beta = Beta0Of(state[cid]);
+    p[cid] = (1.f - beta) * p[cid] + beta * p_fresh;
 }
 
-/** \brief Sets interior velocities to 0 (and clears acceleration a_n buffers) */
-kernel void clear_solid(device REAL *d_vx [[buffer(0)]], device REAL *d_vy [[buffer(1)]], device REAL *d_vz [[buffer(2)]],
-                        device REAL *d_ax [[buffer(3)]], device REAL *d_ay [[buffer(4)]], device REAL *d_az [[buffer(5)]],
-                        device const uchar *d_state [[buffer(6)]],
-                        constant ClearSolidParams &P [[buffer(7)]],
-                        uint3 tid [[thread_position_in_grid]]) {
-    int i = tid.x + PML_WIDTH;
-    int j = tid.y + PML_WIDTH;
-    int k = tid.z + PML_WIDTH;
+// Sets interior velocities to 0 (and clears the acceleration a_n buffers).
+kernel void ClearSolid(device real *vx [[buffer(0)]], device real *vy [[buffer(1)]], device real *vz [[buffer(2)]],
+                       device real *ax [[buffer(3)]], device real *ay [[buffer(4)]], device real *az [[buffer(5)]],
+                       device const uchar *state [[buffer(6)]],
+                       constant ClearSolidParams &params [[buffer(7)]],
+                       uint3 tid [[thread_position_in_grid]]) {
+    int i = tid.x + PmlWidth;
+    int j = tid.y + PmlWidth;
+    int k = tid.z + PmlWidth;
 
-    if (i >= P.Nx - 1 - PML_WIDTH || j >= P.Ny - 1 - PML_WIDTH || k >= P.Nz - 1 - PML_WIDTH) return;
-    int cid = CID(i, j, k, P.Nx, P.Ny);
+    if (i >= params.Nx - 1 - PmlWidth || j >= params.Ny - 1 - PmlWidth || k >= params.Nz - 1 - PmlWidth) return;
+    int cid = Cid(i, j, k, params.Nx, params.Ny);
 
-    if (beta0_of(d_state[cid]) >= 1.f) {
-        if (beta0_of(d_state[CID(i + 1, j, k, P.Nx, P.Ny)]) >= 1.f) d_vx[cid] = 0.f;
-        if (beta0_of(d_state[CID(i, j + 1, k, P.Nx, P.Ny)]) >= 1.f) d_vy[cid] = 0.f;
-        if (beta0_of(d_state[CID(i, j, k + 1, P.Nx, P.Ny)]) >= 1.f) d_vz[cid] = 0.f;
+    if (Beta0Of(state[cid]) >= 1.f) {
+        if (Beta0Of(state[Cid(i + 1, j, k, params.Nx, params.Ny)]) >= 1.f) vx[cid] = 0.f;
+        if (Beta0Of(state[Cid(i, j + 1, k, params.Nx, params.Ny)]) >= 1.f) vy[cid] = 0.f;
+        if (Beta0Of(state[Cid(i, j, k + 1, params.Nx, params.Ny)]) >= 1.f) vz[cid] = 0.f;
     }
-    d_ax[cid] = 0.f;
-    d_ay[cid] = 0.f;
-    d_az[cid] = 0.f;
+    ax[cid] = 0.f;
+    ay[cid] = 0.f;
+    az[cid] = 0.f;
 }
 
-/** \brief Section 6.2.2 from [Xue et al. 2024] */
-kernel void shader_reinit(device const REAL *d_vx [[buffer(0)]], device const REAL *d_vy [[buffer(1)]], device const REAL *d_vz [[buffer(2)]],
-                          device REAL *d_shaderData [[buffer(3)]], device const int *d_shaderMap [[buffer(4)]],
-                          constant ShaderReInitParams &P [[buffer(5)]],
-                          uint tid [[thread_position_in_grid]]) {
+// Section 6.2.2 from [Xue et al. 2024]
+kernel void ShaderReInit(device const real *vx [[buffer(0)]], device const real *vy [[buffer(1)]], device const real *vz [[buffer(2)]],
+                         device real *shader_data [[buffer(3)]], device const int *shader_map [[buffer(4)]],
+                         constant ShaderReInitParams &params [[buffer(5)]],
+                         uint tid [[thread_position_in_grid]]) {
     int global_bid = tid;
-    if (global_bid >= P.N_shader_points) return;
+    if (global_bid >= params.NShaderPoints) return;
 
-    // Decode shader map
-    if (d_shaderMap[global_bid] < 0) return; // Skip if isForce
-    int dir = d_shaderMap[global_bid] % 3;
-    int cid = d_shaderMap[global_bid] / 3;
+    // Decode the shader map
+    if (shader_map[global_bid] < 0) return; // Skip if is_force
+    int dir = shader_map[global_bid] % 3;
+    int cid = shader_map[global_bid] / 3;
 
-    // Decode shader values
-    int floor_ = (global_bid * P.N_shader_samples);
-    REAL vb0 = d_shaderData[floor_];
-    REAL v_0 = 0.f;
+    int base = (global_bid * params.NShaderSamples);
+    real vb0 = shader_data[base];
+    real v_0 = 0.f;
 
-    if (dir == X_DIR) v_0 = d_vx[cid];
-    else if (dir == Y_DIR) v_0 = d_vy[cid];
-    else if (dir == Z_DIR) v_0 = d_vz[cid];
+    if (dir == XDir) v_0 = vx[cid];
+    else if (dir == YDir) v_0 = vy[cid];
+    else if (dir == ZDir) v_0 = vz[cid];
 
-    for (int t = 0; t < P.N_shader_samples; t++) d_shaderData[floor_ + t] -= (vb0 - v_0);
+    for (int t = 0; t < params.NShaderSamples; t++) shader_data[base + t] -= (vb0 - v_0);
 }
 
 // ============================== Acoustic shaders (Shaders/*.cu) ==============================
 
-/** \brief Monopole source (Eq. (D-5b), Blackstock pg. 358) */
-kernel void monopole(device REAL *d_vb [[buffer(0)]],
-                     device const REAL *d_B [[buffer(1)]], device const REAL *d_BN [[buffer(2)]],
-                     constant MonopoleParams &P [[buffer(3)]],
+// Monopole source (Eq. (D-5b), Blackstock pg. 358)
+kernel void Monopole(device real *vb [[buffer(0)]],
+                     device const real *b [[buffer(1)]], device const real *bn [[buffer(2)]],
+                     constant MonopoleParams &params [[buffer(3)]],
                      uint2 tid [[thread_position_in_grid]]) {
     int i = tid.x, k = tid.y;
-    if (i >= P.N_points || k >= P.N_samples) return;
+    if (i >= params.NPoints || k >= params.NSamples) return;
 
-    REAL x_src = (P.start_step >= P.N_samples - 1) ? -P.speed + P.speed * (P.start_step + k) / (P.N_samples - 1) : 0.f;
-    REAL y_src = 0.f, z_src = 0.f;
+    real x_src = (params.StartStep >= params.NSamples - 1) ? -params.Speed + params.Speed * (params.StartStep + k) / (params.NSamples - 1) : 0.f;
+    real y_src = 0.f, z_src = 0.f;
 
-    REAL x = d_B[3 * i], y = d_B[3 * i + 1], z = d_B[3 * i + 2];
-    REAL xn = d_BN[3 * i], yn = d_BN[3 * i + 1], zn = d_BN[3 * i + 2];
+    real x = b[3 * i], y = b[3 * i + 1], z = b[3 * i + 2];
+    real xn = bn[3 * i], yn = bn[3 * i + 1], zn = bn[3 * i + 2];
 
-    REAL time = ((REAL)(P.start_step + k) / P.srate);
+    real time = ((real)(params.StartStep + k) / params.Srate);
 
-    REAL r = sqrt((x - x_src) * (x - x_src) + (y - y_src) * (y - y_src) + (z - z_src) * (z - z_src));
-    REAL vb = (cos(2.f * PI_F * P.freqHz * (time - r / P.C)) / (r * r * 2.f * PI_F * P.freqHz)
-               - sin(2.f * PI_F * P.freqHz * (time - r / P.C)) / (r * P.C))
+    real r = sqrt((x - x_src) * (x - x_src) + (y - y_src) * (y - y_src) + (z - z_src) * (z - z_src));
+    real v = (cos(2.f * Pi * params.FreqHz * (time - r / params.C)) / (r * r * 2.f * Pi * params.FreqHz)
+              - sin(2.f * Pi * params.FreqHz * (time - r / params.C)) / (r * params.C))
         * (xn + yn + zn);
 
-    if (time - r / P.C < 0.f) vb = 0.f;
-    d_vb[(P.global_bid + i) * P.N_samples + k] = vb;
+    if (time - r / params.C < 0.f) v = 0.f;
+    vb[(params.GlobalBid + i) * params.NSamples + k] = v;
 }
 
-/** \brief Section 5.1.1 from [Xue et al. 2024] */
-kernel void speaker(device REAL *d_vb [[buffer(0)]],
-                    device const REAL *d_BN [[buffer(1)]], device const REAL *d_audio [[buffer(2)]],
-                    constant SpeakerParams &P [[buffer(3)]],
+// Section 5.1.1 from [Xue et al. 2024]
+kernel void Speaker(device real *vb [[buffer(0)]],
+                    device const real *bn [[buffer(1)]], device const real *audio [[buffer(2)]],
+                    constant SpeakerParams &params [[buffer(3)]],
                     uint2 tid [[thread_position_in_grid]]) {
-    const REAL SCALE = 100.f; // Manually scale input audio amplitude
+    const real Scale = 100.f; // Manually scale the input audio amplitude
 
     int i = tid.x, k = tid.y;
-    if (i >= P.N_points || k >= P.N_samples) return;
+    if (i >= params.NPoints || k >= params.NSamples) return;
 
-    REAL xn = d_BN[3 * i], yn = d_BN[3 * i + 1], zn = d_BN[3 * i + 2];
+    real xn = bn[3 * i], yn = bn[3 * i + 1], zn = bn[3 * i + 2];
 
-    REAL vb = 0.f; // Manually specify speaker direction
-    if (P.dir == 0 && xn <= -1.f) vb = -d_audio[P.start_step + k]; // LEFT
-    else if (P.dir == 1 && xn >= 1.f) vb = d_audio[P.start_step + k]; // RIGHT
-    else if (P.dir == 2 && yn <= -1.f) vb = -d_audio[P.start_step + k]; // DOWN
-    else if (P.dir == 3 && yn >= 1.f) vb = d_audio[P.start_step + k]; // UP
-    else if (P.dir == 4 && zn <= -1.f) vb = -d_audio[P.start_step + k]; // FRONT
-    else if (P.dir == 5 && zn >= 1.f) vb = d_audio[P.start_step + k]; // BACK
+    real v = 0.f; // Manually specify the speaker direction
+    if (params.Dir == 0 && xn <= -1.f) v = -audio[params.StartStep + k]; // LEFT
+    else if (params.Dir == 1 && xn >= 1.f) v = audio[params.StartStep + k]; // RIGHT
+    else if (params.Dir == 2 && yn <= -1.f) v = -audio[params.StartStep + k]; // DOWN
+    else if (params.Dir == 3 && yn >= 1.f) v = audio[params.StartStep + k]; // UP
+    else if (params.Dir == 4 && zn <= -1.f) v = -audio[params.StartStep + k]; // FRONT
+    else if (params.Dir == 5 && zn >= 1.f) v = audio[params.StartStep + k]; // BACK
 
-    d_vb[(P.global_bid + i) * P.N_samples + k] = SCALE * vb;
+    vb[(params.GlobalBid + i) * params.NSamples + k] = Scale * v;
 }
 
-/** \brief Projects modal velocities to boundary faces (interpolating the transfer matrix over the batch) */
-kernel void mode_matmul(device REAL *d_vb [[buffer(0)]],
-                        device const REAL *d_modeToBoundary1 [[buffer(1)]], device const REAL *d_modeToBoundary2 [[buffer(2)]],
-                        device const REAL *d_modeVels [[buffer(3)]], device const REAL *d_accelNoise [[buffer(4)]],
-                        constant ModeMatmulParams &P [[buffer(5)]],
-                        uint2 tid [[thread_position_in_grid]]) {
-    int i = tid.x, k = tid.y;
-    if (i >= P.N_points || k >= P.N_samples) return;
-
-    REAL vb = 0.f;
-    REAL alpha = ((REAL)k) / (P.N_samples - 1.f);
-    for (int j = 0; j < P.N_modes; j++) {
-        vb += (1.f - alpha) * d_modeToBoundary1[P.N_points * j + i] * d_modeVels[P.N_modes * k + j];
-        vb += alpha * d_modeToBoundary2[P.N_points * j + i] * d_modeVels[P.N_modes * k + j];
-    }
-    d_vb[(P.global_bid + i) * P.N_samples + k] = vb + d_accelNoise[P.N_points * k + i];
-}
-
-/** \brief Constructs (N_points x N_bubs) "bubble-to-boundary" transfer matrix (Eq. 11 from [Xue et al. 2024]) */
-kernel void bub_to_boundary(device REAL *d_bubToBoundary [[buffer(0)]],
-                            device const REAL *d_B [[buffer(1)]], device const REAL *d_BN [[buffer(2)]],
-                            device const REAL *d_bubData [[buffer(3)]],
-                            constant BubToBoundaryParams &P [[buffer(4)]],
-                            uint2 tid [[thread_position_in_grid]]) {
-    int i = tid.x, j = tid.y;
-    if (i >= P.N_points || j >= P.N_bubs) return;
-
-    REAL x = d_B[3 * i], y = d_B[3 * i + 1], z = d_B[3 * i + 2];
-    REAL xn = d_BN[3 * i], yn = d_BN[3 * i + 1], zn = d_BN[3 * i + 2];
-
-    REAL r = d_bubData[4 * j];
-    REAL xbub = d_bubData[4 * j + 1], ybub = d_bubData[4 * j + 2], zbub = d_bubData[4 * j + 3];
-
-    REAL dist = sqrt((x - xbub) * (x - xbub) + (y - ybub) * (y - ybub) + (z - zbub) * (z - zbub));
-    REAL A_bub = ((x - xbub) * abs(xn) + (y - ybub) * abs(yn) + (z - zbub) * abs(zn)) / (dist * 4.f * PI_F);
-
-    // Special handling for d < r case (avoid d = 0 blowing up, etc.)
-    if (A_bub < 0.f) A_bub = 0.f;
-    else if (dist < r) A_bub *= -3.f * dist * dist / (r * r * r * r) + 4.f * dist / (r * r * r);
-    else A_bub *= 1.f / (dist * dist);
-
-    d_bubToBoundary[P.N_points * j + i] = A_bub;
-}
-
-/** \brief Per-bubble boundary flux: alpha * column sums of the transfer matrix
- *         (replaces cublasSgemv(OP_T, ..., ones, ...) in the CUDA reference) */
-kernel void bub_flux(device const REAL *d_bubToBoundary [[buffer(0)]], device REAL *d_flux [[buffer(1)]],
-                     constant BubFluxParams &P [[buffer(2)]],
-                     uint tid [[thread_position_in_grid]]) {
-    int j = tid;
-    if (j >= P.N_bubs) return;
-
-    REAL sum = 0.f;
-    for (int i = 0; i < P.N_points; i++) sum += d_bubToBoundary[P.N_points * j + i];
-    d_flux[j] = P.alpha * sum;
-}
-
-/** \brief Multiplies "bubble-to-boundary" transfer matrix with bubble volume velocities to compute vb */
-kernel void bub_matmul(device REAL *d_vb [[buffer(0)]],
-                       device const REAL *d_bubToBoundary [[buffer(1)]], device const REAL *d_bubVels [[buffer(2)]],
-                       device const REAL *d_flux [[buffer(3)]],
-                       constant BubMatmulParams &P [[buffer(4)]],
+// Projects modal velocities to boundary faces, interpolating the transfer matrix over the batch.
+kernel void ModeMatmul(device real *vb [[buffer(0)]],
+                       device const real *mode_to_boundary1 [[buffer(1)]], device const real *mode_to_boundary2 [[buffer(2)]],
+                       device const real *mode_vels [[buffer(3)]], device const real *accel_noise [[buffer(4)]],
+                       constant ModeMatmulParams &params [[buffer(5)]],
                        uint2 tid [[thread_position_in_grid]]) {
     int i = tid.x, k = tid.y;
-    if (i >= P.N_points || k >= P.stop - P.start) return;
+    if (i >= params.NPoints || k >= params.NSamples) return;
 
-    REAL vb = 0.f;
-    for (int j = 0; j < P.N_bubs; j++) {
-        REAL flux = (d_flux[j] > 1e-6f) ? d_flux[j] : 1.f;
-        vb += d_bubToBoundary[P.N_points * j + i] * d_bubVels[P.N_bubs * k + j] / flux;
+    real v = 0.f;
+    real alpha = ((real)k) / (params.NSamples - 1.f);
+    for (int j = 0; j < params.NModes; j++) {
+        v += (1.f - alpha) * mode_to_boundary1[params.NPoints * j + i] * mode_vels[params.NModes * k + j];
+        v += alpha * mode_to_boundary2[params.NPoints * j + i] * mode_vels[params.NModes * k + j];
     }
-    d_vb[(P.global_bid + i) * P.N_samples + (P.start + k)] = vb;
+    vb[(params.GlobalBid + i) * params.NSamples + k] = v + accel_noise[params.NPoints * k + i];
 }
 
-/** \brief Constructs (N_points x N_impulses) "impulse-to-boundary" (particle-to-grid) transfer matrix */
-kernel void impulse_to_boundary(device REAL *d_impulseToBoundary [[buffer(0)]],
-                                device const REAL *d_B [[buffer(1)]], device const REAL *d_BN [[buffer(2)]],
-                                device const REAL *d_impulseData [[buffer(3)]],
-                                constant ImpulseToBoundaryParams &P [[buffer(4)]],
-                                uint2 tid [[thread_position_in_grid]]) {
+// Constructs the (NPoints x NBubs) "bubble-to-boundary" transfer matrix (Eq. 11 from [Xue et al. 2024]).
+kernel void BubToBoundary(device real *bub_to_boundary [[buffer(0)]],
+                          device const real *b [[buffer(1)]], device const real *bn [[buffer(2)]],
+                          device const real *bub_data [[buffer(3)]],
+                          constant BubToBoundaryParams &params [[buffer(4)]],
+                          uint2 tid [[thread_position_in_grid]]) {
     int i = tid.x, j = tid.y;
-    if (i >= P.N_points || j >= P.N_impulses) return;
+    if (i >= params.NPoints || j >= params.NBubs) return;
 
-    REAL x = d_B[3 * i], y = d_B[3 * i + 1], z = d_B[3 * i + 2];
-    REAL xn = d_BN[3 * i], yn = d_BN[3 * i + 1], zn = d_BN[3 * i + 2];
+    real x = b[3 * i], y = b[3 * i + 1], z = b[3 * i + 2];
+    real xn = bn[3 * i], yn = bn[3 * i + 1], zn = bn[3 * i + 2];
 
-    REAL xpt = d_impulseData[6 * j], ypt = d_impulseData[6 * j + 1], zpt = d_impulseData[6 * j + 2];
-    REAL xpt_dir = d_impulseData[6 * j + 3], ypt_dir = d_impulseData[6 * j + 4], zpt_dir = d_impulseData[6 * j + 5];
+    real r = bub_data[4 * j];
+    real xbub = bub_data[4 * j + 1], ybub = bub_data[4 * j + 2], zbub = bub_data[4 * j + 3];
 
-    REAL distx = abs(x - xpt), disty = abs(y - ypt), distz = abs(z - zpt);
+    real dist = sqrt((x - xbub) * (x - xbub) + (y - ybub) * (y - ybub) + (z - zbub) * (z - zbub));
+    real a_bub = ((x - xbub) * abs(xn) + (y - ybub) * abs(yn) + (z - zbub) * abs(zn)) / (dist * 4.f * Pi);
 
-    REAL weight = 0.f;
-    if (distx < P.dx && disty < P.dx && distz < P.dx) weight = (1.f - distx / P.dx) * (1.f - disty / P.dx) * (1.f - distz / P.dx);
+    // Special handling for the d < r case (avoid d = 0 blowing up, etc.)
+    if (a_bub < 0.f) a_bub = 0.f;
+    else if (dist < r) a_bub *= -3.f * dist * dist / (r * r * r * r) + 4.f * dist / (r * r * r);
+    else a_bub *= 1.f / (dist * dist);
+
+    bub_to_boundary[params.NPoints * j + i] = a_bub;
+}
+
+// Per-bubble boundary flux: alpha times the column sums of the transfer matrix (replaces
+// cublasSgemv(OP_T, ..., ones, ...) in the CUDA reference).
+kernel void BubFlux(device const real *bub_to_boundary [[buffer(0)]], device real *flux [[buffer(1)]],
+                    constant BubFluxParams &params [[buffer(2)]],
+                    uint tid [[thread_position_in_grid]]) {
+    int j = tid;
+    if (j >= params.NBubs) return;
+
+    real sum = 0.f;
+    for (int i = 0; i < params.NPoints; i++) sum += bub_to_boundary[params.NPoints * j + i];
+    flux[j] = params.Alpha * sum;
+}
+
+// Multiplies the "bubble-to-boundary" transfer matrix with bubble volume velocities to compute vb.
+kernel void BubMatmul(device real *vb [[buffer(0)]],
+                      device const real *bub_to_boundary [[buffer(1)]], device const real *bub_vels [[buffer(2)]],
+                      device const real *flux [[buffer(3)]],
+                      constant BubMatmulParams &params [[buffer(4)]],
+                      uint2 tid [[thread_position_in_grid]]) {
+    int i = tid.x, k = tid.y;
+    if (i >= params.NPoints || k >= params.Stop - params.Start) return;
+
+    real v = 0.f;
+    for (int j = 0; j < params.NBubs; j++) {
+        real f = (flux[j] > 1e-6f) ? flux[j] : 1.f;
+        v += bub_to_boundary[params.NPoints * j + i] * bub_vels[params.NBubs * k + j] / f;
+    }
+    vb[(params.GlobalBid + i) * params.NSamples + (params.Start + k)] = v;
+}
+
+// Constructs the (NPoints x NImpulses) "impulse-to-boundary" (particle-to-grid) transfer matrix.
+kernel void ImpulseToBoundary(device real *impulse_to_boundary [[buffer(0)]],
+                              device const real *b [[buffer(1)]], device const real *bn [[buffer(2)]],
+                              device const real *impulse_data [[buffer(3)]],
+                              constant ImpulseToBoundaryParams &params [[buffer(4)]],
+                              uint2 tid [[thread_position_in_grid]]) {
+    int i = tid.x, j = tid.y;
+    if (i >= params.NPoints || j >= params.NImpulses) return;
+
+    real x = b[3 * i], y = b[3 * i + 1], z = b[3 * i + 2];
+    real xn = bn[3 * i], yn = bn[3 * i + 1], zn = bn[3 * i + 2];
+
+    real xpt = impulse_data[6 * j], ypt = impulse_data[6 * j + 1], zpt = impulse_data[6 * j + 2];
+    real xpt_dir = impulse_data[6 * j + 3], ypt_dir = impulse_data[6 * j + 4], zpt_dir = impulse_data[6 * j + 5];
+
+    real distx = abs(x - xpt), disty = abs(y - ypt), distz = abs(z - zpt);
+
+    real weight = 0.f;
+    if (distx < params.Dx && disty < params.Dx && distz < params.Dx) weight = (1.f - distx / params.Dx) * (1.f - disty / params.Dx) * (1.f - distz / params.Dx);
 
     if (xn != 0.f) weight *= xpt_dir;
     else if (yn != 0.f) weight *= ypt_dir;
     else if (zn != 0.f) weight *= zpt_dir;
 
-    d_impulseToBoundary[P.N_points * j + i] = weight;
+    impulse_to_boundary[params.NPoints * j + i] = weight;
 }
 
-/** \brief Multiplies "impulse-to-boundary" transfer matrix with impulse magnitudes to compute forces */
-kernel void impulse_matmul(device REAL *d_force [[buffer(0)]],
-                           device const REAL *d_impulseToBoundary [[buffer(1)]], device const REAL *d_impulseVels [[buffer(2)]],
-                           constant ImpulseMatmulParams &P [[buffer(3)]],
-                           uint2 tid [[thread_position_in_grid]]) {
+// Multiplies the "impulse-to-boundary" transfer matrix with impulse magnitudes to compute forces.
+kernel void ImpulseMatmul(device real *force [[buffer(0)]],
+                          device const real *impulse_to_boundary [[buffer(1)]], device const real *impulse_vels [[buffer(2)]],
+                          constant ImpulseMatmulParams &params [[buffer(3)]],
+                          uint2 tid [[thread_position_in_grid]]) {
     int i = tid.x, k = tid.y;
-    if (i >= P.N_points || k >= P.N_samples) return;
+    if (i >= params.NPoints || k >= params.NSamples) return;
 
-    REAL vb = 0.f;
-    for (int j = 0; j < P.N_impulses; j++) {
-        vb += d_impulseToBoundary[P.N_points * j + i] * d_impulseVels[P.N_impulses * k + j];
+    real v = 0.f;
+    for (int j = 0; j < params.NImpulses; j++) {
+        v += impulse_to_boundary[params.NPoints * j + i] * impulse_vels[params.NImpulses * k + j];
     }
-    d_force[(P.global_bid + i) * P.N_samples + k] = vb;
+    force[(params.GlobalBid + i) * params.NSamples + k] = v;
 }

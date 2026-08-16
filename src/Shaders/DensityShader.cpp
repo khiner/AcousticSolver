@@ -7,15 +7,15 @@
 // in a newline emits one trailing all-zeros row, and a file with no trailing newline
 // ends after its last data row.
 
+#include "Shaders.h"
+
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
 
-#include "Shaders.h"
-
 void Density::ReadDensity() {
     auto &base = Obj;
-    std::vector<Eigen::Vector3<REAL>> pos;
+    std::vector<Eigen::Vector3<real>> pos;
     std::vector<int> betas;
 
     const int frame = (base.Step * base.Dt + base.Ts) * Fps + 1;
@@ -60,10 +60,10 @@ void Density::ReadDensity() {
 
         // istringstream{line} >> density >> px >> py >> pz, with 0 on failed extraction
         const char *p = line.c_str();
-        REAL values[4]{};
+        real values[4]{};
         for (auto &value : values) {
             char *next = nullptr;
-            const REAL v = std::strtof(p, &next);
+            const real v = std::strtof(p, &next);
             if (next == p) break; // extraction failed: this and all later values stay 0
             value = v;
             p = next;
@@ -72,7 +72,7 @@ void Density::ReadDensity() {
         betas.push_back(int(100 * values[0]));
     }
 
-    base.V2 = Eigen::MatrixX<REAL>::Zero(pos.size(), 3);
+    base.V2 = Eigen::MatrixX<real>::Zero(pos.size(), 3);
     base.F = Eigen::MatrixXi::Zero(betas.size(), 3);
     for (int r = 0; r < int(pos.size()); ++r) {
         base.V2.row(r) = pos[r];

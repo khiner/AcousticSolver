@@ -37,7 +37,7 @@ struct Dim3 {
     uint32_t x{1}, y{1}, z{1};
 };
 
-class GpuBuffer;
+struct GpuBuffer;
 
 // A buffer binding with a byte offset, for dispatches that read a slice of a larger
 // buffer (e.g. per-minibatch slots). Implicitly constructible from a GpuBuffer pointer.
@@ -49,8 +49,7 @@ struct GpuSlice {
     size_t OffsetBytes{0};
 };
 
-class MetalContext {
-public:
+struct MetalContext {
     static MetalContext &Get();
 
     // Encodes one compute dispatch. Threadgroup counts/sizes mirror CUDA <<<blocks, threads>>> exactly.
@@ -58,18 +57,15 @@ public:
     // Skipped when any threadgroup count is 0, matching CUDA's no-op zero-block launches.
     void Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params = nullptr, size_t params_size = 0);
 
-    // Commits pending dispatches without waiting. No-op when nothing is pending.
-    void Flush();
-
-    // Flushes pending dispatches and blocks until the GPU is idle. No-op when idle.
-    void Sync();
+    void Flush(); // No-op when nothing is pending
+    void Sync(); // No-op when idle
 
     // GPU execution time of the longest command buffer drained since the last call
     // (a running max, so intermediate syncs during batch prep don't hide it).
     double TakeBatchGpuSeconds() { return std::exchange(LastBatchSeconds, 0.); }
 
     // The pipeline state for a kernel, compiled on first use. `fold_apply` selects the
-    // FOLD_APPLY function-constant specialization (see Kernels.metal).
+    // FoldApply function-constant specialization (see Kernels.metal).
     MTL::ComputePipelineState *Pipeline(const char *name, bool fold_apply = false);
 
     // The active serial compute encoder, creating a command buffer/encoder if needed.
@@ -92,8 +88,7 @@ private:
 
 // Owning wrapper over a shared-storage MTL::Buffer. Grow-only, like the
 // cudaFree + cudaMalloc reallocation pattern in the reference code.
-class GpuBuffer {
-public:
+struct GpuBuffer {
     GpuBuffer() = default;
     ~GpuBuffer() { Free(); }
     GpuBuffer(const GpuBuffer &) = delete;

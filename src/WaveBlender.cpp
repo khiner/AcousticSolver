@@ -9,9 +9,11 @@
 #include "KernelParams.h"
 #include "Parallel.h"
 #include "Profile.h"
-#include "tribox.h"
 
 #include <Metal/Metal.hpp>
+
+using REAL = real; // tribox.h is written against a `REAL` scalar its includer supplies
+#include "tribox.h"
 
 #include <atomic>
 #include <cmath>
@@ -21,24 +23,24 @@
 #include <limits>
 
 namespace {
-// Whether a cell state is solid at batch end (RISING converges to solid, FALLING to air)
-bool EndsSolid(uint8_t state) { return state == CELL_SOLID || state == CELL_RISING; }
+// Whether a cell state is solid at batch end (Rising converges to solid, Falling to air)
+bool EndsSolid(uint8_t state) { return state == CellSolid || state == CellRising; }
 } // namespace
 
 WaveBlender::WaveBlender(const SimParams &params)
     : Params(params), GridSize(Params.Nx * Params.Ny * Params.Nz),
       NFdtdSamples(Params.FdtdSrate / Params.BlendRate), NShaderSamples(Params.ShaderSrate / Params.BlendRate + 1),
-      RhoCCDt(Params.Rho * Params.C * Params.C * Params.Dt), InvDx(1. / Params.Dx), InvRhoDt(1. / Params.Rho * Params.Dt),
+      RhoCcDt(Params.Rho * Params.C * Params.C * Params.Dt), InvDx(1. / Params.Dx), InvRhoDt(1. / Params.Rho * Params.Dt),
       Damping(Params.Damping) {
     for (auto *field : {&P, &Vx, &Vy, &Vz}) { // both ping-pong slots
-        field->Cur().ResizeZeroed(GridSize * sizeof(REAL));
-        field->Other().ResizeZeroed(GridSize * sizeof(REAL));
+        field->Cur().ResizeZeroed(GridSize * sizeof(real));
+        field->Other().ResizeZeroed(GridSize * sizeof(real));
     }
 
     Cell1.resize(GridSize);
     Cell2.resize(GridSize);
 
-    // Both slots all-AIR: Cur() doubles as the previous batch-end solidity source
+    // Both slots all-Air: Cur() doubles as the previous batch-end solidity source
     CellState.Cur().ResizeZeroed(GridSize * sizeof(uint8_t));
     CellState.Other().ResizeZeroed(GridSize * sizeof(uint8_t));
 
@@ -56,39 +58,39 @@ WaveBlender::WaveBlender(const SimParams &params)
 
 // Same simple quadratic-ramp split-field PML as the reference (see its TODO on C-PML).
 void WaveBlender::InitializePml() {
-    Px.ResizeZeroed(GridSize * sizeof(REAL));
-    Py.ResizeZeroed(GridSize * sizeof(REAL));
-    Pz.ResizeZeroed(GridSize * sizeof(REAL));
+    Px.ResizeZeroed(GridSize * sizeof(real));
+    Py.ResizeZeroed(GridSize * sizeof(real));
+    Pz.ResizeZeroed(GridSize * sizeof(real));
 
     const int max_half_grid_length = (std::max({Params.Nx, Params.Ny, Params.Nz}) + 1) / 2;
 
     // Velocity and pressure PML weights: numerator and denominator
-    std::vector<REAL> pml_nv(max_half_grid_length + 1, 1.), pml_dv(max_half_grid_length + 1, 1. / (1. + Damping));
-    std::vector<REAL> pml_np(max_half_grid_length, 1.), pml_dp(max_half_grid_length, 1.);
+    std::vector<real> pml_nv(max_half_grid_length + 1, 1.), pml_dv(max_half_grid_length + 1, 1. / (1. + Damping));
+    std::vector<real> pml_np(max_half_grid_length, 1.), pml_dp(max_half_grid_length, 1.);
 
-    for (int dist = 0; dist < PML_WIDTH; ++dist) {
-        REAL weight = (REAL(PML_WIDTH) - dist) / PML_WIDTH; // velocity
+    for (int dist = 0; dist < PmlWidth; ++dist) {
+        real weight = (real(PmlWidth) - dist) / real(PmlWidth); // velocity
         weight = 0.5 * weight * weight;
         pml_nv[dist] = 1. - weight;
         pml_dv[dist] = 1. / (1. + weight);
 
-        weight = (REAL(PML_WIDTH) - dist - 0.5) / PML_WIDTH; // pressure
+        weight = (real(PmlWidth) - dist - 0.5) / real(PmlWidth); // pressure
         weight = 0.5 * weight * weight;
         pml_np[dist] = 1. - weight;
         pml_dp[dist] = 1. / (1. + weight);
     }
-    PmlNv.Resize((max_half_grid_length + 1) * sizeof(REAL));
-    PmlDv.Resize((max_half_grid_length + 1) * sizeof(REAL));
-    PmlNv.Upload(pml_nv.data(), (max_half_grid_length + 1) * sizeof(REAL));
-    PmlDv.Upload(pml_dv.data(), (max_half_grid_length + 1) * sizeof(REAL));
+    PmlNv.Resize((max_half_grid_length + 1) * sizeof(real));
+    PmlDv.Resize((max_half_grid_length + 1) * sizeof(real));
+    PmlNv.Upload(pml_nv.data(), (max_half_grid_length + 1) * sizeof(real));
+    PmlDv.Upload(pml_dv.data(), (max_half_grid_length + 1) * sizeof(real));
 
-    PmlNp.Resize(max_half_grid_length * sizeof(REAL));
-    PmlDp.Resize(max_half_grid_length * sizeof(REAL));
-    PmlNp.Upload(pml_np.data(), max_half_grid_length * sizeof(REAL));
-    PmlDp.Upload(pml_dp.data(), max_half_grid_length * sizeof(REAL));
+    PmlNp.Resize(max_half_grid_length * sizeof(real));
+    PmlDp.Resize(max_half_grid_length * sizeof(real));
+    PmlNp.Upload(pml_np.data(), max_half_grid_length * sizeof(real));
+    PmlDp.Upload(pml_dp.data(), max_half_grid_length * sizeof(real));
 }
 
-void WaveBlender::AddListener(const std::string &format, const std::vector<REAL> &position, const std::string &output_name) {
+void WaveBlender::AddListener(const std::string &format, const std::vector<real> &position, const std::string &output_name) {
     const int i = (position[0] / Params.Dx) + (Params.Nx - 1) / 2.;
     const int j = (position[1] / Params.Dx) + (Params.Ny - 1) / 2.;
     const int k = (position[2] / Params.Dx) + (Params.Nz - 1) / 2.;
@@ -104,23 +106,23 @@ void WaveBlender::InitializeListeners() {
 
     ListenerCids.Resize(std::max<size_t>(1, cids.size()) * sizeof(int));
     ListenerCids.Upload(cids.data(), cids.size() * sizeof(int));
-    ListenerOut.ResizeZeroed(std::max<size_t>(1, size_t(NFdtdSamples) * cids.size()) * sizeof(REAL));
+    ListenerOut.ResizeZeroed(std::max<size_t>(1, size_t(NFdtdSamples) * cids.size()) * sizeof(real));
 }
 
 void WaveBlender::WritePendingListeners() {
     if (!ListenerPending) return;
     ListenerPending = false;
 
-    const auto *samples = ListenerOut.As<REAL>(); // completed at this batch's sync point
+    const auto *samples = ListenerOut.As<real>(); // completed at this batch's sync point
     const int n = Listeners.size();
-    std::vector<REAL> deinterleaved(n > 1 ? NFdtdSamples : 0);
+    std::vector<real> deinterleaved(n > 1 ? NFdtdSamples : 0);
     for (int l = 0; l < n; ++l) {
         auto &listener = Listeners[l];
         if (n == 1) {
-            listener.Out.write(reinterpret_cast<const char *>(samples), NFdtdSamples * sizeof(REAL));
+            listener.Out.write(reinterpret_cast<const char *>(samples), NFdtdSamples * sizeof(real));
         } else {
             for (int s = 0; s < NFdtdSamples; ++s) deinterleaved[s] = samples[size_t(s) * n + l];
-            listener.Out.write(reinterpret_cast<const char *>(deinterleaved.data()), NFdtdSamples * sizeof(REAL));
+            listener.Out.write(reinterpret_cast<const char *>(deinterleaved.data()), NFdtdSamples * sizeof(real));
         }
     }
 }
@@ -129,13 +131,13 @@ void WaveBlender::LogZSlice(const std::string &filetag) {
     const int offset = Cid(0, 0, Params.Nz / 2); // z-slice
     std::ofstream logfile{filetag, std::ofstream::binary};
 
-    const auto *p = P.Cur().As<REAL>(); // synchronizes the stream
-    logfile.write(reinterpret_cast<const char *>(p + offset), Params.Nx * Params.Ny * sizeof(REAL));
+    const auto *p = P.Cur().As<real>(); // synchronizes the stream
+    logfile.write(reinterpret_cast<const char *>(p + offset), Params.Nx * Params.Ny * sizeof(real));
 
     const auto *states = CellState.Cur().As<uint8_t>();
-    std::vector<REAL> beta(Params.Nx * Params.Ny); // converged between batches: exactly 0 or 1
+    std::vector<real> beta(Params.Nx * Params.Ny); // converged between batches: exactly 0 or 1
     for (int c = 0; c < int(beta.size()); ++c) beta[c] = EndsSolid(states[offset + c]) ? 1. : 0.;
-    logfile.write(reinterpret_cast<const char *>(beta.data()), beta.size() * sizeof(REAL));
+    logfile.write(reinterpret_cast<const char *>(beta.data()), beta.size() * sizeof(real));
 }
 
 bool WaveBlender::RunBatch() {
@@ -178,12 +180,12 @@ bool WaveBlender::RunBatch() {
         }
         {
             const profile::Scope scope{"cpu/detect_cavities"};
-            DetectCavities(); // Runtime cavity detection
+            DetectCavities();
         }
 
         if (Step == 0) { // batch-start solidity (pre point-source reversion, as in the reference)
             auto *states = static_cast<uint8_t *>(CellState.Cur().RawData()); // no GPU work in flight yet
-            for (int cid = 0; cid < GridSize; ++cid) states[cid] = Cell2[cid] > 0 ? CELL_SOLID : CELL_AIR;
+            for (int cid = 0; cid < GridSize; ++cid) states[cid] = Cell2[cid] > 0 ? CellSolid : CellAir;
         }
         {
             const profile::Scope scope{"cpu/setup_shaders"};
@@ -193,18 +195,18 @@ bool WaveBlender::RunBatch() {
         // (the in-flight batch reads Cur(), which also holds the previous batch-end
         // solidity). Cells whose solidity changed transition over the batch. Solid-now
         // and solid-before cells both lie within the current-or-previous bounds union,
-        // so everything outside is AIR.
+        // so everything outside is Air.
         const auto *prev = static_cast<const uint8_t *>(CellState.Cur().RawData());
         auto *states = static_cast<uint8_t *>(CellState.Other().RawData());
-        std::memset(states, CELL_AIR, GridSize);
+        std::memset(states, CellAir, GridSize);
         HadTransitions = false;
         ForEachCell(SolidBounds(true), Params.Nx, Params.Ny, [&](int cid, int, int, int) {
             const bool solid = Cell2[cid] > 0;
             if (solid != EndsSolid(prev[cid])) {
-                states[cid] = solid ? CELL_RISING : CELL_FALLING;
+                states[cid] = solid ? CellRising : CellFalling;
                 HadTransitions = true;
             } else {
-                states[cid] = solid ? CELL_SOLID : CELL_AIR;
+                states[cid] = solid ? CellSolid : CellAir;
             }
         });
         CellState.Flip();
@@ -212,9 +214,9 @@ bool WaveBlender::RunBatch() {
         // Geometry unchanged: last batch's transitioning cells have converged
         const auto *prev = static_cast<const uint8_t *>(CellState.Cur().RawData());
         auto *states = static_cast<uint8_t *>(CellState.Other().RawData());
-        std::memset(states, CELL_AIR, GridSize);
+        std::memset(states, CellAir, GridSize);
         ForEachCell(SolidBounds(false), Params.Nx, Params.Ny, [&](int cid, int, int, int) {
-            if (EndsSolid(prev[cid])) states[cid] = CELL_SOLID;
+            if (EndsSolid(prev[cid])) states[cid] = CellSolid;
         });
         CellState.Flip();
         HadTransitions = false;
@@ -236,7 +238,7 @@ bool WaveBlender::RunBatch() {
     // 4. Additional "per-batch overhead"
     {
         const profile::Scope scope{"encode/fresh_cell_pressure"};
-        FreshCellPressure(); // Fresh cell extrapolation
+        FreshCellPressure();
     }
 
     // The one sync point per batch: the fresh-cell velocity solve reads the previous
@@ -260,12 +262,12 @@ bool WaveBlender::RunBatch() {
 
 // Cell bounds of a vertex set's rasterization, using the raster paths' cell-index
 // conversion, padded by `pad` cells and clamped to the grid.
-CellBox WaveBlender::VertexBounds(const Eigen::MatrixX<REAL> &v, const Eigen::Vector3<REAL> &offset, int pad) const {
+CellBox WaveBlender::VertexBounds(const Eigen::MatrixX<real> &v, const Eigen::Vector3<real> &offset, int pad) const {
     CellBox box;
     if (v.rows() == 0) return box;
-    Eigen::Vector3<REAL> min = v.colwise().minCoeff();
+    Eigen::Vector3<real> min = v.colwise().minCoeff();
     min += offset;
-    Eigen::Vector3<REAL> max = v.colwise().maxCoeff();
+    Eigen::Vector3<real> max = v.colwise().maxCoeff();
     max += offset;
     const int n[3]{Params.Nx, Params.Ny, Params.Nz};
     for (int d = 0; d < 3; ++d) {
@@ -301,10 +303,9 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
         ObjectBounds[oid] = VertexBounds(v, offset, base.Type == ShaderClass::Point ? 1 : 0);
 
         // Point source rasterization special handling
-        // (for now, assumes point sources are specified at the end of config file)
         if (base.Type == ShaderClass::Point) {
             for (int r = 0; r < v.rows(); ++r) {
-                Eigen::Vector3<REAL> pt = v.row(r);
+                Eigen::Vector3<real> pt = v.row(r);
                 pt += offset;
 
                 const int i = int(pt[0] / Params.Dx + Params.Nx / 2.);
@@ -329,7 +330,7 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
         // Density rasterization special handling
         if (base.Type == ShaderClass::Density) {
             for (int r = 0; r < v.rows(); ++r) {
-                Eigen::Vector3<REAL> pt = v.row(r);
+                Eigen::Vector3<real> pt = v.row(r);
                 pt += offset;
 
                 const int i = int(pt[0] / Params.Dx + Params.Nx / 2.);
@@ -347,14 +348,14 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
         // General triangle mesh rasterization
         ParallelFor(f.rows(), 32, [&](size_t r) {
             const Eigen::Vector3i face = f.row(r);
-            Eigen::Matrix3<REAL> tri_v;
+            Eigen::Matrix3<real> tri_v;
             tri_v.row(0) = v.row(face[0]);
             tri_v.row(1) = v.row(face[1]);
             tri_v.row(2) = v.row(face[2]);
 
-            Eigen::Vector3<REAL> min = tri_v.colwise().minCoeff();
+            Eigen::Vector3<real> min = tri_v.colwise().minCoeff();
             min += offset;
-            Eigen::Vector3<REAL> max = tri_v.colwise().maxCoeff();
+            Eigen::Vector3<real> max = tri_v.colwise().maxCoeff();
             max += offset;
 
             const int min_i = std::max(int(min[0] / Params.Dx + Params.Nx / 2.), 0);
@@ -366,8 +367,8 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
             const int min_k = std::max(int(min[2] / Params.Dx + Params.Nz / 2.), 0);
             const int max_k = std::min(int(max[2] / Params.Dx + Params.Nz / 2.), Params.Nz - 1);
 
-            REAL boxhalfsize[3]{Params.Dx / 2.f, Params.Dx / 2.f, Params.Dx / 2.f};
-            REAL triverts[3][3]{
+            real boxhalfsize[3]{Params.Dx / 2.f, Params.Dx / 2.f, Params.Dx / 2.f};
+            real triverts[3][3]{
                 {tri_v(0, 0), tri_v(0, 1), tri_v(0, 2)},
                 {tri_v(1, 0), tri_v(1, 1), tri_v(1, 2)},
                 {tri_v(2, 0), tri_v(2, 1), tri_v(2, 2)},
@@ -375,8 +376,8 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
             for (int i = min_i; i <= max_i; ++i) {
                 for (int j = min_j; j <= max_j; ++j) {
                     for (int k = min_k; k <= max_k; ++k) {
-                        const Eigen::Vector3<REAL> p = Pos(i, j, k) - offset;
-                        REAL boxcenter[3]{p[0], p[1], p[2]};
+                        const Eigen::Vector3<real> p = Pos(i, j, k) - offset;
+                        real boxcenter[3]{p[0], p[1], p[2]};
                         if (!triBoxOverlap(boxcenter, boxhalfsize, triverts)) continue;
 
                         const std::atomic_ref<uint8_t> cell{Cell2[Cid(i, j, k)]};
@@ -384,8 +385,8 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
                     }
                 }
             }
-        }); // loop over triangles
-    } // loop over objects
+        });
+    }
 }
 
 // Section 6.2.3 from [Xue et al. 2024]
@@ -401,9 +402,9 @@ void WaveBlender::DetectCavities() {
         const auto &v = base.V2;
         const auto &offset = Offsets[oid];
 
-        Eigen::Vector3<REAL> min = v.colwise().minCoeff();
+        Eigen::Vector3<real> min = v.colwise().minCoeff();
         min += offset;
-        Eigen::Vector3<REAL> max = v.colwise().maxCoeff();
+        Eigen::Vector3<real> max = v.colwise().maxCoeff();
         max += offset;
 
         min_i = std::min(min_i, int(min[0] / Params.Dx + Params.Nx / 2.));
@@ -488,8 +489,8 @@ void WaveBlender::SetupShaders() {
         if (!base.HasShader || base.Type == ShaderClass::Point) continue;
 
         const uint8_t fill = oid + 1;
-        std::vector<Eigen::Vector3<REAL>> b_vec;
-        std::vector<Eigen::Vector3<REAL>> bn_vec;
+        std::vector<Eigen::Vector3<real>> b_vec;
+        std::vector<Eigen::Vector3<real>> bn_vec;
         int bid = 0;
         CellBox scan = ObjectBounds[oid]; // the object's cells at either batch endpoint
         scan.Expand(PrevObjectBounds[oid]);
@@ -498,7 +499,7 @@ void WaveBlender::SetupShaders() {
 
             if (i == 0 || i >= Params.Nx - 1 || j == 0 || j >= Params.Ny - 1 || k == 0 || k >= Params.Nz - 1) return;
 
-            const Eigen::Vector3<REAL> p = Pos(i, j, k) - Offsets[oid]; // world-space to object-space
+            const Eigen::Vector3<real> p = Pos(i, j, k) - Offsets[oid]; // world-space to object-space
 
             const int neighbor_cids[6]{
                 Cid(i - 1, j, k), Cid(i + 1, j, k), // left, right
@@ -509,7 +510,7 @@ void WaveBlender::SetupShaders() {
                 if ((Cell1[cid] == fill && Cell1[neighbor_cids[n]] == 0) ||
                     (Cell2[cid] == fill && Cell2[neighbor_cids[n]] == 0)) {
                     const int d = (n % 2 == 0);
-                    const REAL sign = (n % 2 == 0) ? -1. : 1.;
+                    const real sign = (n % 2 == 0) ? -1. : 1.;
                     const int dir = n / 2;
                     const int face_cid = (dir == 0) ? Cid(i - d, j, k) : (dir == 1) ? Cid(i, j - d, k) :
                                                                                       Cid(i, j, k - d);
@@ -518,21 +519,21 @@ void WaveBlender::SetupShaders() {
                     FaceStamp[dir][face_cid] = FaceEpoch;
 
                     ShaderMapHost.push_back(3 * face_cid + dir);
-                    bn_vec.emplace_back(sign * Eigen::Vector3<REAL>{dir == 0 ? 1.f : 0.f, dir == 1 ? 1.f : 0.f, dir == 2 ? 1.f : 0.f});
-                    b_vec.emplace_back(p.cast<REAL>() + (0.5 * Params.Dx) * bn_vec[bid]);
+                    bn_vec.emplace_back(sign * Eigen::Vector3<real>{dir == 0 ? 1.f : 0.f, dir == 1 ? 1.f : 0.f, dir == 2 ? 1.f : 0.f});
+                    b_vec.emplace_back(p.cast<real>() + (0.5 * Params.Dx) * bn_vec[bid]);
                     bid += 1;
                 }
             }
-        }); // loop over cells
+        });
 
-        Eigen::MatrixX<REAL> b(b_vec.size(), 3);
-        Eigen::MatrixX<REAL> bn(bn_vec.size(), 3);
+        Eigen::MatrixX<real> b(b_vec.size(), 3);
+        Eigen::MatrixX<real> bn(bn_vec.size(), 3);
         for (int row = 0; row < int(b_vec.size()); ++row) {
             b.row(row) = b_vec[row];
             bn.row(row) = bn_vec[row];
         }
         base.SetSamplePoints(b, bn);
-    } // loop over objects
+    }
 
     NRegularShaderPoints = ShaderMapHost.size();
 
@@ -544,8 +545,8 @@ void WaveBlender::SetupShaders() {
         if (base.Type != ShaderClass::Point) continue;
 
         const uint8_t fill = oid + 1;
-        std::vector<Eigen::Vector3<REAL>> b_vec;
-        std::vector<Eigen::Vector3<REAL>> bn_vec;
+        std::vector<Eigen::Vector3<real>> b_vec;
+        std::vector<Eigen::Vector3<real>> bn_vec;
         int bid = 0;
         ForEachCell(ObjectBounds[oid], Params.Nx, Params.Ny, [&](int cid, int i, int j, int k) {
             if (Cell2[cid] != fill) return;
@@ -553,11 +554,11 @@ void WaveBlender::SetupShaders() {
 
             if (i == 0 || i >= Params.Nx - 1 || j == 0 || j >= Params.Ny - 1 || k == 0 || k >= Params.Nz - 1) return;
 
-            const Eigen::Vector3<REAL> p = Pos(i, j, k) - Offsets[oid]; // world-space to object-space
+            const Eigen::Vector3<real> p = Pos(i, j, k) - Offsets[oid]; // world-space to object-space
 
             for (int n = 0; n < 6; ++n) {
                 const int d = (n % 2 == 0);
-                const REAL sign = (n % 2 == 0) ? -1. : 1.;
+                const real sign = (n % 2 == 0) ? -1. : 1.;
                 const int dir = n / 2;
                 const int face_cid = (dir == 0) ? Cid(i - d, j, k) : (dir == 1) ? Cid(i, j - d, k) :
                                                                                   Cid(i, j, k - d);
@@ -566,20 +567,20 @@ void WaveBlender::SetupShaders() {
                 FaceStamp[dir][face_cid] = FaceEpoch;
 
                 ShaderMapHost.push_back(-3 * face_cid - dir);
-                bn_vec.emplace_back(sign * Eigen::Vector3<REAL>{dir == 0 ? 1.f : 0.f, dir == 1 ? 1.f : 0.f, dir == 2 ? 1.f : 0.f});
-                b_vec.emplace_back(p.cast<REAL>() + (0.5 * Params.Dx) * bn_vec[bid]);
+                bn_vec.emplace_back(sign * Eigen::Vector3<real>{dir == 0 ? 1.f : 0.f, dir == 1 ? 1.f : 0.f, dir == 2 ? 1.f : 0.f});
+                b_vec.emplace_back(p.cast<real>() + (0.5 * Params.Dx) * bn_vec[bid]);
                 bid += 1;
             }
-        }); // loop over cells
+        });
 
-        Eigen::MatrixX<REAL> b(b_vec.size(), 3);
-        Eigen::MatrixX<REAL> bn(bn_vec.size(), 3);
+        Eigen::MatrixX<real> b(b_vec.size(), 3);
+        Eigen::MatrixX<real> bn(bn_vec.size(), 3);
         for (int row = 0; row < int(b_vec.size()); ++row) {
             b.row(row) = b_vec[row];
             bn.row(row) = bn_vec[row];
         }
         base.SetSamplePoints(b, bn);
-    } // loop over objects
+    }
 
     // Upload shader map into this batch's double-buffer slots
     NShaderPoints = ShaderMapHost.size();
@@ -590,8 +591,8 @@ void WaveBlender::SetupShaders() {
     ShaderMap.Cur().Upload(ShaderMapHost.data(), NShaderPoints * sizeof(int));
 
     ShaderData.Flip();
-    ShaderData.Cur().Resize(size_t(MaxNShaderPoints) * NShaderSamples * sizeof(REAL));
-    ShaderData.Cur().Zero(size_t(NShaderPoints) * NShaderSamples * sizeof(REAL));
+    ShaderData.Cur().Resize(size_t(MaxNShaderPoints) * NShaderSamples * sizeof(real));
+    ShaderData.Cur().Zero(size_t(NShaderPoints) * NShaderSamples * sizeof(real));
 
     // Boundary-application path for this batch (see KernelParams.h)
     FoldApply = PathTuner.Choose(NShaderPoints > 0, NRegularShaderPoints != NShaderPoints);
@@ -600,11 +601,11 @@ void WaveBlender::SetupShaders() {
     // Per-cell face masks, shader-data row ids, and per-tile flags for the folded
     // boundary application (layout in KernelParams.h). Row-id planes are read only where
     // the mask bit is set, so only the mask and tile flags need clearing.
-    const size_t bids_base = SHADER_FACES_BIDS_OFFSET(size_t(GridSize));
-    const size_t tiles_base = SHADER_FACES_TILES_OFFSET(size_t(GridSize));
-    const int ntx = (Params.Nx + FDTD_TGX - 1) / FDTD_TGX;
-    const int nty = (Params.Ny + FDTD_TGY - 1) / FDTD_TGY;
-    const int ntz = (Params.Nz + FDTD_TGZ - 1) / FDTD_TGZ;
+    const size_t bids_base = ShaderFacesBidsOffset(size_t(GridSize));
+    const size_t tiles_base = ShaderFacesTilesOffset(size_t(GridSize));
+    const int ntx = (Params.Nx + FdtdTgX - 1) / FdtdTgX;
+    const int nty = (Params.Ny + FdtdTgY - 1) / FdtdTgY;
+    const int ntz = (Params.Nz + FdtdTgZ - 1) / FdtdTgZ;
     ShaderFaces.Flip();
     ShaderFaces.Cur().Resize(tiles_base + size_t(ntx) * nty * ntz);
     auto *mask = static_cast<uint8_t *>(ShaderFaces.Cur().RawData());
@@ -612,7 +613,7 @@ void WaveBlender::SetupShaders() {
     auto *bids = reinterpret_cast<int *>(mask + bids_base);
     auto *tiles = mask + tiles_base;
     std::memset(tiles, 0, size_t(ntx) * nty * ntz);
-    const auto mark_tile = [&](int i, int j, int k) { tiles[FDTD_TILE_INDEX(i / FDTD_TGX, j / FDTD_TGY, k / FDTD_TGZ, ntx, nty)] = 1; };
+    const auto mark_tile = [&](int i, int j, int k) { tiles[FdtdTileIndex(i / FdtdTgX, j / FdtdTgY, k / FdtdTgZ, ntx, nty)] = 1; };
     for (int bid = 0; bid < NShaderPoints; ++bid) {
         const int entry = ShaderMapHost[bid];
         const bool is_force = entry < 0;
@@ -637,23 +638,23 @@ void WaveBlender::FreshCellPressure() {
     auto &ctx = MetalContext::Get();
 
     const Dim3 fdtd_threads{8, 8, 8};
-    const Dim3 fdtd_blocks{uint32_t(Params.Nx + 7 - PML_WIDTH) / 8, uint32_t(Params.Ny + 7 - PML_WIDTH) / 8, uint32_t(Params.Nz + 7 - PML_WIDTH) / 8};
+    const Dim3 fdtd_blocks{uint32_t(Params.Nx + 7 - PmlWidth) / 8, uint32_t(Params.Ny + 7 - PmlWidth) / 8, uint32_t(Params.Nz + 7 - PmlWidth) / 8};
 
     const Dim3 shader_threads{32, 1, 1};
     const Dim3 shader_blocks{uint32_t(NShaderPoints + 31) / 32, 1, 1};
 
-    const REAL incr = REAL(Params.ShaderSrate) / Params.FdtdSrate; // For now, assumes shader rate is same for all objects
+    const real incr = real(Params.ShaderSrate) / Params.FdtdSrate; // For now, assumes shader rate is same for all objects
 
     // We use split-pressure buffers as acceleration buffers for convenience (since split-pressure only used in PML)
     // -- just make sure to clear afterwards
     const PrepareFreshCellParams prep_params{NShaderSamples, NShaderPoints, float(1. / Params.Dt), incr};
-    ctx.Dispatch("prepare_fresh_cell", shader_blocks, shader_threads, {&Px, &Py, &Pz, &ShaderData.Cur(), &ShaderMap.Cur()}, &prep_params, sizeof(prep_params));
+    ctx.Dispatch("PrepareFreshCell", shader_blocks, shader_threads, {&Px, &Py, &Pz, &ShaderData.Cur(), &ShaderMap.Cur()}, &prep_params, sizeof(prep_params));
 
     const FreshCellPressureParams fc_params{Params.Nx, Params.Ny, Params.Nz, Params.Rho * Params.Dx};
-    ctx.Dispatch("fresh_cell_pressure", fdtd_blocks, fdtd_threads, {&P.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &fc_params, sizeof(fc_params));
+    ctx.Dispatch("FreshCellPressure", fdtd_blocks, fdtd_threads, {&P.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &fc_params, sizeof(fc_params));
 
     const ClearSolidParams cs_params{Params.Nx, Params.Ny, Params.Nz};
-    ctx.Dispatch("clear_solid", fdtd_blocks, fdtd_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &cs_params, sizeof(cs_params));
+    ctx.Dispatch("ClearSolid", fdtd_blocks, fdtd_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &cs_params, sizeof(cs_params));
 }
 
 void WaveBlender::FreshCellVelocity() {
@@ -708,12 +709,8 @@ void WaveBlender::FreshCellVelocity() {
         for (const int cid : fresh_cids) components[FreshComponent[cid]].push_back(cid);
     for (const int cid : fresh_cids) FreshComponent[cid] = -1; // reset scratch
 
-    const auto *vx_host = Vx.Cur().As<REAL>();
-    const auto *vy_host = Vy.Cur().As<REAL>();
-    const auto *vz_host = Vz.Cur().As<REAL>();
-    auto *vx_out = Vx.Cur().As<REAL>();
-    auto *vy_out = Vy.Cur().As<REAL>();
-    auto *vz_out = Vz.Cur().As<REAL>();
+    const real *const v_host[3]{Vx.Cur().As<real>(), Vy.Cur().As<real>(), Vz.Cur().As<real>()};
+    real *const v_out[3]{Vx.Cur().As<real>(), Vy.Cur().As<real>(), Vz.Cur().As<real>()};
 
     std::vector<double> residuals(n_components, 0.);
     ParallelFor(n_components, 1, [&](size_t c) {
@@ -748,8 +745,8 @@ void WaveBlender::FreshCellVelocity() {
 
         // Pass 2: build the least-squares system enforcing zero net flux per fresh cell
         const int n_dof = counts[0] + counts[1] + counts[2];
-        Eigen::MatrixX<REAL> a = Eigen::MatrixX<REAL>::Zero(cells.size(), n_dof);
-        Eigen::VectorX<REAL> g = Eigen::VectorX<REAL>::Zero(cells.size());
+        Eigen::MatrixX<real> a = Eigen::MatrixX<real>::Zero(cells.size(), n_dof);
+        Eigen::VectorX<real> g = Eigen::VectorX<real>::Zero(cells.size());
 
         int row = 0;
         for (const int cid : cells) {
@@ -759,7 +756,7 @@ void WaveBlender::FreshCellVelocity() {
 
             for (int n = 0; n < 6; ++n) {
                 const int d = (n % 2 == 0);
-                const REAL sign = (n % 2 == 0) ? -1. : 1.;
+                const real sign = (n % 2 == 0) ? -1. : 1.;
                 const int dir = n / 2;
                 const int face_cid = (dir == 0) ? Cid(i - d, j, k) : (dir == 1) ? Cid(i, j - d, k) :
                                                                                   Cid(i, j, k - d);
@@ -768,20 +765,19 @@ void WaveBlender::FreshCellVelocity() {
                 if (col != -1) col += (dir >= 1 ? counts[0] : 0) + (dir >= 2 ? counts[1] : 0);
 
                 if (col != -1) a(row, col) = sign;
-                else g[row] -= sign * ((dir == 0) ? vx_host[face_cid] : (dir == 1) ? vy_host[face_cid] :
-                                                                                     vz_host[face_cid]);
+                else g[row] -= sign * v_host[dir][face_cid];
             }
             row += 1;
         }
 
         if (n_dof > 0) {
-            const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixX<REAL>> qr{a}; // least squares
-            const Eigen::VectorX<REAL> u = qr.solve(g);
+            const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixX<real>> qr{a}; // least squares
+            const Eigen::VectorX<real> u = qr.solve(g);
 
             // Write fresh cell velocity solve results back to the shared buffers
-            for (const int face_cid : faces[0]) vx_out[face_cid] = u[FaceCol[0][face_cid]];
-            for (const int face_cid : faces[1]) vy_out[face_cid] = u[counts[0] + FaceCol[1][face_cid]];
-            for (const int face_cid : faces[2]) vz_out[face_cid] = u[counts[0] + counts[1] + FaceCol[2][face_cid]];
+            for (const int face_cid : faces[0]) v_out[0][face_cid] = u[FaceCol[0][face_cid]];
+            for (const int face_cid : faces[1]) v_out[1][face_cid] = u[counts[0] + FaceCol[1][face_cid]];
+            for (const int face_cid : faces[2]) v_out[2][face_cid] = u[counts[0] + counts[1] + FaceCol[2][face_cid]];
 
             residuals[c] = (a * u - g).squaredNorm();
         }
@@ -802,7 +798,7 @@ void WaveBlender::ShaderReInit() {
     const Dim3 shader_blocks{uint32_t(NShaderPoints + 31) / 32, 1, 1};
 
     const ShaderReInitParams params{NShaderSamples, NShaderPoints};
-    MetalContext::Get().Dispatch("shader_reinit", shader_blocks, shader_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &ShaderData.Cur(), &ShaderMap.Cur()}, &params, sizeof(params));
+    MetalContext::Get().Dispatch("ShaderReInit", shader_blocks, shader_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &ShaderData.Cur(), &ShaderMap.Cur()}, &params, sizeof(params));
 }
 
 bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces) {
@@ -845,21 +841,21 @@ void WaveBlender::ApplyPathTuner::RecordDrained(double gpu_seconds) {
 // table, then commits without waiting — the GPU crunches while the CPU prepares the next
 // batch. Each step's sequence is [pressure, boundary application, velocity]. With the
 // boundary application folded in and beta derived in-kernel, the loop is one full-grid
-// pass per step (the fused step_velocity_pressure kernel), book-ended by a step_pressure
-// prologue and a step_velocity tail:
+// pass per step (the fused StepVelocityPressure kernel), book-ended by a StepPressure
+// prologue and a StepVelocity tail:
 //   P(0) | [V(0),P(1)] | ... | [V(N-2),P(N-1)] | V(N-1)
 // The dispatch computing V(q) gets step q's params (tb, ss, and the listener slot for p(q)).
 void WaveBlender::RunFdtd() {
     const profile::Scope scope{"encode/fdtd"};
     auto &ctx = MetalContext::Get();
 
-    const MTL::Size fdtd_threads{FDTD_TGX, FDTD_TGY, FDTD_TGZ};
-    const MTL::Size fdtd_blocks{uint32_t(Params.Nx + FDTD_TGX - 1) / FDTD_TGX, uint32_t(Params.Ny + FDTD_TGY - 1) / FDTD_TGY, uint32_t(Params.Nz + FDTD_TGZ - 1) / FDTD_TGZ};
+    const MTL::Size fdtd_threads{FdtdTgX, FdtdTgY, FdtdTgZ};
+    const MTL::Size fdtd_blocks{uint32_t(Params.Nx + FdtdTgX - 1) / FdtdTgX, uint32_t(Params.Ny + FdtdTgY - 1) / FdtdTgY, uint32_t(Params.Nz + FdtdTgZ - 1) / FdtdTgZ};
 
-    auto *pressure_pso = ctx.Pipeline("step_pressure");
-    auto *fused_pso = ctx.Pipeline("step_velocity_pressure", FoldApply);
-    auto *velocity_pso = ctx.Pipeline("step_velocity", FoldApply);
-    auto *shader_pso = FoldApply ? nullptr : ctx.Pipeline("apply_shader");
+    auto *pressure_pso = ctx.Pipeline("StepPressure");
+    auto *fused_pso = ctx.Pipeline("StepVelocityPressure", FoldApply);
+    auto *velocity_pso = ctx.Pipeline("StepVelocity", FoldApply);
+    auto *shader_pso = FoldApply ? nullptr : ctx.Pipeline("ApplyShader");
 
     // Standalone boundary application (plain path): blend range then force range, so a
     // dual-claimed face updates in a defined order.
@@ -875,8 +871,8 @@ void WaveBlender::RunFdtd() {
         if (table[index]) encoder->setBuffer(table[index]->Handle(), 0, index);
     }
 
-    const FdtdBatchParams batch_params{RhoCCDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size())};
-    encoder->setBytes(&batch_params, sizeof(batch_params), FDTD_BATCH_PARAMS_INDEX);
+    const FdtdBatchParams batch_params{RhoCcDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size())};
+    encoder->setBytes(&batch_params, sizeof(batch_params), FdtdBatchParamsIndex);
 
     const auto bind_fields = [&] { // in slots 0, 4-6; out slots 21-24
         encoder->setBuffer(P.Cur().Handle(), 0, 0);
@@ -893,18 +889,18 @@ void WaveBlender::RunFdtd() {
         if (FoldApply || NShaderPoints == 0) return;
         encoder->setComputePipelineState(shader_pso);
         for (const auto &range : shader_ranges) {
-            if (range.start == range.end) continue;
-            encoder->setBytes(&range, sizeof(range), FDTD_APPLY_RANGE_INDEX);
-            encoder->dispatchThreadgroups(MTL::Size{uint32_t(range.end - range.start + 31) / 32, 1, 1}, shader_threads);
+            if (range.Start == range.End) continue;
+            encoder->setBytes(&range, sizeof(range), FdtdApplyRangeIndex);
+            encoder->dispatchThreadgroups(MTL::Size{uint32_t(range.End - range.Start + 31) / 32, 1, 1}, shader_threads);
         }
     };
     // Step params of step q, consumed by the dispatch that computes V(q).
     const auto set_step_params = [&](int q) {
-        const REAL t = (q + 1 == NFdtdSamples) ? 1. : REAL(q + 1) / NFdtdSamples; // normalized blending time (0, 1]
-        const REAL ss = t * (NShaderSamples - 1); // shader sample index (fractional to support interpolation)
-        const REAL tb = (Params.Scheme == BlendScheme::NoBlend && q + 1 != NFdtdSamples) ? 0. : t;
+        const real t = (q + 1 == NFdtdSamples) ? 1. : real(q + 1) / NFdtdSamples; // normalized blending time (0, 1]
+        const real ss = t * (NShaderSamples - 1); // shader sample index (fractional to support interpolation)
+        const real tb = (Params.Scheme == BlendScheme::NoBlend && q + 1 != NFdtdSamples) ? 0. : t;
         const FdtdStepParams step_params{tb, ss, q};
-        encoder->setBytes(&step_params, sizeof(step_params), FDTD_STEP_PARAMS_INDEX);
+        encoder->setBytes(&step_params, sizeof(step_params), FdtdStepParamsIndex);
     };
 
     // Prologue: P(0) (in-place, before step 0's boundary application)

@@ -2,7 +2,7 @@
 
 // Ported from WaveBlender (c) 2024 Kangrui Xue (FDTDCommon.h). Global FDTD simulation parameters.
 
-using REAL = float;
+using real = float;
 
 enum class BlendScheme {
     NoBlend,
@@ -11,7 +11,7 @@ enum class BlendScheme {
 
 struct SimParams {
     int Nx{80}, Ny{80}, Nz{80}; // FDTD grid dimensions
-    REAL Dx{0.005}; // cell size
+    real Dx{0.005}; // cell size
 
     int FdtdSrate{120'000}; // FDTD sample rate
     double Dt{1. / 120'000}; // FDTD timestep size
@@ -21,8 +21,8 @@ struct SimParams {
     int BlendRate{100}; // blending rate (how often to rasterize geometry)
     BlendScheme Scheme{BlendScheme::Smoothstep};
 
-    REAL C{343.2}; // speed of sound
-    REAL Rho{1.204}; // density of acoustic medium
+    real C{343.2}; // speed of sound
+    real Rho{1.204}; // density of acoustic medium
 
-    REAL Damping{0}; // frequency-independent air damping (see reference TODO on boundary conditions)
+    real Damping{0}; // frequency-independent air damping (see reference TODO on boundary conditions)
 };

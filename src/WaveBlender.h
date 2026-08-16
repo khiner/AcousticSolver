@@ -15,11 +15,11 @@
 // NOTE: Ordering of objects matters. Point sources MUST be placed at end; later objects
 // will override previous rasterizations.
 
+#include "Shaders.h"
+
 #include <algorithm>
 #include <climits>
 #include <deque>
-
-#include "Shaders.h"
 
 constexpr int CavityInterior{255};
 
@@ -58,31 +58,30 @@ template<typename F> void ForEachCell(const CellBox &box, int nx, int ny, F &&fn
 
 // Mono-channel, stationary listener for single-point pressure output.
 struct MonoListener {
-    int Cid; // listener cell index
+    int Cid;
     std::ofstream Out;
 };
 
-class WaveBlender {
-public:
+struct WaveBlender {
     WaveBlender(const SimParams &params);
 
     // Runs a complete simulation batch: from rasterization to FDTD timestepping.
     // Returns false (after draining pending GPU work) once the simulation is complete.
     bool RunBatch();
 
-    template<typename T, typename... Args> void AddObject(const Eigen::Vector3<REAL> &offset, Args &&...args) {
+    template<typename T, typename... Args> void AddObject(const Eigen::Vector3<real> &offset, Args &&...args) {
         Offsets.emplace_back(offset);
         Objects.emplace_back(std::in_place_type<T>, std::forward<Args>(args)...);
     }
 
     // Adds a listener. `format` is "Mono" only for now, `position` is the listener's (x, y, z).
-    void AddListener(const std::string &format, const std::vector<REAL> &position, const std::string &output_name = "output");
+    void AddListener(const std::string &format, const std::vector<real> &position, const std::string &output_name = "output");
 
     // Writes pressure and beta z-slice (z = Nz/2) to file for debugging.
     void LogZSlice(const std::string &filetag);
 
 private:
-    SimParams Params; // simulation parameters
+    SimParams Params;
     int Step{0}; // current simulation time step
 
     int GridSize{0}; // total number of cells (Nx * Ny * Nz)
@@ -112,11 +111,11 @@ private:
     ApplyPathTuner PathTuner;
 
     // Precomputed constants
-    REAL RhoCCDt{0}, InvDx{0}, InvRhoDt{0};
-    REAL Damping{0}; // temporary solution in lieu of frequency-dependent boundary conditions
+    real RhoCcDt{0}, InvDx{0}, InvRhoDt{0};
+    real Damping{0}; // temporary solution in lieu of frequency-dependent boundary conditions
 
     std::deque<ObjectVariant> Objects; // deque: objects hold streams/trees and never move
-    std::vector<Eigen::Vector3<REAL>> Offsets;
+    std::vector<Eigen::Vector3<real>> Offsets;
     std::vector<MonoListener> Listeners;
     bool ListenerPending{false}; // a batch's listener samples are on the GPU timeline, not yet written to file
 
@@ -131,7 +130,7 @@ private:
     GpuBuffer PmlNp, PmlDp, PmlNv, PmlDv; // PML weights (separate pressure and velocity)
     GpuBuffer ListenerCids, ListenerOut; // listener cell indices and per-batch sampled pressure
 
-    // Per-cell blending state for the batch (CELL_* in KernelParams.h), the map from
+    // Per-cell blending state for the batch (the Cell* constants in KernelParams.h), the map from
     // boundary faces to shader points, and the shader sample data. All rewritten by the
     // CPU while the previous batch may still be in flight, hence double-buffered.
     // For boundary points (b1, ..., bN) and times (0, ..., T), ShaderData corresponds to:
@@ -144,7 +143,7 @@ private:
     // KernelParams.h)
     GpuDouble ShaderFaces;
 
-    bool HadTransitions{false}; // last uploaded states include RISING/FALLING cells
+    bool HadTransitions{false}; // last uploaded states include Rising/Falling cells
 
     std::vector<uint8_t> Cell1, Cell2; // rasterized cell states at batch endpoints t1 and t2 (values: 0 air, oid + 1, CavityInterior)
 
@@ -156,20 +155,19 @@ private:
 
     // ----- Persistent scratch (sized once, reused per batch) -----
     std::vector<int> ShaderMapHost;
-    std::vector<uint8_t> FloodVisited; // flood-fill visited flags
+    std::vector<uint8_t> FloodVisited;
     std::vector<int> FloodStack;
     std::vector<uint32_t> FaceStamp[3]; // epoch-stamped per-direction used-face sets (shader setup)
     uint32_t FaceEpoch{0};
     std::vector<int> FreshComponent; // per-cell fresh-cell component id (-1 when not fresh)
     std::vector<int> FaceCol[3]; // per-direction face column ids for the fresh-cell solve (-1 when unused)
 
-    // ----- Basic helper functions -----
     int Cid(int i, int j, int k) const { return (Params.Ny * Params.Nx) * k + Params.Nx * j + i; }
     // Cell bounds of a vertex set's rasterization (padded by `pad` cells, grid-clamped)
-    CellBox VertexBounds(const Eigen::MatrixX<REAL> &v, const Eigen::Vector3<REAL> &offset, int pad) const;
+    CellBox VertexBounds(const Eigen::MatrixX<real> &v, const Eigen::Vector3<real> &offset, int pad) const;
     // Union of every cell that can be solid in Cell2 (and, when `with_prev`, in Cell1)
     CellBox SolidBounds(bool with_prev) const;
-    Eigen::Vector3<REAL> Pos(int i, int j, int k) const {
+    Eigen::Vector3<real> Pos(int i, int j, int k) const {
         return {(i - (Params.Nx - 1) / 2.f) * Params.Dx, (j - (Params.Ny - 1) / 2.f) * Params.Dx, (k - (Params.Nz - 1) / 2.f) * Params.Dx};
     }
 
@@ -185,7 +183,7 @@ private:
 
     // ----- FDTD timestepping -----
     void RunFdtd(); // encodes all timesteps of the batch and flushes without waiting
-    void InitializePml(); // allocates memory and precomputes constants for PML
+    void InitializePml();
     void InitializeListeners();
-    void WritePendingListeners(); // writes the completed batch's listener samples to file
+    void WritePendingListeners();
 };

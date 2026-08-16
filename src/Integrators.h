@@ -1,177 +1,134 @@
-/** (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
- *
- * \file Integrators.h
- * \brief Defines Integrator classes for numerically integrating coupled (or uncoupled) Oscillator systems
- */
+#pragma once
 
-#ifndef _FS_INTEGRATORS_H
-#define _FS_INTEGRATORS_H
-
-#include <chrono>
-#include <functional> // LOCAL PATCH (perf): precomputed-factor provider hook
+// (c) 2024 Kangrui Xue. Adapted from FluidSound (MIT) — see NOTICE.md.
+// Numerical integration of the coupled (or uncoupled) oscillator system
+// M v''(t) + C v'(t) + K v(t) = F(t).
 
 #include "Oscillator.h"
 
+#include <chrono>
+#include <functional>
+#include <iostream>
+
 namespace FluidSound {
 
-/**
- * \class Integrator
- * \brief Base RK4 integrator for the oscillator system \f$ M \ddot{v}(t) + C \dot{v}(t) + Kv(t) = F(t) \f$
- *
- * Classes extending Integrator are responsible for specifying how to compute + factorize M,
- *   as well as how to efficiently solve for \f$ \ddot{v}(t) = M^{-1} ( F(t) - C \dot{v}(t) - K v(t) ) \f$
- */
-template<typename T>
-class Integrator {
-public:
-    Integrator(double dt) : _dt(dt) {}
-
-    // LOCAL PATCH (not upstream): Solver::~Solver() deletes derived integrators through this
-    // base pointer, which is undefined behavior without a virtual destructor. Clang at -O2
-    // compiles that delete to a trap. Upstream (github.com/kangruix/FluidSound) is archived.
+// Base RK4 integrator. Deriving types specify how to compute and factorize M, and how to
+// efficiently solve v''(t) = M^-1 (F(t) - C v'(t) - K v(t)).
+template<typename T> struct Integrator {
+    Integrator(double dt) : Dt(dt) {}
     virtual ~Integrator() = default;
 
-    /** \brief Takes an RK4 integration step */
-    void step(double time);
+    // One RK4 step. Stage inputs and the (k1 + 2 k2 + 2 k3 + k4) combination live in
+    // preallocated scratch and accumulate in the reference's left-to-right element order,
+    // so a step allocates nothing and stays bit-identical.
+    void Step(double time);
 
-    // LOCAL PATCH (perf, bit-exact): solve() returns a reference to _Derivs and step()
-    // accumulates the RK4 combination incrementally (same per-element operation order as
-    // the original k1..k4 expression), so stepping allocates nothing.
+    // Copies the oscillator data a batch needs, at its endpoint times. Call at batch start.
+    void UpdateData(const std::vector<Oscillator<T> *> &coupled, const std::vector<Oscillator<T> *> &uncoupled, double time1, double time2);
 
-    /**
-     * \brief Copies all Oscillator data needed for the integration batch; must be called at start of batch.
-     * \param[in]  coupled_osc    Oscillators to treat as coupled
-     * \param[in]  uncoupled_osc  Oscillators to treat as uncoupled
-     * \param[in]  time1          integration batch start time
-     * \param[in]  time2          integration batch end time
-     */
-    void updateData(const std::vector<Oscillator<T> *> &coupled_osc, const std::vector<Oscillator<T> *> &uncoupled_osc, double time1, double time2);
+    // Computes and factorizes M at the batch endpoints T1 and T2.
+    virtual void Refactor() = 0;
 
-    /** \brief Computes and factorizes mass matrix at batch endpoints _t1 and _t2 */
-    virtual void refactor() = 0;
+    // Solves v''(t) = M^-1 (F(t) - C v'(t) - K v(t)) for the packed state vectors [v v'].
+    // `time` must satisfy T1 <= time <= T2. Returns Derivs, so a solve allocates nothing.
+    virtual const Eigen::ArrayX<T> &Solve(const Eigen::ArrayX<T> &states, double time) = 0;
 
-    /**
-     * \brief Solves for \f$ \ddot{v}(t) = M^{-1} ( F(t) - C \dot{v}(t) - K v(t) ) \f$
-     * \param[in]  State  packed state vectors [v v']
-     * \param[in]  time   solve time t (must satisfy _t1 <= t <= _t2)
-     */
-    virtual const Eigen::ArrayX<T> &solve(const Eigen::ArrayX<T> &State, double time) = 0;
+    Eigen::ArrayX<T> States; // Packed state vectors [v ... v' ...] across all active oscillators
+    Eigen::ArrayX<T> Derivs; // Packed derivatives [v' ... v'' ...] across all active oscillators
 
-    const Eigen::ArrayX<T> &States() { return _States; }
-    const Eigen::ArrayX<T> &Derivs() { return _Derivs; }
+    std::chrono::duration<double> CoeffTime{}, MassTime{}, SolveTime{};
+
+    void PrintTimings() const {
+        std::cout << "K,C,F time: " << CoeffTime.count() << std::endl;
+        std::cout << "M^-1 time:  " << MassTime.count() << std::endl;
+        std::cout << "Solve time: " << SolveTime.count() << std::endl;
+    }
 
 protected:
-    double _dt = 0.; //!< timestep size
-    int _N_coupled = 0; //!< number of Oscillators to treat as coupled for the batch
-    int _N_total = 0; //!< total number of Oscillators for the batch
+    void ComputeKcf(double time);
 
-    Eigen::ArrayX<T> _States; //!< packed state vectors [v ... v' ...] (across all active Oscillators)
-    Eigen::ArrayX<T> _Derivs; //!< packed derivatives [v' ... v'' ...] (across all active Oscillators)
+    double Dt{0}; // Timestep size
+    int NCoupled{0}; // Oscillators treated as coupled for the batch
+    int NTotal{0}; // Total oscillators for the batch
 
     // Stiffness, damping, and forcing
-    Eigen::ArrayX<T> _Kvals, _Cvals, _Fvals;
-    void _computeKCF(double time);
+    Eigen::ArrayX<T> KVals, CVals, FVals;
 
-    /** \brief Batch endpoint times */
-    double _t1 = -1., _t2 = -1.;
+    double T1{-1}, T2{-1}; // Batch endpoint times
 
-    /** \brief packed solve data (across all active Oscillators) at endpoint times, \see Oscillators.solveData */
-    Eigen::Array<T, 6, Eigen::Dynamic> _solveData1, _solveData2;
+    // Oscillator::SolveData and ::ForceData, packed across active oscillators at the endpoints.
+    Eigen::Array<T, 6, Eigen::Dynamic> SolveData1, SolveData2;
+    Eigen::Array<T, 3, Eigen::Dynamic> ForceData1, ForceData2;
 
-    /** \brief packed force data (across all active Oscillators) at endpoint times, \see Oscillators.forceData */
-    Eigen::Array<T, 3, Eigen::Dynamic> _forceData1, _forceData2;
-
-    // LOCAL PATCH (perf, bit-exact): preallocated RK4 scratch (stage input and running
-    // combination), see step().
-    Eigen::ArrayX<T> _Y, _Acc;
-
-public:
-    std::chrono::duration<double> coeff_time = std::chrono::duration<double>::zero();
-    std::chrono::duration<double> mass_time = std::chrono::duration<double>::zero();
-    std::chrono::duration<double> solve_time = std::chrono::duration<double>::zero();
+    Eigen::ArrayX<T> Y, Acc; // Preallocated RK4 scratch: stage input and running combination
 };
 
-/**
- * \class Coupled_Direct
- * \brief Integrator for all-pairs, dense coupled oscillator system, with Cholesky factorization of M
- */
-template<typename T>
-class Coupled_Direct : public Integrator<T> {
-public:
-    Coupled_Direct(double dt) : Integrator<T>(dt) {}
+// Integrator for the all-pairs, dense coupled oscillator system, with a Cholesky
+// factorization of M.
+template<typename T> struct CoupledDirect : Integrator<T> {
+    using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
 
-    void refactor() override;
-    const Eigen::ArrayX<T> &solve(const Eigen::ArrayX<T> &States, double time) override;
+    CoupledDirect(double dt) : Integrator<T>(dt) {}
 
-    // LOCAL PATCH (perf): optional provider of precomputed endpoint mass-matrix
-    // INVERSES (see BubbleFactorPipeline.h). refactor() calls it with
-    // (t1, t2, N_coupled); when it succeeds, solve() applies the blended inverse as two
-    // matrix-vector products instead of two pairs of triangular substitutions (same
-    // linear system, different float rounding). When it returns false, refactor()
-    // computes Cholesky factors inline and solve() substitutes, as in the reference.
-    std::function<bool(double, double, int, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &)> InverseProvider;
+    void Refactor() override;
+    const Eigen::ArrayX<T> &Solve(const Eigen::ArrayX<T> &states, double time) override;
 
-    /** LOCAL PATCH (perf): standalone mass-matrix construction over packed solve data,
-     *  shared by the inline path and the background precompute workers. */
-    static void ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic> &solveData1, const Eigen::Array<T, 6, Eigen::Dynamic> &solveData2, double t1, double t2, double time, int N_coupled, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &M);
+    // Optional provider of precomputed endpoint mass-matrix INVERSES (see
+    // BubbleFactorPipeline.h). Refactor calls it with (t1, t2, n_coupled); when it
+    // succeeds, Solve applies the blended inverse as two matrix-vector products instead of
+    // two pairs of triangular substitutions (same linear system, different float rounding).
+    // When it returns false, Refactor computes Cholesky factors inline and Solve
+    // substitutes, as in the reference.
+    std::function<bool(double, double, int, Matrix &, Matrix &)> InverseProvider;
 
-    // LOCAL PATCH: renamed public (from private _epsSq) so the precompute pipeline's
-    // mass construction can share it
-    static constexpr T EpsSq = 4.; //!< regularization term
+    // Mass matrix over packed solve data, shared by the inline path and the background
+    // precompute workers. The row fill is parallel: each element is written exactly once,
+    // with the reference's arithmetic.
+    static void ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic> &solve_data1, const Eigen::Array<T, 6, Eigen::Dynamic> &solve_data2, double t1, double t2, double time, int n_coupled, Matrix &m);
+
+    static constexpr T EpsSq{4.}; // Regularization term
 
 private:
-    /** \private constructs mass matrix M
-     *  LOCAL PATCH (perf): out-parameter + const so the two endpoint constructions can
-     *  run concurrently. */
-    void _constructMass(double time, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &M) const;
+    Eigen::ArrayX<T> Radii;
+    Eigen::ArrayX<T> SqrtRadii; // sqrt(Radii), computed once per solve
 
-    Eigen::ArrayX<T> _radii;
-    Eigen::ArrayX<T> _sqrtRadii; // LOCAL PATCH (perf, bit-exact): sqrt(_radii), computed once per solve
+    Eigen::LLT<Matrix> Factor1, Factor2;
+    Eigen::Vector<T, Eigen::Dynamic> Rhs;
 
-    Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>> _factor1, _factor2;
-    Eigen::Vector<T, Eigen::Dynamic> _RHS;
-
-    // LOCAL PATCH (perf): precomputed endpoint inverses and their GEMV outputs, active
-    // for the current event interval when _useInverse is set (see InverseProvider).
-    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> _inv1, _inv2;
-    Eigen::Vector<T, Eigen::Dynamic> _sol1, _sol2;
-    bool _useInverse = false;
+    // Precomputed endpoint inverses and their GEMV outputs, active for the current event
+    // interval when UseInverse is set (see InverseProvider).
+    Matrix Inv1, Inv2;
+    Eigen::Vector<T, Eigen::Dynamic> Sol1, Sol2;
+    bool UseInverse{false};
 
     // Needed for templated class inheritance to work
-    using Integrator<T>::_N_coupled;
-    using Integrator<T>::_N_total;
-    using Integrator<T>::_Derivs;
-    using Integrator<T>::_Kvals;
-    using Integrator<T>::_Cvals;
-    using Integrator<T>::_Fvals;
+    using Integrator<T>::NCoupled;
+    using Integrator<T>::NTotal;
+    using Integrator<T>::Derivs;
+    using Integrator<T>::KVals;
+    using Integrator<T>::CVals;
+    using Integrator<T>::FVals;
 
-    using Integrator<T>::_t1;
-    using Integrator<T>::_t2;
-    using Integrator<T>::_solveData1;
-    using Integrator<T>::_solveData2;
+    using Integrator<T>::T1;
+    using Integrator<T>::T2;
+    using Integrator<T>::SolveData1;
+    using Integrator<T>::SolveData2;
 };
 
-/**
- * \class Uncoupled
- * \brief Integrator for uncoupled oscillator system (M = Identity)
- */
-template<typename T>
-class Uncoupled : public Integrator<T> {
-public:
+// Integrator for the uncoupled oscillator system (M = Identity).
+template<typename T> struct Uncoupled : Integrator<T> {
     Uncoupled(double dt) : Integrator<T>(dt) {}
 
-    void refactor() override {} // dummy function call
-    const Eigen::ArrayX<T> &solve(const Eigen::ArrayX<T> &State, double time) override;
+    void Refactor() override {}
+    const Eigen::ArrayX<T> &Solve(const Eigen::ArrayX<T> &states, double time) override;
 
 private:
     // Needed for templated class inheritance to work
-    using Integrator<T>::_N_total;
-    using Integrator<T>::_Derivs;
-    using Integrator<T>::_Kvals;
-    using Integrator<T>::_Cvals;
-    using Integrator<T>::_Fvals;
+    using Integrator<T>::NTotal;
+    using Integrator<T>::Derivs;
+    using Integrator<T>::KVals;
+    using Integrator<T>::CVals;
+    using Integrator<T>::FVals;
 };
 
 } // namespace FluidSound
-
-#endif // _FS_INTEGRATORS_H

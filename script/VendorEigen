@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Re-vendors Eigen into Source/ThirdParty/Eigen. To bump it, change Version and Sha256 and
+# rerun. script/Build is the check: every kept module is reached through <Eigen/Dense>.
+
+set -euo pipefail
+
+Version="3.4.0"
+Sha256="8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72"
+Url="https://gitlab.com/libeigen/eigen/-/archive/${Version}/eigen-${Version}.tar.gz"
+
+# Modules the project reaches, directly or transitively. Kept ones are copied whole: their
+# LAPACKE/BLAS shims are inert without EIGEN_USE_LAPACKE, and pruning within a module is
+# latent breakage for about a megabyte.
+Modules=(Core LU Cholesky QR SVD Geometry Eigenvalues Householder Jacobi)
+
+ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
+ProjectRootDir="$(dirname "${ScriptDir}")"
+Dest="${ProjectRootDir}/Source/ThirdParty/Eigen"
+
+Work="$(mktemp -d)"
+trap 'rm -rf "${Work}"' EXIT
+
+echo "Fetching ${Url}"
+curl -fsSL "${Url}" -o "${Work}/eigen.tar.gz"
+echo "${Sha256}  ${Work}/eigen.tar.gz" | shasum -a 256 -c -
+tar -xzf "${Work}/eigen.tar.gz" -C "${Work}"
+Upstream="${Work}/eigen-${Version}"
+
+rm -rf "${Dest}"
+mkdir -p "${Dest}/src"
+cp "${Upstream}/Eigen/Dense" "${Dest}/"
+for Module in "${Modules[@]}"; do cp "${Upstream}/Eigen/${Module}" "${Dest}/"; done
+for Module in "${Modules[@]}" misc plugins; do cp -R "${Upstream}/Eigen/src/${Module}" "${Dest}/src/"; done
+# MPL2 covers Eigen. The Intel-authored *_BLAS.h / *_LAPACKE.h / MKL_support.h shims are BSD,
+# and arch/Default/{Half,BFloat16}.h carry an Apache-2.0 notice.
+cp "${Upstream}"/COPYING.{MPL2,BSD,APACHE} "${Dest}/"
+
+cat > "${Dest}/README.md" <<EOF
+# Eigen ${Version} (vendored)
+
+Copied by \`script/VendorEigen\`, the only supported way to change this directory. Sources
+are upstream's, unmodified.
+
+- Release: <${Url}>
+- SHA256: \`${Sha256}\`
+- Modules kept: Dense ${Modules[*]}
+
+Everything else is dropped: the sparse solvers, the external library backends, the Qt/STL
+container headers, and upstream's \`unsupported/\`, \`doc/\`, and \`test/\` trees.
+
+Eigen is MPL2 (\`COPYING.MPL2\`). The Intel-authored \`*_BLAS.h\`, \`*_LAPACKE.h\`, and
+\`MKL_support.h\` shims are BSD (\`COPYING.BSD\`), and \`src/Core/arch/Default/Half.h\` and
+\`BFloat16.h\` are Apache-2.0 (\`COPYING.APACHE\`).
+EOF
+
+echo "Vendored Eigen ${Version} into ${Dest} ($(du -sh "${Dest}" | cut -f1))"

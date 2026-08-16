@@ -43,6 +43,14 @@ grid→grid, block→threadgroup, thread→thread, warp(32)→SIMD-group(32), `_
   - Tutorial on `MPSMatrix` row-bytes layout: https://machinethink.net/blog/mps-matrix-multiplication/
 - **Custom-kernel alternative**: MLX "steel" GEMM kernels (https://github.com/ml-explore/mlx, `mlx/backend/metal/kernels/steel/`) — best open-source reference for `simdgroup_matrix` 8×8 tile GEMM. For WaveBlender's small matrices (N_boundary_points × N_modes/bubbles), a trivial custom kernel may beat MPS encoding overhead — and folding the projection into the shader-apply gather kernel is worth considering before reaching for GEMM at all.
 
+## CPU-side dense linear algebra (Accelerate)
+
+Added 2026-08-16 (perf round 3): the bubble-solver rework precomputes per-event-interval mass-matrix inverses and applies them with GEMV, leaning on Accelerate's AMX/SME-backed BLAS/LAPACK.
+
+- **Accelerate BLAS/LAPACK** — https://developer.apple.com/documentation/accelerate/blas-library and https://developer.apple.com/documentation/accelerate — Apple's LAPACK/CBLAS, dispatching to the per-cluster matrix coprocessor (AMX/SME). Define `ACCELERATE_NEW_LAPACK` for the modern headers (https://developer.apple.com/documentation/accelerate/using-the-latest-lapack-interfaces).
+- Measured locally on M5 Max (double precision, N≈958): `cblas_dgemv` ~10 µs (≈6–10× Eigen's NEON gemv), `dpotrf` 1.1 ms, `dpotri` 2.5 ms, `cblas_dtrsv` ~50 µs (triangular solves gain little from the matrix units — the reason explicit inverses + GEMV beat substitution here). Aggregate potrf+potri throughput saturates at ~660 inversions/s regardless of thread count (the matrix units are shared per cluster; more threads only stretch each call), and low-QoS threads do not add throughput — they contend for the same units.
+- **corsix's AMX notes** — https://github.com/corsix/amx — unofficial but standard reference on the AMX coprocessor's per-cluster sharing, consistent with the saturation behavior measured here.
+
 ## Precision and determinism
 
 - **No float64 on Apple GPUs — confirmed.** MSL has no `double` for device code (corroborated: https://developer.apple.com/metal/jax/, https://developer.apple.com/forums/thread/709663, and the existence of the emulation library https://github.com/philipturner/metal-float64). Not a blocker here: WaveBlender's device code is all fp32; doubles live in CPU-side ODE solvers (FluidSound, ModalSound) that port unchanged.

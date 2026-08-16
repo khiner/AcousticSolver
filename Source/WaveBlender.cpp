@@ -49,6 +49,7 @@ WaveBlender::WaveBlender(const SimParams &params)
     for (auto &stamp : FaceStamp) stamp.assign(GridSize, 0);
     for (auto &col : FaceCol) col.assign(GridSize, -1);
     FreshComponent.assign(GridSize, -1);
+    FloodVisited.assign(GridSize, 0);
 
     InitializePml();
 }
@@ -112,14 +113,14 @@ void WaveBlender::WritePendingListeners() {
 
     const auto *samples = ListenerOut.As<REAL>(); // completed at this batch's sync point
     const int n = Listeners.size();
+    std::vector<REAL> deinterleaved(n > 1 ? NFdtdSamples : 0);
     for (int l = 0; l < n; ++l) {
         auto &listener = Listeners[l];
         if (n == 1) {
             listener.Out.write(reinterpret_cast<const char *>(samples), NFdtdSamples * sizeof(REAL));
         } else {
-            for (int s = 0; s < NFdtdSamples; ++s) {
-                listener.Out.write(reinterpret_cast<const char *>(&samples[size_t(s) * n + l]), sizeof(REAL));
-            }
+            for (int s = 0; s < NFdtdSamples; ++s) deinterleaved[s] = samples[size_t(s) * n + l];
+            listener.Out.write(reinterpret_cast<const char *>(deinterleaved.data()), NFdtdSamples * sizeof(REAL));
         }
     }
 }
@@ -146,6 +147,9 @@ bool WaveBlender::RunBatch() {
     if (Step == 0) InitializeListeners();
 
     Cell1 = Cell2;
+    ObjectBounds.resize(Objects.size());
+    PrevObjectBounds = ObjectBounds; // Cell1's bounds: the last rasterization's
+    PrevCavityBounds = CavityBounds;
 
     // 1. Check if objects have moved; if not, we can skip step 2
     bool keep_value[256]{}; // keep_value[v]: cell value v belongs to an object unchanged this batch
@@ -158,9 +162,15 @@ bool WaveBlender::RunBatch() {
     if (any_changed) {
         {
             const profile::Scope scope{"cpu/clear_cells"};
-            for (int cid = 0; cid < GridSize; ++cid) { // Only clear cells of objects that moved
-                if (!keep_value[Cell2[cid]]) Cell2[cid] = 0;
+            // Only clear cells of objects that moved (plus the cavity fill, which is
+            // never kept) — all within their previous rasterization bounds
+            CellBox clear_box = PrevCavityBounds;
+            for (int oid = 0; oid < int(Objects.size()); ++oid) {
+                if (Base(Objects[oid]).Changed) clear_box.Expand(PrevObjectBounds[oid]);
             }
+            ForEachCell(clear_box, Params.Nx, Params.Ny, [&](int cid, int, int, int) {
+                if (!keep_value[Cell2[cid]]) Cell2[cid] = 0;
+            });
         }
         {
             const profile::Scope scope{"cpu/rasterize"};
@@ -181,11 +191,14 @@ bool WaveBlender::RunBatch() {
         }
         // Per-cell blending states for the batch, written into the spare CellState slot
         // (the in-flight batch reads Cur(), which also holds the previous batch-end
-        // solidity). Cells whose solidity changed transition over the batch.
+        // solidity). Cells whose solidity changed transition over the batch. Solid-now
+        // and solid-before cells both lie within the current-or-previous bounds union,
+        // so everything outside is AIR.
         const auto *prev = static_cast<const uint8_t *>(CellState.Cur().RawData());
         auto *states = static_cast<uint8_t *>(CellState.Other().RawData());
+        std::memset(states, CELL_AIR, GridSize);
         HadTransitions = false;
-        for (int cid = 0; cid < GridSize; ++cid) {
+        ForEachCell(SolidBounds(true), Params.Nx, Params.Ny, [&](int cid, int, int, int) {
             const bool solid = Cell2[cid] > 0;
             if (solid != EndsSolid(prev[cid])) {
                 states[cid] = solid ? CELL_RISING : CELL_FALLING;
@@ -193,13 +206,16 @@ bool WaveBlender::RunBatch() {
             } else {
                 states[cid] = solid ? CELL_SOLID : CELL_AIR;
             }
-        }
+        });
         CellState.Flip();
     } else if (HadTransitions) {
         // Geometry unchanged: last batch's transitioning cells have converged
         const auto *prev = static_cast<const uint8_t *>(CellState.Cur().RawData());
         auto *states = static_cast<uint8_t *>(CellState.Other().RawData());
-        for (int cid = 0; cid < GridSize; ++cid) states[cid] = EndsSolid(prev[cid]) ? CELL_SOLID : CELL_AIR;
+        std::memset(states, CELL_AIR, GridSize);
+        ForEachCell(SolidBounds(false), Params.Nx, Params.Ny, [&](int cid, int, int, int) {
+            if (EndsSolid(prev[cid])) states[cid] = CELL_SOLID;
+        });
         CellState.Flip();
         HadTransitions = false;
     }
@@ -242,6 +258,35 @@ bool WaveBlender::RunBatch() {
     return true;
 }
 
+// Cell bounds of a vertex set's rasterization, using the raster paths' cell-index
+// conversion, padded by `pad` cells and clamped to the grid.
+CellBox WaveBlender::VertexBounds(const Eigen::MatrixX<REAL> &v, const Eigen::Vector3<REAL> &offset, int pad) const {
+    CellBox box;
+    if (v.rows() == 0) return box;
+    Eigen::Vector3<REAL> min = v.colwise().minCoeff();
+    min += offset;
+    Eigen::Vector3<REAL> max = v.colwise().maxCoeff();
+    max += offset;
+    const int n[3]{Params.Nx, Params.Ny, Params.Nz};
+    for (int d = 0; d < 3; ++d) {
+        box.Min[d] = int(min[d] / Params.Dx + n[d] / 2.) - pad;
+        box.Max[d] = int(max[d] / Params.Dx + n[d] / 2.) + pad;
+    }
+    box.Clamp(Params.Nx, Params.Ny, Params.Nz);
+    return box;
+}
+
+// Union of every cell that can be solid in Cell2 (and, when `with_prev`, in Cell1)
+CellBox WaveBlender::SolidBounds(bool with_prev) const {
+    CellBox box = CavityBounds;
+    for (const auto &b : ObjectBounds) box.Expand(b);
+    if (with_prev) {
+        box.Expand(PrevCavityBounds);
+        for (const auto &b : PrevObjectBounds) box.Expand(b);
+    }
+    return box;
+}
+
 // Conservative CPU rasterizer based on triangle-box overlap test. Parallel over each
 // object's triangles — safe because all of an object's threads write the same value.
 void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
@@ -253,6 +298,7 @@ void WaveBlender::Rasterize(const bool (&keep_value)[256]) {
         const auto &v = base.V2;
         const auto &f = base.F;
         const uint8_t fill = oid + 1;
+        ObjectBounds[oid] = VertexBounds(v, offset, base.Type == ShaderClass::Point ? 1 : 0);
 
         // Point source rasterization special handling
         // (for now, assumes point sources are specified at the end of config file)
@@ -391,8 +437,18 @@ void WaveBlender::DetectCavities() {
         return i >= min_i && i <= max_i && j >= min_j && j <= max_j && k >= min_k && k <= max_k;
     };
 
-    // Flood fill to detect connected components
-    FloodVisited.assign(GridSize, 0);
+    // Flood fill to detect connected components. Visited marks from the previous fill
+    // all lie within its bounds, so only that region needs re-clearing (row-wise).
+    if (!CavityBounds.Empty()) {
+        const size_t row_bytes = CavityBounds.Max[0] - CavityBounds.Min[0] + 1;
+        for (int k = CavityBounds.Min[2]; k <= CavityBounds.Max[2]; ++k) {
+            for (int j = CavityBounds.Min[1]; j <= CavityBounds.Max[1]; ++j) {
+                std::memset(&FloodVisited[Cid(CavityBounds.Min[0], j, k)], 0, row_bytes);
+            }
+        }
+    }
+    CavityBounds = CellBox{{min_i, min_j, min_k}, {max_i, max_j, max_k}};
+    CavityBounds.Clamp(Params.Nx, Params.Ny, Params.Nz);
     FloodStack.clear();
     if (const int seed = Cid(max_i, max_j, max_k); passable_value[Cell2[seed]]) {
         FloodVisited[seed] = 1;
@@ -435,14 +491,12 @@ void WaveBlender::SetupShaders() {
         std::vector<Eigen::Vector3<REAL>> b_vec;
         std::vector<Eigen::Vector3<REAL>> bn_vec;
         int bid = 0;
-        for (int cid = 0; cid < GridSize; ++cid) {
-            if (Cell1[cid] != fill && Cell2[cid] != fill) continue;
+        CellBox scan = ObjectBounds[oid]; // the object's cells at either batch endpoint
+        scan.Expand(PrevObjectBounds[oid]);
+        ForEachCell(scan, Params.Nx, Params.Ny, [&](int cid, int i, int j, int k) {
+            if (Cell1[cid] != fill && Cell2[cid] != fill) return;
 
-            const int i = cid % Params.Nx;
-            const int j = (cid / Params.Nx) % Params.Ny;
-            const int k = (cid / Params.Nx) / Params.Ny;
-
-            if (i == 0 || i >= Params.Nx - 1 || j == 0 || j >= Params.Ny - 1 || k == 0 || k >= Params.Nz - 1) continue;
+            if (i == 0 || i >= Params.Nx - 1 || j == 0 || j >= Params.Ny - 1 || k == 0 || k >= Params.Nz - 1) return;
 
             const Eigen::Vector3<REAL> p = Pos(i, j, k) - Offsets[oid]; // world-space to object-space
 
@@ -469,7 +523,7 @@ void WaveBlender::SetupShaders() {
                     bid += 1;
                 }
             }
-        } // loop over cells
+        }); // loop over cells
 
         Eigen::MatrixX<REAL> b(b_vec.size(), 3);
         Eigen::MatrixX<REAL> bn(bn_vec.size(), 3);
@@ -493,15 +547,11 @@ void WaveBlender::SetupShaders() {
         std::vector<Eigen::Vector3<REAL>> b_vec;
         std::vector<Eigen::Vector3<REAL>> bn_vec;
         int bid = 0;
-        for (int cid = 0; cid < GridSize; ++cid) {
-            if (Cell2[cid] != fill) continue;
+        ForEachCell(ObjectBounds[oid], Params.Nx, Params.Ny, [&](int cid, int i, int j, int k) {
+            if (Cell2[cid] != fill) return;
             Cell2[cid] = 0;
 
-            const int i = cid % Params.Nx;
-            const int j = (cid / Params.Nx) % Params.Ny;
-            const int k = (cid / Params.Nx) / Params.Ny;
-
-            if (i == 0 || i >= Params.Nx - 1 || j == 0 || j >= Params.Ny - 1 || k == 0 || k >= Params.Nz - 1) continue;
+            if (i == 0 || i >= Params.Nx - 1 || j == 0 || j >= Params.Ny - 1 || k == 0 || k >= Params.Nz - 1) return;
 
             const Eigen::Vector3<REAL> p = Pos(i, j, k) - Offsets[oid]; // world-space to object-space
 
@@ -520,7 +570,7 @@ void WaveBlender::SetupShaders() {
                 b_vec.emplace_back(p.cast<REAL>() + (0.5 * Params.Dx) * bn_vec[bid]);
                 bid += 1;
             }
-        } // loop over cells
+        }); // loop over cells
 
         Eigen::MatrixX<REAL> b(b_vec.size(), 3);
         Eigen::MatrixX<REAL> bn(bn_vec.size(), 3);
@@ -613,11 +663,14 @@ void WaveBlender::FreshCellVelocity() {
         if (Base(Objects[oid]).Type == ShaderClass::Point) point_value[oid + 1] = true;
     }
 
-    // Determine fresh cells (based on Cell1 and Cell2 difference), in ascending cell order
+    // Determine fresh cells (based on Cell1 and Cell2 difference), in ascending cell
+    // order. Nonzero Cell1 values all lie within the previous rasterization's bounds.
     std::vector<int> fresh_cids;
-    for (int cid = 0; cid < GridSize; ++cid) {
+    CellBox prev_box = PrevCavityBounds;
+    for (const auto &b : PrevObjectBounds) prev_box.Expand(b);
+    ForEachCell(prev_box, Params.Nx, Params.Ny, [&](int cid, int, int, int) {
         if (Cell2[cid] == 0 && Cell1[cid] > 0 && Cell1[cid] != CavityInterior && !point_value[Cell1[cid]]) fresh_cids.push_back(cid);
-    }
+    });
     std::cout << "  # Fresh Cells = " << fresh_cids.size() << std::endl;
     if (fresh_cids.empty()) return;
 

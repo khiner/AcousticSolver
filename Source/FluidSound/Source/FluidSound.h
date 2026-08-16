@@ -68,6 +68,7 @@ private:
 
     std::vector<Oscillator<T>*> _coupled_osc;
     std::vector<Oscillator<T>*> _uncoupled_osc;
+    std::vector<Oscillator<T>*> _total_osc;  // LOCAL PATCH (perf): coupled + uncoupled, rebuilt only when they change
 
     std::vector<Oscillator<T>> _oscillators;   //!< vector of ALL Oscillators, sorted by start time
     int _osID = 0;  //!< current _oscillators index

@@ -39,8 +39,10 @@ MetalContext::MetalContext() : Device(MTL::CreateSystemDefaultDevice()) {
     if (!Device) throw std::runtime_error("No Metal device available");
     Queue = Device->newCommandQueue();
 
-    // Runtime-compile the kernel library. KernelParams.h is shared with the host,
-    // so it is prepended in place of a #include (runtime compilation has no header search path).
+    // Runtime-compile the kernel library (macOS caches this, so warm starts take ~1 ms).
+    // KernelParams.h is shared with the host, so it is prepended in place of a #include
+    // (runtime compilation has no header search path).
+    const profile::Scope scope{"startup/msl_compile"};
     const auto source = ReadFile(std::string{ACOUSTIC_MSL_DIR} + "/KernelParams.h") + ReadFile(std::string{ACOUSTIC_MSL_DIR} + "/Kernels.metal");
 
     auto *options = MTL::CompileOptions::alloc()->init();
@@ -56,6 +58,7 @@ MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool fold_ap
     const std::string key = fold_apply ? std::string{name} + "#fold" : std::string{name};
     if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
 
+    const profile::Scope scope{"startup/pipeline_create"};
     auto *constants = MTL::FunctionConstantValues::alloc()->init();
     constants->setConstantValue(&fold_apply, MTL::DataTypeBool, NS::UInteger{FOLD_APPLY_FC_INDEX});
     NS::Error *fn_error{nullptr};
@@ -131,7 +134,10 @@ void GpuBuffer::Resize(size_t bytes) {
 
     auto &ctx = MetalContext::Get();
     ctx.Sync(); // in-flight work may reference the old allocation
-    if (Buf) Buf->release();
+    if (Buf) {
+        Buf->release();
+        bytes = std::max(bytes, 2 * CapacityBytes); // geometric growth: each grow syncs the stream, so make them rare
+    }
     Buf = ctx.Device->newBuffer(bytes, MTL::ResourceStorageModeShared);
     if (!Buf) throw std::runtime_error(std::format("MTL::Buffer allocation failed ({} bytes)", bytes));
     CapacityBytes = bytes;

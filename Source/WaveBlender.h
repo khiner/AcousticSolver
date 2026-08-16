@@ -15,11 +15,46 @@
 // NOTE: Ordering of objects matters. Point sources MUST be placed at end; later objects
 // will override previous rasterizations.
 
+#include <algorithm>
+#include <climits>
 #include <deque>
 
 #include "Shaders.h"
 
 constexpr int CavityInterior{255};
+
+// Inclusive cell-index bounds of a grid region, used to confine per-batch CPU sweeps to
+// the cells an object (or the cavity fill) can actually touch. Default-initialized empty.
+struct CellBox {
+    int Min[3]{INT_MAX, INT_MAX, INT_MAX};
+    int Max[3]{-1, -1, -1};
+
+    bool Empty() const { return Max[0] < Min[0] || Max[1] < Min[1] || Max[2] < Min[2]; }
+    void Expand(const CellBox &o) {
+        for (int d = 0; d < 3; ++d) {
+            Min[d] = std::min(Min[d], o.Min[d]);
+            Max[d] = std::max(Max[d], o.Max[d]);
+        }
+    }
+    void Clamp(int nx, int ny, int nz) {
+        const int n[3]{nx, ny, nz};
+        for (int d = 0; d < 3; ++d) {
+            Min[d] = std::max(Min[d], 0);
+            Max[d] = std::min(Max[d], n[d] - 1);
+        }
+    }
+};
+
+// Calls fn(cid, i, j, k) for every cell in the box, in ascending cid order (several
+// sweeps' float-rounding depends on visiting cells in this order).
+template<typename F> void ForEachCell(const CellBox &box, int nx, int ny, F &&fn) {
+    for (int k = box.Min[2]; k <= box.Max[2]; ++k) {
+        for (int j = box.Min[1]; j <= box.Max[1]; ++j) {
+            int cid = (ny * nx) * k + nx * j + box.Min[0];
+            for (int i = box.Min[0]; i <= box.Max[0]; ++i, ++cid) fn(cid, i, j, k);
+        }
+    }
+}
 
 // Mono-channel, stationary listener for single-point pressure output.
 struct MonoListener {
@@ -113,6 +148,12 @@ private:
 
     std::vector<uint8_t> Cell1, Cell2; // rasterized cell states at batch endpoints t1 and t2 (values: 0 air, oid + 1, CavityInterior)
 
+    // Cell bounds of each object's rasterization and of the cavity fill, for Cell2 (as
+    // of the last rasterization) and Cell1 (the previous batch's snapshot). Every cell
+    // holding an object's value lies within its box.
+    std::vector<CellBox> ObjectBounds, PrevObjectBounds;
+    CellBox CavityBounds, PrevCavityBounds;
+
     // ----- Persistent scratch (sized once, reused per batch) -----
     std::vector<int> ShaderMapHost;
     std::vector<uint8_t> FloodVisited; // flood-fill visited flags
@@ -124,6 +165,10 @@ private:
 
     // ----- Basic helper functions -----
     int Cid(int i, int j, int k) const { return (Params.Ny * Params.Nx) * k + Params.Nx * j + i; }
+    // Cell bounds of a vertex set's rasterization (padded by `pad` cells, grid-clamped)
+    CellBox VertexBounds(const Eigen::MatrixX<REAL> &v, const Eigen::Vector3<REAL> &offset, int pad) const;
+    // Union of every cell that can be solid in Cell2 (and, when `with_prev`, in Cell1)
+    CellBox SolidBounds(bool with_prev) const;
     Eigen::Vector3<REAL> Pos(int i, int j, int k) const {
         return {(i - (Params.Nx - 1) / 2.f) * Params.Dx, (j - (Params.Ny - 1) / 2.f) * Params.Dx, (k - (Params.Nz - 1) / 2.f) * Params.Dx};
     }

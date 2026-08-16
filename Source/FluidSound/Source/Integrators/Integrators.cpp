@@ -11,18 +11,32 @@
 
 #include "Parallel.h" // LOCAL PATCH (perf): bit-exact parallel fan-out helpers
 
+// LOCAL PATCH (perf): AMX-backed matrix-vector products for the precomputed-inverse
+// solve path (see InverseProvider in Integrators.h)
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+
 namespace FluidSound {
 
-/** */
+/** LOCAL PATCH (perf, bit-exact): allocation-free RK4. Each stage's input is built in
+ *  preallocated scratch and the combination (k1 + 2 k2 + 2 k3 + k4) accumulates in the
+ *  original left-to-right element order, so results are bit-identical. */
 template <typename T>
 void Integrator<T>::step(double time)
 {
-    Eigen::ArrayX<T> k1 = solve(_States, time);
-    Eigen::ArrayX<T> k2 = solve(_States + _dt / 2. * k1, time + _dt / 2.);
-    Eigen::ArrayX<T> k3 = solve(_States + _dt / 2. * k2, time + _dt / 2.);
-    Eigen::ArrayX<T> k4 = solve(_States + _dt * k3, time + _dt);
+    const Eigen::ArrayX<T>& k1 = solve(_States, time);
+    _Acc = k1;
+    _Y = _States + _dt / 2. * k1;
+    const Eigen::ArrayX<T>& k2 = solve(_Y, time + _dt / 2.);
+    _Acc += 2. * k2;
+    _Y = _States + _dt / 2. * k2;
+    const Eigen::ArrayX<T>& k3 = solve(_Y, time + _dt / 2.);
+    _Acc += 2. * k3;
+    _Y = _States + _dt * k3;
+    const Eigen::ArrayX<T>& k4 = solve(_Y, time + _dt);
+    _Acc += k4;
 
-    _Derivs = (k1 + 2. * k2 + 2. * k3 + k4) / 6.;
+    _Derivs = _Acc / 6.;
     _States += _dt * _Derivs;
 }
 
@@ -85,14 +99,14 @@ void Integrator<T>::_computeKCF(double time)
     double alpha = (time - _t1) / (_t2 - _t1);
 
     // Compute stiffness at current time, K = w0^2
-    Eigen::ArrayX<T> w0 = (1. - alpha) * _solveData1.row(1) + alpha * _solveData2.row(1);
-    _Kvals = w0 * w0;
+    // LOCAL PATCH (perf, bit-exact): fused .square() avoids the w0 temporary
+    _Kvals = ((1. - alpha) * _solveData1.row(1) + alpha * _solveData2.row(1)).square();
 
     // Compute damping at current time (precomputed, so we just need to interpolate)
     _Cvals = (1. - alpha) * _solveData1.row(5) + alpha * _solveData2.row(5);
 
     // Compute force at current time (all forcing models we use have the form F(t) = (t < cutoff) * weight * t^2, \see Oscillators)
-    _Fvals = Eigen::ArrayX<T>::Zero(_N_total);
+    _Fvals.setZero(_N_total); // LOCAL PATCH (perf, bit-exact): no realloc when the size is unchanged
     for (int i = 0; i < _N_coupled; i++)
     {
         if (time > _forceData2(0, i))
@@ -145,7 +159,7 @@ void Coupled_Direct<T>::ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic>& 
                 else {
                     T r_j = radii[j];
                     T distSq = (centers.col(j) - centers.col(i)).squaredNorm();
-                    M(i, j) = 1. / std::sqrt(distSq / (r_i * r_j) + _epsSq);
+                    M(i, j) = 1. / std::sqrt(distSq / (r_i * r_j) + EpsSq);
                     M(j, i) = M(i, j);
                 }
             }
@@ -159,22 +173,22 @@ void Coupled_Direct<T>::_constructMass(double time, Eigen::Matrix<T, Eigen::Dyna
     ConstructMass(_solveData1, _solveData2, _t1, _t2, time, _N_coupled, M);
 }
 
-/** LOCAL PATCH (perf, bit-exact): takes factors from the precompute pipeline when one is
+/** LOCAL PATCH (perf): takes endpoint inverses from the precompute pipeline when one is
  *  installed, otherwise constructs and factors the two independent endpoints
- *  concurrently. */
+ *  concurrently (the reference path). */
 template <typename T>
 void Coupled_Direct<T>::refactor()
 {
     auto mass_start = std::chrono::steady_clock::now();
 
-    if (FactorProvider && FactorProvider(_t1, _t2, _N_coupled, _factor1, _factor2))
+    if (InverseProvider && InverseProvider(_t1, _t2, _N_coupled, _inv1, _inv2))
     {
-        if (_factor1.info() == Eigen::NumericalIssue) { throw std::runtime_error("Non positive definite matrix!"); }
-        if (_factor2.info() == Eigen::NumericalIssue) { throw std::runtime_error("Non positive definite matrix!"); }
+        _useInverse = true;
         auto mass_end = std::chrono::steady_clock::now();
         this->mass_time += mass_end - mass_start;
         return;
     }
+    _useInverse = false;
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> M1, M2;
     ParallelFor(2, 1, [&](size_t which)
     {
@@ -190,7 +204,7 @@ void Coupled_Direct<T>::refactor()
 
 /** We re-use _Derivs to avoid allocating additional memory */
 template <typename T>
-Eigen::ArrayX<T> Coupled_Direct<T>::solve(const Eigen::ArrayX<T>& States, double time)
+const Eigen::ArrayX<T>& Coupled_Direct<T>::solve(const Eigen::ArrayX<T>& States, double time)
 {
     this->_computeKCF(time);
 
@@ -198,25 +212,30 @@ Eigen::ArrayX<T> Coupled_Direct<T>::solve(const Eigen::ArrayX<T>& States, double
 
     double alpha = (time - _t1) / (_t2 - _t1);
     _radii = (1. - alpha) * _solveData1.row(0) + alpha * _solveData2.row(0);
+    _sqrtRadii = _radii.sqrt(); // LOCAL PATCH (perf, bit-exact): computed once, used twice
 
     // solve for y'' | My'' = (F/sqrt(r) - Cy' - Ky) (linearly interpolate M^{-1})
-    _RHS = (_Fvals - _Cvals * States.segment(_N_total, _N_total) - _Kvals * States.segment(0, _N_total)) / _radii.sqrt();
-    // LOCAL PATCH (perf, bit-exact): the two endpoint triangular solves are independent,
-    // so run them concurrently when the system is large enough to cover the fan-out cost.
-    if (_N_coupled >= 128) {
-        Eigen::Vector<T, Eigen::Dynamic> sol1, sol2;
-        ParallelFor(2, 1, [&](size_t which)
-        {
-            if (which == 0) sol1 = _factor1.solve(_RHS.head(_N_coupled));
-            else sol2 = _factor2.solve(_RHS.head(_N_coupled));
-        });
-        _RHS.head(_N_coupled) = (1. - alpha) * sol1 + alpha * sol2;
+    _RHS = (_Fvals - _Cvals * States.segment(_N_total, _N_total) - _Kvals * States.segment(0, _N_total)) / _sqrtRadii;
+    // LOCAL PATCH (perf): with precomputed endpoint inverses, the blended solve is two
+    // matrix-vector products. Otherwise, substitute against the inline Cholesky factors.
+    if (_useInverse) {
+        if (_N_coupled > 0) {
+            _sol1.resize(_N_coupled); _sol2.resize(_N_coupled);
+            if constexpr (std::is_same_v<T, double>) {
+                cblas_dgemv(CblasColMajor, CblasNoTrans, _N_coupled, _N_coupled, 1., _inv1.data(), _N_coupled, _RHS.data(), 1, 0., _sol1.data(), 1);
+                cblas_dgemv(CblasColMajor, CblasNoTrans, _N_coupled, _N_coupled, 1., _inv2.data(), _N_coupled, _RHS.data(), 1, 0., _sol2.data(), 1);
+            } else {
+                cblas_sgemv(CblasColMajor, CblasNoTrans, _N_coupled, _N_coupled, 1.f, _inv1.data(), _N_coupled, _RHS.data(), 1, 0.f, _sol1.data(), 1);
+                cblas_sgemv(CblasColMajor, CblasNoTrans, _N_coupled, _N_coupled, 1.f, _inv2.data(), _N_coupled, _RHS.data(), 1, 0.f, _sol2.data(), 1);
+            }
+            _RHS.head(_N_coupled) = (1. - alpha) * _sol1 + alpha * _sol2;
+        }
     } else {
         _RHS.head(_N_coupled) = (1. - alpha) * _factor1.solve(_RHS.head(_N_coupled)) + alpha * _factor2.solve(_RHS.head(_N_coupled));
     }
 
     _Derivs.segment(0, _N_total) = States.segment(_N_total, _N_total);
-    _Derivs.segment(_N_total, _N_total) = _RHS.array() * _radii.sqrt();
+    _Derivs.segment(_N_total, _N_total) = _RHS.array() * _sqrtRadii;
 
     auto solve_end = std::chrono::steady_clock::now();
     this->solve_time += solve_end - solve_start;
@@ -230,7 +249,7 @@ template class Coupled_Direct<double>;
 
 /** */
 template <typename T>
-Eigen::ArrayX<T> Uncoupled<T>::solve(const Eigen::ArrayX<T>& States, double time)
+const Eigen::ArrayX<T>& Uncoupled<T>::solve(const Eigen::ArrayX<T>& States, double time)
 {
     this->_computeKCF(time);
 

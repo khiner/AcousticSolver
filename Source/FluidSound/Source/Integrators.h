@@ -36,6 +36,10 @@ public:
     /** \brief Takes an RK4 integration step */
     void step(double time);
 
+    // LOCAL PATCH (perf, bit-exact): solve() returns a reference to _Derivs and step()
+    // accumulates the RK4 combination incrementally (same per-element operation order as
+    // the original k1..k4 expression), so stepping allocates nothing.
+
     /**
      * \brief Copies all Oscillator data needed for the integration batch; must be called at start of batch.
      * \param[in]  coupled_osc    Oscillators to treat as coupled
@@ -54,7 +58,7 @@ public:
      * \param[in]  State  packed state vectors [v v']
      * \param[in]  time   solve time t (must satisfy _t1 <= t <= _t2)
      */
-    virtual Eigen::ArrayX<T> solve(const Eigen::ArrayX<T>& State, double time) = 0;
+    virtual const Eigen::ArrayX<T>& solve(const Eigen::ArrayX<T>& State, double time) = 0;
     
     const Eigen::ArrayX<T>& States() { return _States; }
     const Eigen::ArrayX<T>& Derivs() { return _Derivs; }
@@ -80,6 +84,10 @@ protected:
     /** \brief packed force data (across all active Oscillators) at endpoint times, \see Oscillators.forceData */
     Eigen::Array<T, 3, Eigen::Dynamic> _forceData1, _forceData2;
 
+    // LOCAL PATCH (perf, bit-exact): preallocated RK4 scratch (stage input and running
+    // combination), see step().
+    Eigen::ArrayX<T> _Y, _Acc;
+
 public:
     std::chrono::duration<double> coeff_time = std::chrono::duration<double>::zero();
     std::chrono::duration<double> mass_time = std::chrono::duration<double>::zero();
@@ -97,22 +105,28 @@ public:
     Coupled_Direct(double dt) : Integrator<T>(dt) { }
 
     void refactor();
-    Eigen::ArrayX<T> solve(const Eigen::ArrayX<T>& States, double time);
+    const Eigen::ArrayX<T>& solve(const Eigen::ArrayX<T>& States, double time);
 
-    // LOCAL PATCH (perf, bit-exact): optional provider of precomputed endpoint
-    // factorizations (see BubbleFactorPipeline.h). refactor() calls it with
-    // (t1, t2, N_coupled) and computes inline as before when it returns false.
+    // LOCAL PATCH (perf): optional provider of precomputed endpoint mass-matrix
+    // INVERSES (see BubbleFactorPipeline.h). refactor() calls it with
+    // (t1, t2, N_coupled); when it succeeds, solve() applies the blended inverse as two
+    // matrix-vector products instead of two pairs of triangular substitutions (same
+    // linear system, different float rounding). When it returns false, refactor()
+    // computes Cholesky factors inline and solve() substitutes, as in the reference.
     std::function<bool(double, double, int,
-        Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>&,
-        Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>&)> FactorProvider;
+        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>&,
+        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>&)> InverseProvider;
 
     /** LOCAL PATCH (perf): standalone mass-matrix construction over packed solve data,
      *  shared by the inline path and the background precompute workers. */
     static void ConstructMass(const Eigen::Array<T, 6, Eigen::Dynamic>& solveData1, const Eigen::Array<T, 6, Eigen::Dynamic>& solveData2,
         double t1, double t2, double time, int N_coupled, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>& M);
 
+    // LOCAL PATCH: renamed public (from private _epsSq) so the precompute pipeline's
+    // mass construction can share it
+    static constexpr T EpsSq = 4.;  //!< regularization term
+
 private:
-    static constexpr T _epsSq = 4.;  //!< regularization term
 
     /** \private constructs mass matrix M
      *  LOCAL PATCH (perf): out-parameter + const so the two endpoint constructions can
@@ -120,9 +134,16 @@ private:
     void _constructMass(double time, Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &M) const;
 
     Eigen::ArrayX<T> _radii;
+    Eigen::ArrayX<T> _sqrtRadii; // LOCAL PATCH (perf, bit-exact): sqrt(_radii), computed once per solve
 
     Eigen::LLT<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>> _factor1, _factor2;
     Eigen::Vector<T, Eigen::Dynamic> _RHS;
+
+    // LOCAL PATCH (perf): precomputed endpoint inverses and their GEMV outputs, active
+    // for the current event interval when _useInverse is set (see InverseProvider).
+    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> _inv1, _inv2;
+    Eigen::Vector<T, Eigen::Dynamic> _sol1, _sol2;
+    bool _useInverse = false;
 
 
     // Needed for templated class inheritance to work
@@ -144,7 +165,7 @@ public:
     Uncoupled(double dt) : Integrator<T>(dt) { }
     
     void refactor() { }     // dummy function call
-    Eigen::ArrayX<T> solve(const Eigen::ArrayX<T>& State, double time);
+    const Eigen::ArrayX<T>& solve(const Eigen::ArrayX<T>& State, double time);
 
 private:
     // Needed for templated class inheritance to work

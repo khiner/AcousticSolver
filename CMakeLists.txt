@@ -50,7 +50,9 @@ target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
 )
 
 # Kernels are compiled at runtime from these sources (KernelParams.h + Kernels.metal).
+# macOS caches the compilation, so warm-start compiles are ~1 ms (see startup/msl_compile
+# under ACOUSTIC_PROFILE).
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Source/FDTD")
 
-target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Metal" "-framework Foundation")
+target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Metal" "-framework Foundation" "-framework Accelerate")

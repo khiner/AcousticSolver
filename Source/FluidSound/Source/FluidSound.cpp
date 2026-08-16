@@ -33,11 +33,14 @@ T Solver<T>::step()
 {
     double time = _dt * _step + _ts;
 
+    bool lists_changed = false;  // LOCAL PATCH (perf): tracks whether _total_osc needs rebuilding
+
     // Check if any events (e.g., Bubbles added or removed) will occurr during this timestep
     while (_evID < _eventTimes.size() && time >= _eventTimes[_evID])
     {
         if (time < _eventTimes[_evID + 1])
         {
+            lists_changed = true;
             double time1 = _eventTimes[_evID]; double time2 = _eventTimes[_evID + 1];
 
             // Check if any Oscillators have ended by time1. We uncouple them from the bubble cloud but
@@ -90,8 +93,14 @@ T Solver<T>::step()
     }
     _step++;
 
-    std::vector<Oscillator<T>*> total_osc(_coupled_osc.begin(), _coupled_osc.end());
-    total_osc.insert(total_osc.end(), _uncoupled_osc.begin(), _uncoupled_osc.end());
+    // LOCAL PATCH (perf): the coupled/uncoupled lists only change in the event branch
+    // above, so the concatenated list is rebuilt only then
+    if (lists_changed || _total_osc.size() != _coupled_osc.size() + _uncoupled_osc.size())
+    {
+        _total_osc.assign(_coupled_osc.begin(), _coupled_osc.end());
+        _total_osc.insert(_total_osc.end(), _uncoupled_osc.begin(), _uncoupled_osc.end());
+    }
+    const std::vector<Oscillator<T>*>& total_osc = _total_osc;
     size_t N_total = total_osc.size();
 
     if (N_total == 0) { return 0.; }
@@ -123,7 +132,9 @@ void Solver<T>::_makeOscillators(const std::map<int, Bubble<T>> &bubMap)
     std::set<double> eventTimesSet;
     
     std::set<int> usedBubIDs;
-    for (const std::pair<int, Bubble<T>>& bubPair : bubMap)  // Loop over all bubbles
+    // LOCAL PATCH (perf): const auto& matches the map's value type (pair<const int, ...>),
+    // so iterating no longer deep-copies every Bubble
+    for (const auto& bubPair : bubMap)  // Loop over all bubbles
     {
         // Skip if bubble has already been used
         if (usedBubIDs.count(bubPair.first)) continue;

@@ -189,6 +189,83 @@ blocking variant was implemented and measured slower (extra cached loads and bar
 outweigh the halved traffic) — the single fused pass appears to be the right shape for
 this hardware.
 
+## Performance, round 3 (2026-08-16)
+
+A third pass, targeting the two things round 2 left on the table: the coupled-bubble
+solver's main-thread cost, and the per-batch full-grid CPU sweeps. The FDTD kernels are
+untouched (round 2 established they run at the memory-stream floor for this hardware).
+
+Validation: every non-bubble scene's listener output is **byte-identical** to the round-2
+build. The bubble scenes carry one new deliberate float-rounding change (item 3 below):
+their outputs differ from round 2 at rel L2 ~1e-6 — five orders of magnitude below the
+CUDA-golden comparison level — and every golden verdict and error metric is unchanged.
+
+| Scene | Round 2 | Round 3 | Speedup | vs original port |
+|---|---|---|---|---|
+| GlassPour | 15.0s | 6.2s | 2.4× | 5.6× |
+| PaddleSplash | 96.5s | 85.7s | 1.1× | 4.7× |
+| CupPhone | 37.4s | 35.6s | 1.1× | 1.6× |
+| SpollingBowl | 14.2s | 13.6s | 1.0× | 4.5× |
+| Trumpet | 39.7s | 38.9s | 1.0× | 2.0× |
+| 2016Pour | 82.6s | 81.2s | 1.0× | 2.3× |
+| TalkFan | 55.7s | 55.5s | 1.0× | 2.3× |
+| LegoDrop | 3.5s | 3.5s | 1.0× | 2.9× |
+| FillerUp | 34.8s | 35.5s | 1.0× | 2.5× |
+| HandShake | 57.5s | 57.9s | 1.0× | 2.2× |
+
+Total 437s → 414s (1170s → 414s, 2.8× vs the original straight translation). The in-suite
+totals for GPU-bound scenes hide the CPU-side savings: sustained back-to-back runs inflate
+GPU time ~10% thermally (verified by comparing the apply-path tuner's early-run probe
+timings, which match run-to-run), and once batch-prep CPU drops below the GPU batch time
+it stops affecting wall clock at all. Standalone on a rested machine, TalkFan runs 47.9s
+(was 50.5s), with its instrumented batch-prep CPU down from 14.7s to ~5s — headroom that
+now belongs to any future GPU-side gain rather than a second bottleneck.
+
+What changed:
+
+1. **Precomputed bubble mass-matrix inverses, applied with AMX GEMV.** Round 2
+   precomputed the two per-event-interval Cholesky factorizations; the main thread still
+   spent most of each RK4 stage in Eigen's serial triangular substitutions (plus, it
+   turned out, ~40% of that block waiting on the round-2 two-way dispatch fan-out — now
+   removed). The pipeline workers now construct each endpoint mass matrix (serial
+   vectorized lower-triangle fill) and invert it in place with Accelerate's AMX-backed
+   `dpotrf`/`dpotri`, and the solve becomes two `cblas_dgemv` calls plus a blend.
+   Measured on M5 Max at N≈958: `dgemv` 10 µs vs ~100 µs for a triangular-solve pair —
+   AMX accelerates GEMV ~10× but triangular substitution barely at all, which is the
+   whole case for explicit inverses. This is the rounding change above (same linear
+   system, different operation order); the inline fallback path (schedule divergence,
+   post-final-event tail) still factors and substitutes exactly as the reference does.
+2. **Byte-budgeted pipeline lookahead.** Bubble events cluster: event-dense stretches
+   consume intervals far faster than workers can produce them, and the round-2
+   fixed 8-interval lookahead let the buffer drain and stalled the solver (~30 s of
+   main-thread waiting in PaddleSplash). Workers now run ahead until they hold 1.5 GB of
+   not-yet-consumed inverses (ticket floor 4, ceiling 512), pre-filling through quiet
+   stretches. Worker count is capped at 4: the matrix units saturate at ~660
+   inversions/s aggregate regardless of thread count (measured — extra workers at any
+   QoS only stretch every call, including the main thread's own GEMVs).
+3. **Bounding-box-limited CPU batch sweeps** (bit-exact; the bulk of the non-bubble CPU
+   savings). Each object's rasterization now records its cell bounds (`CellBox`), as
+   does the cavity fill, and every per-batch full-grid sweep — clear-moved-cells,
+   blending-state transitions, per-object shader-face scans, the fresh-cell scan, and
+   the flood-fill visited-clear — iterates only the relevant bounds union (in the same
+   ascending cell order, so results are byte-identical). TalkFan, which rasterizes two
+   animated objects at 1 kHz blend rate over an 88³ grid, drops from 14.7 s of
+   instrumented batch-prep CPU to ~5 s.
+4. **Small fixes**: `GpuBuffer::Resize` grows geometrically (each grow syncs the GPU
+   stream — repeated fluid-mesh-driven regrows were breaking bubble-scene pipelining);
+   multi-listener output writes deinterleave into one buffered write per listener per
+   batch; the RK4 step no longer allocates (bit-exact incremental accumulation); the
+   vendored bubble loader no longer deep-copies every `Bubble` (a `pair<int, Bubble>`
+   loop variable against a `pair<const int, Bubble>` map); `Solver::step` rebuilds its
+   oscillator list only on events.
+
+Also measured and deliberately *not* done: a build-time `.metallib` (runtime MSL
+compilation is ~1 ms warm — macOS caches it — and the offline Metal toolchain is a
+separate multi-GB download); temporal blocking and threadgroup staging remain rejected
+from round 2; low-QoS/E-core inversion workers (contend for the same matrix units);
+`dtrtri`-only inverses applied via `dtrmv` (worker savings exactly cancelled by the
+doubled apply cost).
+
 ## Rerunning
 
 ```

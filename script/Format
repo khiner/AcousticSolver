@@ -3,6 +3,6 @@
 ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
 ProjectRootDir="$(dirname "${ScriptDir}")"
 
-# Vendored code under Source/{ModalSound,FluidSound,ThirdParty} is excluded via per-directory
-# .clang-format files with DisableFormat.
-find -E "${ProjectRootDir}/Source" "${ProjectRootDir}/main.cpp" -regex '.*\.(cpp|hpp|c|cc|cxx|h|hh)' -exec clang-format -style=file -i {} \;
+# Third-party code under src/ThirdParty is excluded via a per-directory .clang-format
+# with DisableFormat.
+find -E "${ProjectRootDir}/src" "${ProjectRootDir}/main.cpp" -regex '.*\.(cpp|hpp|c|cc|cxx|h|hh)' -exec clang-format -style=file -i {} \;

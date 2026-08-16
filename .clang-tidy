@@ -99,8 +99,9 @@ Checks: >
   misc-uniqueptr-reset-release,
   cppcoreguidelines-virtual-class-destructor,
   cppcoreguidelines-misleading-capture-default-by-value
-# Only report diagnostics from our own headers, not lib/ or the SDK.
-HeaderFilterRegex: '/MeshEditor/src/'
+# Only report diagnostics from our own headers, not vendored code, metal-cpp, or the SDK.
+HeaderFilterRegex: '/src/'
+ExcludeHeaderFilterRegex: '/src/ThirdParty/'
 WarningsAsErrors: ''
 CheckOptions:
   # Keep the `x ? true : false` style simplifications, but not the DeMorgan rewrites

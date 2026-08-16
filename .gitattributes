@@ -1,3 +1,1 @@
-Source/ThirdParty/** linguist-vendored
-Source/FluidSound/** linguist-vendored
-Source/ModalSound/** linguist-vendored
+src/ThirdParty/** linguist-vendored

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Formats (and, when a compile database exists, tidies) staged C++ sources, then re-stages them
-# so the commit lands with cleaned-up code. Vendored code is excluded.
+# so the commit lands with cleaned-up code. Third-party code is excluded.
 # Installed via `git config core.hooksPath .githooks`.
 
 set -e
@@ -9,7 +9,7 @@ set -e
 RootDir="$(git rev-parse --show-toplevel)"
 cd "${RootDir}"
 
-Files="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(cpp|hpp|c|cc|cxx|h|hh)$' | grep -vE '^Source/(ModalSound|FluidSound|ThirdParty)/' || true)"
+Files="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(cpp|hpp|c|cc|cxx|h|hh)$' | grep -vE '^src/ThirdParty/' || true)"
 [ -z "${Files}" ] && exit 0
 
 echo "${Files}" | xargs clang-format -style=file -i

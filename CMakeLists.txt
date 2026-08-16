@@ -22,30 +22,24 @@ FetchContent_Declare(metalcpp
     SOURCE_SUBDIR cmake_disabled)
 FetchContent_MakeAvailable(metalcpp)
 
-file(GLOB SHADER_SOURCES Source/Shaders/*.cpp)
-set(VENDORED_SOURCES
-    Source/ModalSound/Source/ModalSound.cpp
-    Source/FluidSound/Source/FluidSound.cpp
-    Source/FluidSound/Source/Oscillator.cpp
-    Source/FluidSound/Source/BubbleUtils.cpp
-    Source/FluidSound/Source/Integrators/Integrators.cpp
-)
-# Vendored reference code is kept byte-identical upstream. Ignore its warnings.
-set_source_files_properties(${VENDORED_SOURCES} PROPERTIES COMPILE_FLAGS "-w")
+file(GLOB SHADER_SOURCES src/Shaders/*.cpp)
 
 add_executable(${PROJECT_NAME}
     main.cpp
-    Source/Mesh.cpp
-    Source/WaveBlender.cpp
-    Source/Metal/MetalContext.cpp
+    src/BubbleUtils.cpp
+    src/FluidSound.cpp
+    src/Integrators.cpp
+    src/Mesh.cpp
+    src/ModalSound.cpp
+    src/Oscillator.cpp
+    src/WaveBlender.cpp
+    src/Metal/MetalContext.cpp
     ${SHADER_SOURCES}
-    ${VENDORED_SOURCES}
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE Source Source/FDTD Source/Metal)
+target_include_directories(${PROJECT_NAME} PRIVATE src src/FDTD src/Metal)
 target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
-    Source/ThirdParty
-    Source/ModalSound/Source Source/FluidSound/Source
+    src/ThirdParty
     ${metalcpp_SOURCE_DIR}
 )
 
@@ -53,6 +47,6 @@ target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
 # macOS caches the compilation, so warm-start compiles are ~1 ms (see startup/msl_compile
 # under ACOUSTIC_PROFILE).
 target_compile_definitions(${PROJECT_NAME} PRIVATE
-    ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Source/FDTD")
+    ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/FDTD")
 
 target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Metal" "-framework Foundation" "-framework Accelerate")

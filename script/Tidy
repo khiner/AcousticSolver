@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Runs clang-tidy over the project's own sources using the checks configured in .clang-tidy.
-# Pass a file or directory to lint just that target; defaults to Source/ + main.cpp.
+# Pass a file or directory to lint just that target; defaults to src/ + main.cpp.
 #   script/Tidy
-#   script/Tidy Source/WaveBlender.cpp
+#   script/Tidy src/WaveBlender.cpp
 # Exits non-zero if any findings remain.
 
 set -uo pipefail
@@ -11,11 +11,12 @@ set -uo pipefail
 ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
 ProjectRootDir="$(dirname "${ScriptDir}")"
 
-Targets=("${1:-${ProjectRootDir}/Source/(WaveBlender|Metal/|FDTD/|Shaders/).*\.cpp|${ProjectRootDir}/main.cpp}")
+# src/ThirdParty holds no .cpp, so every translation unit under src/ is ours.
+Targets=("${1:-${ProjectRootDir}/src/.*\.cpp|${ProjectRootDir}/main.cpp}")
 
 Findings="$(
     run-clang-tidy -p "${ProjectRootDir}/build" -quiet "${Targets[@]}" 2>&1 |
-        grep -oE "${ProjectRootDir}/(Source|main)[^ ]*: warning:.*\[[a-z-]+\]" | sort -u
+        grep -oE "${ProjectRootDir}/(src|main)[^ ]*: warning:.*\[[a-z-]+\]" | sort -u
 )"
 
 if [[ -n "${Findings}" ]]; then

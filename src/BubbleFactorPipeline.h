@@ -82,7 +82,8 @@ class BubbleFactorPipeline {
     // to full storage (the dgemv apply and the chained derivation's gathers read both
     // triangles). Returns false if the matrix is not positive definite.
     static bool Invert(Eigen::MatrixXd &m) {
-        __LAPACK_int n = __LAPACK_int(m.rows()), info = 0;
+        const __LAPACK_int n = __LAPACK_int(m.rows());
+        __LAPACK_int info = 0;
         if (n == 0) return true; // LAPACK rejects lda = 0
         dpotrf_("L", &n, m.data(), &n, &info);
         if (info != 0) return false;
@@ -224,7 +225,8 @@ private:
                 double *hc = hdd.data() + size_t(j) * d;
                 for (int i = 0; i < d; ++i) hc[i] = col[didx[i]];
             }
-            __LAPACK_int dn = d, info = 0;
+            const __LAPACK_int dn = d;
+            __LAPACK_int info = 0;
             dpotrf_("L", &dn, hdd.data(), &dn, &info);
             if (info != 0) return false;
             cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, d, 1., hdd.data(), d, w.data(), m);
@@ -275,7 +277,8 @@ private:
         Eigen::MatrixXd x2(m, a);
         cblas_dsymm(CblasColMajor, CblasLeft, CblasLower, m, a, 1., p.data(), m, u.data(), m, 0., x2.data(), m);
         cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans, a, a, m, -1., u.data(), m, x2.data(), m, 1., s.data(), a);
-        __LAPACK_int an = a, info = 0;
+        const __LAPACK_int an = a;
+        __LAPACK_int info = 0;
         dpotrf_("L", &an, s.data(), &an, &info); // s holds the Schur complement's Cholesky factor
         if (info != 0) return false;
         Eigen::MatrixXd v = x2;

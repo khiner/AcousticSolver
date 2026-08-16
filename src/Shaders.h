@@ -104,7 +104,7 @@ struct Speaker {
         ReadWav(wav_file);
         ReadObj(mesh_file, Obj.V0, Obj.F);
         Obj.V2 = Obj.V0;
-        if (anim_file != "") {
+        if (!anim_file.empty()) {
             Obj.AnimFile.open(anim_file);
             Obj.ReadAnimation();
         }
@@ -123,10 +123,10 @@ private:
 // Rigid, non-vibrating shader for animated occluders.
 struct Occluder {
     Occluder(int blend_rate, int shader_srate, double ts, const std::string &mesh_file, const std::string &anim_file)
-        : Obj(ShaderClass::Occluder, anim_file != "", blend_rate, shader_srate, ts) {
+        : Obj(ShaderClass::Occluder, !anim_file.empty(), blend_rate, shader_srate, ts) {
         ReadObj(mesh_file, Obj.V0, Obj.F);
         Obj.V2 = Obj.V0;
-        if (anim_file != "") {
+        if (!anim_file.empty()) {
             Obj.AnimFile.open(anim_file);
             Obj.ReadAnimation();
         }
@@ -182,7 +182,7 @@ struct Modal {
         Obj.V2 = Obj.V0;
         Obj.Tree.Init(Obj.V0, Obj.F);
 
-        if (anim_file != "") {
+        if (!anim_file.empty()) {
             Obj.AnimFile.open(anim_file);
             Obj.ReadAnimation();
         }

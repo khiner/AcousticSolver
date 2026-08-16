@@ -152,7 +152,7 @@ Total 762s → 437s (1.7×); 1170s → 437s (2.7×) vs the original straight tra
 
 What changed:
 
-- **Precomputed bubble mass-matrix factorizations** (`Source/BubbleFactorPipeline.h`).
+- **Precomputed bubble mass-matrix factorizations** (`src/BubbleFactorPipeline.h`).
   The coupled-bubble integrator re-factorizes two dense Cholesky systems at every bubble
   event (~32k refactors in GlassPour, avg N≈200) — the dominant cost of every bubble
   scene. The factor schedule depends only on static oscillator trajectory data and the
@@ -284,7 +284,7 @@ Total 414s → 381s (1170s → 381s, 3.1× vs the original straight translation)
 on a rested machine, PaddleSplash runs 54.0s (A/B against a round-3 build interleaved on
 the same rested machine: 81.5s → 54.0s, 1.5×).
 
-What changed — **chained endpoint inverses** (`Source/BubbleFactorPipeline.h`): when
+What changed — **chained endpoint inverses** (`src/BubbleFactorPipeline.h`): when
 interval k+1 starts exactly at interval k's endpoint (no event interval skipped between
 refactors — 13,882 of 13,888 successor intervals in PaddleSplash, 33,631 of 33,652 in
 GlassPour), the two mass matrices are evaluated at the same time and differ only by the

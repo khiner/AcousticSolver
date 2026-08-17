@@ -77,7 +77,7 @@ void Bubbles::Compute(GpuBuffer &vb, int global_bid) {
             auto &osc = Solver.Oscillators[ActiveOscIds[j]];
 
             if ((base.Step * base.Dt + base.Ts) > osc.EndTime && osc.IsDead()) continue;
-            const Eigen::ArrayXd data = osc.Interp(base.Step * base.Dt + base.Ts);
+            const auto data = osc.Interp(base.Step * base.Dt + base.Ts); // fixed-size: no heap temporary
             BubData[4 * j] = data[0]; // r
             BubData[4 * j + 1] = data[2]; // xbub
             BubData[4 * j + 2] = data[3]; // ybub

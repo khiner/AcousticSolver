@@ -16,11 +16,13 @@ using REAL = real; // tribox.h is written against a `REAL` scalar its includer s
 #include "tribox.h"
 
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <format>
 #include <iostream>
 #include <limits>
+#include <string_view>
 
 namespace {
 // Whether a cell state is solid at batch end (Rising converges to solid, Falling to air)
@@ -52,7 +54,7 @@ WaveBlender::WaveBlender(const SimParams &params)
     CellState.Cur().ResizeZeroed(GridSize * sizeof(uint8_t));
     CellState.Other().ResizeZeroed(GridSize * sizeof(uint8_t));
 
-    // Valid (unread) allocations for plain-path batches, which bind but never touch these
+    // Bound but never read by batches with no boundary faces
     ShaderFaces.Cur().ResizeZeroed(16);
     ShaderFaces.Other().ResizeZeroed(16);
 
@@ -162,6 +164,7 @@ bool WaveBlender::RunBatch() {
     if (Step >= (Params.Tf - Params.Ts) * Params.FdtdSrate) {
         MetalContext::Get().Sync(); // drain the final batch
         WritePendingListeners();
+        Faces.Report();
         return false;
     }
     if (Step == 0) InitializeListeners();
@@ -273,6 +276,12 @@ bool WaveBlender::RunBatch() {
         AnalyzeFreshCells();
     }
 
+    // Per batch, not per rasterization: probing at coarser granularity lets the two paths run
+    // in blocks at different GPU temperatures, which makes the comparison meaningless.
+    // SetupShaders' face tables stay valid until the shader points change, so either path
+    // can run on any batch.
+    FoldApply = PathTuner.Choose(NShaderPoints > 0, NRegularShaderPoints != NShaderPoints, NShaderPoints);
+
     // 5. Encode the batch's FDTD update (shader re-init + all timesteps) into a deferred
     // command buffer, committed now but gated on a shared event signaled after the host
     // fresh-cell writes below — the GPU has it scheduled and restarts the moment they land.
@@ -288,11 +297,16 @@ bool WaveBlender::RunBatch() {
     ctx.Sync();
     PathTuner.RecordDrained(ctx.TakeBatchGpuSeconds());
     {
-        const profile::Scope scope{"cpu/fresh_cell_velocity"};
-        SolveFreshCells();
+        // Host's share of the window the GPU waits out (gpu/idle_fdtd minus this is the
+        // shared event's signal latency)
+        const profile::Scope window{"cpu/sync_window"};
+        {
+            const profile::Scope scope{"cpu/fresh_cell_velocity"};
+            SolveFreshCells();
+        }
+        if (lazy_commit) ctx.CommitDeferred(); // prologue was committed by the sync's flush
+        ctx.SignalDeferred();
     }
-    if (lazy_commit) ctx.CommitDeferred(); // prologue was committed by the sync's flush
-    ctx.SignalDeferred();
     // The released batch fills the other listener slot, so the drained batch's samples
     // can be written to file with the GPU already running.
     WritePendingListeners();
@@ -641,42 +655,107 @@ void WaveBlender::SetupShaders() {
     ShaderData.Cur().Resize(size_t(MaxNShaderPoints) * NShaderSamples * sizeof(real));
     ShaderData.Cur().Zero(size_t(NShaderPoints) * NShaderSamples * sizeof(real));
 
-    // Boundary-application path for this batch (see KernelParams.h)
-    FoldApply = PathTuner.Choose(NShaderPoints > 0, NRegularShaderPoints != NShaderPoints, NShaderPoints);
-    if (!FoldApply) return;
+    if (NShaderPoints == 0) return;
 
-    // Per-cell face masks, shader-data row ids, and per-tile flags for the folded
-    // boundary application (layout in KernelParams.h). Row-id planes are read only where
-    // the mask bit is set, so only the mask and tile flags need clearing.
-    const size_t bids_base = ShaderFacesBidsOffset(size_t(GridSize));
-    const size_t tiles_base = ShaderFacesTilesOffset(size_t(GridSize));
+    // Per-cell face masks, packed row ids, and per-tile flags (layout in KernelParams.h).
+    // Slot and row ids are read only where a mask bit is set, so only mask and tiles clear.
+    const size_t slot_base = ShaderFacesSlotOffset(GridSize);
+    const size_t tiles_base = ShaderFacesTilesOffset(GridSize);
     const int ntx = FdtdTiles.x, nty = FdtdTiles.y, ntz = FdtdTiles.z;
+    const size_t n_tiles = size_t(ntx) * nty * ntz;
+    const size_t bids_base = ShaderFacesBidsOffset(GridSize, n_tiles);
+
     ShaderFaces.Flip();
-    ShaderFaces.Cur().Resize(tiles_base + size_t(ntx) * nty * ntz);
+    ShaderFaces.Cur().Resize(bids_base + size_t(MaxNShaderPoints) * sizeof(int));
     auto *mask = static_cast<uint8_t *>(ShaderFaces.Cur().RawData());
-    std::memset(mask, 0, bids_base);
-    auto *bids = reinterpret_cast<int *>(mask + bids_base);
+    auto *slot = reinterpret_cast<int *>(mask + slot_base);
     auto *tiles = mask + tiles_base;
-    std::memset(tiles, 0, size_t(ntx) * nty * ntz);
-    const auto mark_tile = [&](int i, int j, int k) { tiles[FdtdTileIndex(i / int(FdtdTg.x), j / int(FdtdTg.y), k / int(FdtdTg.z), ntx, nty)] = 1; };
+    auto *bids = reinterpret_cast<int *>(mask + bids_base);
+    std::memset(mask, 0, slot_base);
+    std::memset(tiles, 0, n_tiles);
+
+    // Pass 1: mask bits, tile flags, and the face cells in first-touch order. Only the owning
+    // tile needs flagging — a thread reads no mask but its own.
+    FaceCells.clear();
+    for (const int entry : ShaderMapHost) {
+        const int face = entry < 0 ? -entry : entry;
+        const int dir = face % 3, cid = face / 3;
+        if (mask[cid] == 0) {
+            FaceCells.push_back(cid);
+            const int i = cid % Params.Nx, j = (cid / Params.Nx) % Params.Ny, k = (cid / Params.Nx) / Params.Ny;
+            tiles[FdtdTileIndex(i / int(FdtdTg.x), j / int(FdtdTg.y), k / int(FdtdTg.z), ntx, nty)] = 1;
+        }
+        mask[cid] |= 1u << (dir + (entry < 0 ? 3 : 0)); // Blend planes 0-2, force planes 3-5
+    }
+    // Pass 2: pack each face cell's row ids contiguously, indexed by mask popcount
+    int next_slot = 0;
+    for (const int cid : FaceCells) {
+        slot[cid] = next_slot;
+        next_slot += std::popcount(mask[cid]);
+    }
     for (int bid = 0; bid < NShaderPoints; ++bid) {
         const int entry = ShaderMapHost[bid];
-        const bool is_force = entry < 0;
-        const int face = is_force ? -entry : entry;
+        const int face = entry < 0 ? -entry : entry;
         const int dir = face % 3, cid = face / 3;
-        const int plane = dir + (is_force ? 3 : 0);
-        mask[cid] |= 1u << plane;
-        bids[plane * size_t(GridSize) + cid] = bid;
-
-        // Flag every tile whose threads read this cell's mask: its own, and the upper
-        // neighbors that read it as their lower halo (shader faces are never at the
-        // outermost grid layer)
-        const int i = cid % Params.Nx, j = (cid / Params.Nx) % Params.Ny, k = (cid / Params.Nx) / Params.Ny;
-        mark_tile(i, j, k);
-        mark_tile(i + 1, j, k);
-        mark_tile(i, j + 1, k);
-        mark_tile(i, j, k + 1);
+        const int plane = dir + (entry < 0 ? 3 : 0);
+        bids[slot[cid] + std::popcount(uint8_t(mask[cid] & ((1u << plane) - 1u)))] = bid;
     }
+
+    if (profile::Enabled()) {
+        Faces.PeakPoints = std::max(Faces.PeakPoints, NShaderPoints);
+        Faces.Batches += 1;
+        Faces.TotalTiles += n_tiles;
+        Faces.FlaggedTiles += std::count(tiles, tiles + n_tiles, uint8_t{1});
+    }
+}
+
+bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces, int npoints) {
+    constexpr int ProbesPerPath{4};
+
+    // ACOUSTIC_APPLY_PATH=plain|folded pins the path, for whole-scene A/B of the two.
+    static const char *const forced = std::getenv("ACOUSTIC_APPLY_PATH");
+    if (forced) return has_points && std::string_view{forced} == "folded";
+
+    SeenForces |= has_forces;
+    const uint32_t key = uint32_t(has_points) | (SeenForces ? 2u : 0u);
+    // Re-open probing when the boundary-application load has drifted far from where the
+    // lock was measured (impulse counts can grow through a scene, shifting the balance).
+    const bool points_drifted = Locked >= 0 && (npoints > 2 * LockedPoints || 2 * npoints < LockedPoints);
+    if (key != Key || points_drifted) {
+        Key = key;
+        Locked = -1;
+        BestSeconds[0] = BestSeconds[1] = std::numeric_limits<double>::max();
+        ProbeCount[0] = ProbeCount[1] = 0;
+        InFlightFold = -1;
+    }
+    if (!has_points) return false;
+    if (Locked >= 0) return Locked == 1;
+
+    if (ProbeCount[0] >= ProbesPerPath && ProbeCount[1] >= ProbesPerPath) {
+        Locked = BestSeconds[1] < BestSeconds[0] ? 1 : 0;
+        LockedPoints = npoints;
+        if (profile::Enabled()) {
+            std::cout << std::format("[apply-path] locked {} (plain {:.2f} ms, folded {:.2f} ms per batch)\n", Locked == 1 ? "folded" : "plain", BestSeconds[0] * 1e3, BestSeconds[1] * 1e3);
+        }
+        return Locked == 1;
+    }
+    return ProbeCount[1] < ProbeCount[0];
+}
+
+void WaveBlender::ApplyPathTuner::MarkInFlight(bool fold) {
+    if (Locked < 0) InFlightFold = fold;
+}
+
+void WaveBlender::ApplyPathTuner::RecordDrained(double gpu_seconds) {
+    if (InFlightFold < 0) return;
+    BestSeconds[InFlightFold] = std::min(BestSeconds[InFlightFold], gpu_seconds);
+    ProbeCount[InFlightFold] += 1;
+    InFlightFold = -1;
+}
+
+void WaveBlender::FaceLoad::Report() const {
+    if (!profile::Enabled() || Batches == 0) return;
+    std::cout << std::format("[shader-faces] peak {} points, {:.1f}% of tiles flagged (mean {:.0f} of {:.0f})\n", PeakPoints, 100. * double(FlaggedTiles) / double(TotalTiles), double(FlaggedTiles) / double(Batches), double(TotalTiles) / double(Batches));
 }
 
 void WaveBlender::FreshCellPressure() {
@@ -887,55 +966,14 @@ void WaveBlender::ShaderReInit() {
     MetalContext::Get().Dispatch("ShaderReInit", shader_blocks, shader_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &ShaderData.Cur(), &ShaderMap.Cur()}, &params, sizeof(params));
 }
 
-bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces, int npoints) {
-    constexpr int ProbesPerPath{4};
-
-    SeenForces |= has_forces;
-    const uint32_t key = uint32_t(has_points) | (SeenForces ? 2u : 0u);
-    // Re-open probing when the boundary-application load has drifted far from where the
-    // lock was measured (impulse counts can grow through a scene, shifting the balance).
-    const bool points_drifted = Locked >= 0 && (npoints > 2 * LockedPoints || 2 * npoints < LockedPoints);
-    if (key != Key || points_drifted) {
-        Key = key;
-        Locked = -1;
-        BestSeconds[0] = BestSeconds[1] = std::numeric_limits<double>::max();
-        ProbeCount[0] = ProbeCount[1] = 0;
-        InFlightFold = -1;
-    }
-    if (!has_points) return false; // no boundary application either way
-    if (Locked >= 0) return Locked == 1;
-
-    if (ProbeCount[0] >= ProbesPerPath && ProbeCount[1] >= ProbesPerPath) {
-        // On a within-noise tie with force points present, prefer folded: its overhead is
-        // fixed, while plain's scattered force applies degrade as the impulse load grows.
-        Locked = BestSeconds[1] < BestSeconds[0] * (SeenForces ? 1.03 : 1.0) ? 1 : 0;
-        LockedPoints = npoints;
-        if (profile::Enabled()) {
-            std::cout << std::format("[apply-path] locked {} (plain {:.1f} ms, folded {:.1f} ms per batch)\n", Locked == 1 ? "folded" : "plain", BestSeconds[0] * 1e3, BestSeconds[1] * 1e3);
-        }
-        return Locked == 1;
-    }
-    return ProbeCount[1] < ProbeCount[0];
-}
-
-void WaveBlender::ApplyPathTuner::MarkInFlight(bool fold) {
-    if (Locked < 0) InFlightFold = fold;
-}
-
-void WaveBlender::ApplyPathTuner::RecordDrained(double gpu_seconds) {
-    if (InFlightFold < 0) return;
-    BestSeconds[InFlightFold] = std::min(BestSeconds[InFlightFold], gpu_seconds);
-    ProbeCount[InFlightFold] += 1;
-    InFlightFold = -1;
-}
-
 // Encodes all timesteps of the batch into the deferred command buffer with a persistent
-// argument table. Each step's sequence is [pressure, boundary application, velocity].
-// With the boundary application folded in and beta derived in-kernel, the loop is one
-// full-grid pass per step (the fused StepVelocityPressure kernel), book-ended by a
-// StepPressure prologue and a StepVelocity tail:
-//   P(0) | [V(0),P(1)] | ... | [V(N-2),P(N-1)] | V(N-1)
-// The dispatch computing V(q) gets step q's params (tb, ss, and the listener slot for p(q)).
+// argument table. Each step's sequence is [pressure, boundary application, velocity]. With
+// beta derived in-kernel, the loop is one full-grid pass per step (the fused
+// StepVelocityPressure kernel), book-ended by a StepPressure prologue and a StepVelocity tail:
+//   P(0) | apply(0) | [V(0),P(1)] | ... | [V(N-2),P(N-1)] | V(N-1)
+// The dispatch computing V(q) gets step q's params (tb, ss, and the listener slot for p(q)),
+// plus, on the folded path, step q+1's — so only step 0 needs its own apply dispatch there.
+// On the plain path every step's application is a standalone dispatch.
 void WaveBlender::RunFdtd() {
     const profile::Scope scope{"encode/fdtd"};
     auto &ctx = MetalContext::Get();
@@ -945,13 +983,8 @@ void WaveBlender::RunFdtd() {
 
     auto *pressure_pso = ctx.Pipeline("StepPressure");
     auto *fused_pso = ctx.Pipeline("StepVelocityPressure", FoldApply);
-    auto *velocity_pso = ctx.Pipeline("StepVelocity", FoldApply);
-    auto *shader_pso = FoldApply ? nullptr : ctx.Pipeline("ApplyShader");
-
-    // Standalone boundary application (plain path): blend range then force range, so a
-    // dual-claimed face updates in a defined order.
-    const MTL::Size shader_threads{32, 1, 1};
-    const ApplyShaderRange shader_ranges[2]{{0, NRegularShaderPoints}, {NRegularShaderPoints, NShaderPoints}};
+    auto *velocity_pso = ctx.Pipeline("StepVelocity");
+    auto *shader_pso = NShaderPoints > 0 ? ctx.Pipeline("ApplyShader") : nullptr;
 
     ListenerOut.Flip(); // this batch's samples fill the spare slot (see WritePendingListeners)
 
@@ -964,7 +997,7 @@ void WaveBlender::RunFdtd() {
         if (table[index]) encoder->setBuffer(table[index]->Handle(), 0, index);
     }
 
-    const FdtdBatchParams batch_params{RhoCcDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size()), int(FdtdTiles.x), int(FdtdTiles.y)};
+    const FdtdBatchParams batch_params{RhoCcDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size()), int(FdtdTiles.x), int(FdtdTiles.y), int(FdtdTiles.z)};
     encoder->setBytes(&batch_params, sizeof(batch_params), FdtdBatchParamsIndex);
 
     const auto bind_fields = [&] { // in slots 0, 4-6; out slots 21-24
@@ -977,34 +1010,41 @@ void WaveBlender::RunFdtd() {
         encoder->setBuffer(Vy.Other().Handle(), 0, 23);
         encoder->setBuffer(Vz.Other().Handle(), 0, 24);
     };
-    // The pending step's boundary application, as standalone dispatches (plain path)
-    const auto apply_dispatches = [&] {
-        if (FoldApply || NShaderPoints == 0) return;
-        encoder->setComputePipelineState(shader_pso);
-        for (const auto &range : shader_ranges) {
-            if (range.Start == range.End) continue;
-            encoder->setBytes(&range, sizeof(range), FdtdApplyRangeIndex);
-            encoder->dispatchThreadgroups(MTL::Size{uint32_t(range.End - range.Start + 31) / 32, 1, 1}, shader_threads);
-        }
-    };
-    // Step params of step q, consumed by the dispatch that computes V(q).
-    const auto set_step_params = [&](int q) {
+    const auto step_params = [&](int q) {
         const real t = (q + 1 == NFdtdSamples) ? 1. : real(q + 1) / NFdtdSamples; // normalized blending time (0, 1]
         const real ss = t * (NShaderSamples - 1); // shader sample index (fractional to support interpolation)
         const real tb = (Params.Scheme == BlendScheme::NoBlend && q + 1 != NFdtdSamples) ? 0. : t;
-        const FdtdStepParams step_params{tb, ss, q};
-        encoder->setBytes(&step_params, sizeof(step_params), FdtdStepParamsIndex);
+        return FdtdStepParams{tb, ss, q};
+    };
+
+    // Blend range then force range, so a dual-claimed face updates in a defined order. The
+    // folded path needs this only for step 0.
+    const auto apply_dispatches = [&](int q) {
+        if (!shader_pso) return;
+        const FdtdStepParams params = step_params(q);
+        encoder->setBytes(&params, sizeof(params), FdtdStepParamsIndex);
+        encoder->setComputePipelineState(shader_pso);
+        for (const ApplyShaderRange range : {ApplyShaderRange{0, NRegularShaderPoints}, ApplyShaderRange{NRegularShaderPoints, NShaderPoints}}) {
+            if (range.Start == range.End) continue;
+            encoder->setBytes(&range, sizeof(range), FdtdApplyRangeIndex);
+            encoder->dispatchThreadgroups(MTL::Size{uint32_t(range.End - range.Start + 31) / 32, 1, 1}, MTL::Size{32, 1, 1});
+        }
     };
 
     // Prologue: P(0) (in-place, before step 0's boundary application)
     bind_fields();
     encoder->setComputePipelineState(pressure_pso);
     encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
+    apply_dispatches(0);
 
     for (int q = 1; q < NFdtdSamples; ++q) {
-        set_step_params(q - 1);
-        apply_dispatches();
-
+        if (!FoldApply && q > 1) apply_dispatches(q - 1);
+        const FdtdStepParams cur = step_params(q - 1);
+        encoder->setBytes(&cur, sizeof(cur), FdtdStepParamsIndex);
+        if (FoldApply) {
+            const FdtdStepParams next = step_params(q);
+            encoder->setBytes(&next, sizeof(next), FdtdNextStepParamsIndex);
+        }
         encoder->setComputePipelineState(fused_pso);
         encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
         P.Flip();
@@ -1015,8 +1055,9 @@ void WaveBlender::RunFdtd() {
     }
 
     // Tail: V(N-1) (in-place) and the final listener sample p(N-1)
-    set_step_params(NFdtdSamples - 1);
-    apply_dispatches();
+    if (!FoldApply) apply_dispatches(NFdtdSamples - 1);
+    const FdtdStepParams last = step_params(NFdtdSamples - 1);
+    encoder->setBytes(&last, sizeof(last), FdtdStepParamsIndex);
     encoder->setComputePipelineState(velocity_pso);
     encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
 

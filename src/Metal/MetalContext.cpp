@@ -54,13 +54,13 @@ MetalContext::MetalContext() : Device(MTL::CreateSystemDefaultDevice()) {
     if (!Library) throw std::runtime_error(std::format("MSL compilation failed:\n{}", error ? error->localizedDescription()->utf8String() : "unknown error"));
 }
 
-MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool fold_apply) {
-    const std::string key = fold_apply ? std::string{name} + "#fold" : std::string{name};
+MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool apply_faces) {
+    const std::string key = apply_faces ? std::string{name} + "#faces" : std::string{name};
     if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
 
     const profile::Scope scope{"startup/pipeline_create"};
     auto *constants = MTL::FunctionConstantValues::alloc()->init();
-    constants->setConstantValue(&fold_apply, MTL::DataTypeBool, NS::UInteger{FoldApplyFcIndex});
+    constants->setConstantValue(&apply_faces, MTL::DataTypeBool, NS::UInteger{ApplyFacesFcIndex});
     NS::Error *fn_error{nullptr};
     auto *fn = Library->newFunction(NS::String::string(name, NS::UTF8StringEncoding), constants, &fn_error);
     constants->release();
@@ -172,13 +172,21 @@ void MetalContext::Sync() {
         }
         exec.Count += Committed.size();
 
-        // GPU idle between consecutive command buffers (commit order) — the batch
-        // loop's pipeline bubbles, measurable independent of machine load
+        // GPU idle between consecutive command buffers (commit order) — the batch loop's
+        // pipeline bubbles, measurable independent of machine load. `idle_prologue` is pure
+        // command-buffer handoff (committed long before), `idle_fdtd` the host sync window.
         auto &idle = profile::Entries()["gpu/idle"];
+        auto &idle_fdtd = profile::Entries()["gpu/idle_fdtd"];
+        auto &idle_prologue = profile::Entries()["gpu/idle_prologue"];
         for (const auto &[cb, deferred] : Committed) {
-            if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+            auto &split = deferred ? idle_fdtd : idle_prologue;
+            if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) {
+                idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+                split.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+            }
             PrevGpuEndTime = cb->GPUEndTime();
             idle.Count += 1;
+            split.Count += 1;
         }
     }
     for (const auto &[cb, deferred] : Committed) cb->release();

@@ -14,9 +14,7 @@ using namespace metal;
 
 using real = float;
 
-// Fold the pending boundary application into the velocity updates. When false, the host
-// runs standalone ApplyShader dispatches and the mask logic below compiles out.
-constant bool FoldApply [[function_constant(FoldApplyFcIndex)]];
+constant bool ApplyFaces [[function_constant(ApplyFacesFcIndex)]];
 
 constant int XDir = 0;
 constant int YDir = 1;
@@ -115,8 +113,8 @@ inline real ShaderValue(int bid, device const real *shader_data, constant FdtdBa
     return (hi - frac) * shader_data[lo] + (frac - lo) * shader_data[hi];
 }
 
-// Standalone boundary application (the Eq. 8b boundary-conditions term), dispatched before
-// the velocity update of the step it belongs to.
+// Standalone boundary application (the Eq. 8b boundary-conditions term). Indexed by shader
+// point rather than by face, so a dual-claimed face needs the host's two ordered ranges.
 kernel void ApplyShader(device real *vx [[buffer(4)]], device real *vy [[buffer(5)]], device real *vz [[buffer(6)]],
                         device const uchar *state [[buffer(8)]],
                         device const real *shader_data [[buffer(13)]], device const int *shader_map [[buffer(14)]],
@@ -153,28 +151,42 @@ kernel void ApplyShader(device real *vx [[buffer(4)]], device real *vy [[buffer(
     }
 }
 
-// The ShaderFaces row-id planes (layout in KernelParams.h).
-inline device const int *FaceBids(device const uchar *face_mask, int g) {
-    return (device const int *)(face_mask + ShaderFacesBidsOffset(g));
+// Layout in KernelParams.h.
+struct ShaderFaces {
+    device const uchar *Mask;
+    device const int *Slot;
+    device const uchar *Tiles;
+    device const int *Bids;
+};
+inline ShaderFaces FacesOf(device const uchar *buffer, constant FdtdBatchParams &batch) {
+    const int g = batch.Nx * batch.Ny * batch.Nz;
+    const int n_tiles = batch.NTilesX * batch.NTilesY * batch.NTilesZ;
+    return {
+        buffer,
+        (device const int *)(buffer + ShaderFacesSlotOffset(g)),
+        buffer + ShaderFacesTilesOffset(g),
+        (device const int *)(buffer + ShaderFacesBidsOffset(g, n_tiles)),
+    };
 }
 
-// Whether this threadgroup's tile can read a nonzero face mask.
-inline bool TileFlagged(device const uchar *face_mask, int g, constant FdtdBatchParams &batch, uint3 tgid) {
-    return face_mask[ShaderFacesTilesOffset(g) + FdtdTileIndex(tgid.x, tgid.y, tgid.z, batch.NTilesX, batch.NTilesY)] != 0;
+inline bool TileFlagged(ShaderFaces faces, constant FdtdBatchParams &batch, uint3 tgid) {
+    return faces.Tiles[FdtdTileIndex(tgid.x, tgid.y, tgid.z, batch.NTilesX, batch.NTilesY)] != 0;
 }
 
-// The pending boundary application for the face at `cid` in direction `dir`, folded into a
-// velocity read. Same arithmetic as ApplyShader.
-inline real ApplyPending(real v, real beta_face, int dir, int cid, uchar mask,
-                         device const int *face_bids, device const real *shader_data,
-                         constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
-    int g = batch.Nx * batch.Ny * batch.Nz;
-    if (FoldApply && (mask & (1u << dir))) { // Pending blend
-        real val = ShaderValue(face_bids[dir * g + cid], shader_data, batch, step);
+inline int FaceBid(ShaderFaces faces, int cid, uchar mask, int plane) {
+    return faces.Bids[faces.Slot[cid] + popcount(uint(mask) & ((1u << plane) - 1u))];
+}
+
+// The pending boundary application for the face at `cid` in direction `dir`. Same
+// arithmetic, and the same blend-before-force order, as ApplyShader.
+inline real ApplyPending(real v, real beta_face, int dir, int cid, uchar mask, ShaderFaces faces,
+                         device const real *shader_data, constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
+    if (mask & (1u << dir)) { // Pending blend
+        real val = ShaderValue(FaceBid(faces, cid, mask, dir), shader_data, batch, step);
         v += beta_face * (val - v);
     }
-    if (FoldApply && (mask & (1u << (dir + 3)))) { // Pending force
-        real val = ShaderValue(face_bids[(3 + dir) * g + cid], shader_data, batch, step);
+    if (mask & (1u << (dir + 3))) { // Pending force
+        real val = ShaderValue(FaceBid(faces, cid, mask, dir + 3), shader_data, batch, step);
         v += (1.f - beta_face) * val * batch.InvRhoDt;
     }
     return v;
@@ -182,9 +194,8 @@ inline real ApplyPending(real v, real beta_face, int dir, int cid, uchar mask,
 
 // One face's blended velocity update (Eq. 8b from [Xue et al. 2024]), for the face stored
 // at cell (i, j, k). Shared by StepVelocity and the fused step so both compile identical
-// arithmetic.
+// arithmetic. Any pending boundary application already landed on the velocity read here.
 inline real FaceVelocityX(int i, int j, int k, device const real *p, device const real *vx, device const uchar *state,
-                          uchar mask, device const int *face_bids, device const real *shader_data,
                           constant real *pml_n, constant real *pml_d,
                           constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
@@ -195,12 +206,10 @@ inline real FaceVelocityX(int i, int j, int k, device const real *p, device cons
     real beta_r = (i < batch.Nx - 1) ? BetaOf(state[Cid(i + 1, j, k, batch.Nx, batch.Ny)], step.Tb) : 1.f;
     real gradx = (p_r - p_c) * batch.InvDx;
     real betax = max(beta, beta_r);
-    real v = ApplyPending(vx[cid], betax, XDir, cid, mask, face_bids, shader_data, batch, step);
     // pml_n = 1. and pml_d = 1. / (1. + damping) outside the PML layer
-    return (pml_n[min_xdist] * v - (1.f - betax) * batch.InvRhoDt * gradx) * pml_d[min_xdist];
+    return (pml_n[min_xdist] * vx[cid] - (1.f - betax) * batch.InvRhoDt * gradx) * pml_d[min_xdist];
 }
 inline real FaceVelocityY(int i, int j, int k, device const real *p, device const real *vy, device const uchar *state,
-                          uchar mask, device const int *face_bids, device const real *shader_data,
                           constant real *pml_n, constant real *pml_d,
                           constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
@@ -211,11 +220,9 @@ inline real FaceVelocityY(int i, int j, int k, device const real *p, device cons
     real beta_u = (j < batch.Ny - 1) ? BetaOf(state[Cid(i, j + 1, k, batch.Nx, batch.Ny)], step.Tb) : 1.f;
     real grady = (p_u - p_c) * batch.InvDx;
     real betay = max(beta, beta_u);
-    real v = ApplyPending(vy[cid], betay, YDir, cid, mask, face_bids, shader_data, batch, step);
-    return (pml_n[min_ydist] * v - (1.f - betay) * batch.InvRhoDt * grady) * pml_d[min_ydist];
+    return (pml_n[min_ydist] * vy[cid] - (1.f - betay) * batch.InvRhoDt * grady) * pml_d[min_ydist];
 }
 inline real FaceVelocityZ(int i, int j, int k, device const real *p, device const real *vz, device const uchar *state,
-                          uchar mask, device const int *face_bids, device const real *shader_data,
                           constant real *pml_n, constant real *pml_d,
                           constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
@@ -226,33 +233,27 @@ inline real FaceVelocityZ(int i, int j, int k, device const real *p, device cons
     real beta_b = (k < batch.Nz - 1) ? BetaOf(state[Cid(i, j, k + 1, batch.Nx, batch.Ny)], step.Tb) : 1.f;
     real gradz = (p_b - p_c) * batch.InvDx;
     real betaz = max(beta, beta_b);
-    real v = ApplyPending(vz[cid], betaz, ZDir, cid, mask, face_bids, shader_data, batch, step);
-    return (pml_n[min_zdist] * v - (1.f - betaz) * batch.InvRhoDt * gradz) * pml_d[min_zdist];
+    return (pml_n[min_zdist] * vz[cid] - (1.f - betaz) * batch.InvRhoDt * gradz) * pml_d[min_zdist];
 }
 
 // Blended velocity update kernel: the pressure gradient term (Eq. 8b from [Xue et al. 2024]),
-// with the pending boundary application folded into the velocity reads. Also samples the
-// pressure field at listener cells into the listener output buffer.
+// also sampling the pressure field at listener cells. Runs as the batch tail, where nothing
+// consumes the velocities afterwards, so no boundary application folds in.
 kernel void StepVelocity(device const real *p [[buffer(0)]],
                          device real *vx [[buffer(4)]], device real *vy [[buffer(5)]], device real *vz [[buffer(6)]],
-                         device const uchar *face_mask [[buffer(7)]], device const uchar *state [[buffer(8)]],
+                         device const uchar *state [[buffer(8)]],
                          constant real *pml_n [[buffer(11)]], constant real *pml_d [[buffer(12)]],
-                         device const real *shader_data [[buffer(13)]],
                          constant int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
                          constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
                          constant FdtdStepParams &step [[buffer(FdtdStepParamsIndex)]],
-                         uint3 tid [[thread_position_in_grid]],
-                         uint3 tgid [[threadgroup_position_in_grid]]) {
+                         uint3 tid [[thread_position_in_grid]]) {
     int i = tid.x, j = tid.y, k = tid.z;
     if (i >= batch.Nx || j >= batch.Ny || k >= batch.Nz) return;
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
-    int g = batch.Nx * batch.Ny * batch.Nz;
-    device const int *face_bids = FaceBids(face_mask, g);
-    uchar mask_c = (FoldApply && TileFlagged(face_mask, g, batch, tgid)) ? face_mask[cid] : 0;
 
-    vx[cid] = FaceVelocityX(i, j, k, p, vx, state, mask_c, face_bids, shader_data, pml_n, pml_d, batch, step);
-    vy[cid] = FaceVelocityY(i, j, k, p, vy, state, mask_c, face_bids, shader_data, pml_n, pml_d, batch, step);
-    vz[cid] = FaceVelocityZ(i, j, k, p, vz, state, mask_c, face_bids, shader_data, pml_n, pml_d, batch, step);
+    vx[cid] = FaceVelocityX(i, j, k, p, vx, state, pml_n, pml_d, batch, step);
+    vy[cid] = FaceVelocityY(i, j, k, p, vy, state, pml_n, pml_d, batch, step);
+    vz[cid] = FaceVelocityZ(i, j, k, p, vz, state, pml_n, pml_d, batch, step);
 
     // Listener sampling (p is unchanged by the velocity update)
     for (int l = 0; l < batch.NListeners; ++l) {
@@ -260,12 +261,12 @@ kernel void StepVelocity(device const real *p [[buffer(0)]],
     }
 }
 
-// Fused step: the velocity update at step s, with step s's pending boundary application
-// folded into the velocity reads, followed by the pressure update at step s + 1, in one
-// full-grid pass. Each thread computes all six face velocities its cell's divergence needs
-// (the three lower faces recompute bit-identically in their owning threads via the shared
-// FaceVelocity* functions), writes its own three, then updates its pressure from the fresh
-// divergence.
+// Fused step: the velocity update at step s followed by the pressure update at step s + 1,
+// in one full-grid pass. Each thread computes all six face velocities its cell's divergence
+// needs (the three lower faces recompute bit-identically in their owning threads), writes
+// its own three, then updates its pressure. Step s + 1's boundary application lands on those
+// writes, but the pressure update deliberately uses the untransformed velocities, matching
+// the reference's [pressure, boundary application, velocity] step order.
 //
 // Reads p(s) and v from the in slots and writes p(s+1) and v(s) to the out slots (the host
 // ping-pongs the bindings per step) — neighbor reads would otherwise race in-kernel writes.
@@ -273,7 +274,7 @@ kernel void StepVelocity(device const real *p [[buffer(0)]],
 kernel void StepVelocityPressure(device const real *p [[buffer(0)]],
                                  device real *px [[buffer(1)]], device real *py [[buffer(2)]], device real *pz [[buffer(3)]],
                                  device const real *vx [[buffer(4)]], device const real *vy [[buffer(5)]], device const real *vz [[buffer(6)]],
-                                 device const uchar *face_mask [[buffer(7)]], device const uchar *state [[buffer(8)]],
+                                 device const uchar *shader_faces [[buffer(7)]], device const uchar *state [[buffer(8)]],
                                  constant real *pml_np [[buffer(9)]], constant real *pml_dp [[buffer(10)]],
                                  constant real *pml_nv [[buffer(11)]], constant real *pml_dv [[buffer(12)]],
                                  device const real *shader_data [[buffer(13)]],
@@ -282,37 +283,43 @@ kernel void StepVelocityPressure(device const real *p [[buffer(0)]],
                                  device real *vx_out [[buffer(22)]], device real *vy_out [[buffer(23)]], device real *vz_out [[buffer(24)]],
                                  constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
                                  constant FdtdStepParams &step [[buffer(FdtdStepParamsIndex)]],
+                                 constant FdtdStepParams &next [[buffer(FdtdNextStepParamsIndex)]],
                                  uint3 tid [[thread_position_in_grid]],
                                  uint3 tgid [[threadgroup_position_in_grid]]) {
     int i = tid.x, j = tid.y, k = tid.z;
     if (i >= batch.Nx || j >= batch.Ny || k >= batch.Nz) return;
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
-    int g = batch.Nx * batch.Ny * batch.Nz;
-    device const int *face_bids = FaceBids(face_mask, g);
 
-    // Face masks for this cell and its lower halo, skipped wholesale for tiles without
-    // shader faces in reach
-    uchar mask_c = 0, mask_l = 0, mask_d = 0, mask_f = 0;
-    if (FoldApply && TileFlagged(face_mask, g, batch, tgid)) {
-        mask_c = face_mask[cid];
-        if (i > 0) mask_l = face_mask[cid - 1];
-        if (j > 0) mask_d = face_mask[cid - batch.Nx];
-        if (k > 0) mask_f = face_mask[cid - batch.Nx * batch.Ny];
-    }
+    // Face mask first: the velocity stores depend on it, so loading it here lets the
+    // velocity arithmetic cover its latency. Unflagged tiles never touch the mask.
+    const ShaderFaces faces = ApplyFaces ? FacesOf(shader_faces, batch) : ShaderFaces{nullptr, nullptr, nullptr, nullptr};
+    const uchar mask = (ApplyFaces && TileFlagged(faces, batch, tgid)) ? faces.Mask[cid] : 0;
 
     // ----- Velocity update at step s: this cell's faces, plus the lower faces its
     // divergence needs -----
-    real vx_c = FaceVelocityX(i, j, k, p, vx, state, mask_c, face_bids, shader_data, pml_nv, pml_dv, batch, step);
-    real vy_c = FaceVelocityY(i, j, k, p, vy, state, mask_c, face_bids, shader_data, pml_nv, pml_dv, batch, step);
-    real vz_c = FaceVelocityZ(i, j, k, p, vz, state, mask_c, face_bids, shader_data, pml_nv, pml_dv, batch, step);
-    real vx_l = (i > 0) ? FaceVelocityX(i - 1, j, k, p, vx, state, mask_l, face_bids, shader_data, pml_nv, pml_dv, batch, step) : 0.f; // LEFT
-    real vy_d = (j > 0) ? FaceVelocityY(i, j - 1, k, p, vy, state, mask_d, face_bids, shader_data, pml_nv, pml_dv, batch, step) : 0.f; // DOWN
-    real vz_f = (k > 0) ? FaceVelocityZ(i, j, k - 1, p, vz, state, mask_f, face_bids, shader_data, pml_nv, pml_dv, batch, step) : 0.f; // FRONT
+    real vx_c = FaceVelocityX(i, j, k, p, vx, state, pml_nv, pml_dv, batch, step);
+    real vy_c = FaceVelocityY(i, j, k, p, vy, state, pml_nv, pml_dv, batch, step);
+    real vz_c = FaceVelocityZ(i, j, k, p, vz, state, pml_nv, pml_dv, batch, step);
+    real vx_l = (i > 0) ? FaceVelocityX(i - 1, j, k, p, vx, state, pml_nv, pml_dv, batch, step) : 0.f; // LEFT
+    real vy_d = (j > 0) ? FaceVelocityY(i, j - 1, k, p, vy, state, pml_nv, pml_dv, batch, step) : 0.f; // DOWN
+    real vz_f = (k > 0) ? FaceVelocityZ(i, j, k - 1, p, vz, state, pml_nv, pml_dv, batch, step) : 0.f; // FRONT
 
     real p_s = p[cid]; // p(s), for the listener sample
-    vx_out[cid] = vx_c;
-    vy_out[cid] = vy_c;
-    vz_out[cid] = vz_c;
+
+    // ----- Step s + 1's boundary application, onto the faces this thread writes -----
+    if (ApplyFaces && mask) {
+        const real beta_c = BetaOf(state[cid], next.Tb);
+        const real beta_x = max(beta_c, (i < batch.Nx - 1) ? BetaOf(state[Cid(i + 1, j, k, batch.Nx, batch.Ny)], next.Tb) : 1.f);
+        const real beta_y = max(beta_c, (j < batch.Ny - 1) ? BetaOf(state[Cid(i, j + 1, k, batch.Nx, batch.Ny)], next.Tb) : 1.f);
+        const real beta_z = max(beta_c, (k < batch.Nz - 1) ? BetaOf(state[Cid(i, j, k + 1, batch.Nx, batch.Ny)], next.Tb) : 1.f);
+        vx_out[cid] = ApplyPending(vx_c, beta_x, XDir, cid, mask, faces, shader_data, batch, next);
+        vy_out[cid] = ApplyPending(vy_c, beta_y, YDir, cid, mask, faces, shader_data, batch, next);
+        vz_out[cid] = ApplyPending(vz_c, beta_z, ZDir, cid, mask, faces, shader_data, batch, next);
+    } else {
+        vx_out[cid] = vx_c;
+        vy_out[cid] = vy_c;
+        vz_out[cid] = vz_c;
+    }
 
     for (int l = 0; l < batch.NListeners; ++l) {
         if (cid == listener_cids[l]) listener_out[step.SampleIndex * batch.NListeners + l] = p_s;

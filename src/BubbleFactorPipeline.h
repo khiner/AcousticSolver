@@ -19,6 +19,7 @@
 // halves the load on the saturated matrix units, the throughput floor of bubble scenes.
 
 #include "FluidSound.h"
+#include "Parallel.h"
 #include "Profile.h"
 
 #define ACCELERATE_NEW_LAPACK
@@ -90,21 +91,24 @@ private:
         e.R = (1. - alpha) * sd1.row(0).transpose() + alpha * sd2.row(0).transpose();
     }
 
-    // Mass matrix with CoupledDirect::ConstructMass's entry arithmetic, lower triangle
-    // only (all Invert reads). Serial: a parallel fill from every worker at once would
-    // thrash the dispatch pool.
+    // Mass matrix with CoupledDirect::ConstructMass's entry arithmetic, lower triangle only
+    // (all Invert reads). Divide- and sqrt-throughput bound rather than matrix-unit bound, so
+    // the column split runs alongside the other workers' LAPACK rather than competing with
+    // it. Each entry is written once from read-only inputs, so the split is bit-identical.
     static void ConstructMassLower(const EndpointData &e, Eigen::MatrixXd &m) {
         const int n = int(e.R.size());
         m.resize(n, n);
-        for (int i = 0; i < n; ++i) {
-            m(i, i) = 1.;
-            const int len = n - i - 1;
-            if (len <= 0) continue;
-            const auto dx = e.Cx.segment(i + 1, len) - e.Cx(i);
-            const auto dy = e.Cy.segment(i + 1, len) - e.Cy(i);
-            const auto dz = e.Cz.segment(i + 1, len) - e.Cz(i);
-            m.col(i).segment(i + 1, len).array() = ((dx * dx + dy * dy + dz * dz) / (e.R(i) * e.R.segment(i + 1, len)) + Integrator::EpsSq).sqrt().inverse();
-        }
+        ParallelChunks(n, 64, [&](size_t begin, size_t end) {
+            for (int i = int(begin); i < int(end); ++i) {
+                m(i, i) = 1.;
+                const int len = n - i - 1;
+                if (len <= 0) continue;
+                const auto dx = e.Cx.segment(i + 1, len) - e.Cx(i);
+                const auto dy = e.Cy.segment(i + 1, len) - e.Cy(i);
+                const auto dz = e.Cz.segment(i + 1, len) - e.Cz(i);
+                m.col(i).segment(i + 1, len).array() = ((dx * dx + dy * dy + dz * dz) / (e.R(i) * e.R.segment(i + 1, len)) + Integrator::EpsSq).sqrt().inverse();
+            }
+        });
     }
 
     // In-place SPD inversion (Cholesky) via Accelerate's AMX-backed LAPACK, symmetrized

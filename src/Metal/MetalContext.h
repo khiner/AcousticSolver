@@ -76,9 +76,9 @@ struct MetalContext {
     // (a running max, so intermediate syncs during batch prep don't hide it).
     double TakeBatchGpuSeconds() { return std::exchange(LastBatchSeconds, 0.); }
 
-    // The pipeline state for a kernel, compiled on first use. `fold_apply` selects the
-    // FoldApply function-constant specialization (see Kernels.metal).
-    MTL::ComputePipelineState *Pipeline(const char *name, bool fold_apply = false);
+    // The pipeline state for a kernel, compiled on first use. `apply_faces` selects the
+    // ApplyFaces function-constant specialization (see Kernels.metal).
+    MTL::ComputePipelineState *Pipeline(const char *name, bool apply_faces = false);
 
     // The active serial compute encoder, creating a command buffer/encoder if needed.
     // For hot encode loops that bypass Dispatch() and bind buffers persistently.

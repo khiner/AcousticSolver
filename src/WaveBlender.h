@@ -95,11 +95,11 @@ private:
     int NShaderPoints{0}; // number of shader points (object boundary faces)
     int NRegularShaderPoints{0}; // leading shader points that are velocity blends (the rest are forces)
     int MaxNShaderPoints{0}; // maximum number of shader points allocated in memory so far
-    bool FoldApply{false}; // this batch folds the boundary application into the velocity kernels
+    bool FoldApply{false}; // fold the boundary application into the velocity writes
 
-    // Chooses the boundary-application path per batch. Both paths are bit-exact, so probe
-    // batches alternate them and measure GPU time, locking to the faster once each has
-    // enough samples. Probe state resets whenever the dispatch-structure key changes.
+    // Chooses the boundary-application path per batch. Both are bit-exact, so probe batches
+    // alternate them and compare measured GPU time — an in-run A/B, immune to the thermal
+    // drift that makes cross-run comparison unreliable here.
     struct ApplyPathTuner {
         bool Choose(bool has_points, bool has_forces, int npoints); // the path for this batch (true: folded)
         void MarkInFlight(bool fold); // this batch is a probe: measure it at the next drain
@@ -115,6 +115,15 @@ private:
         bool SeenForces{false}; // sticky: any batch so far had force points
     };
     ApplyPathTuner PathTuner;
+
+    // Reported under ACOUSTIC_PROFILE. The flagged-tile fraction is what the fold costs:
+    // unflagged tiles read no face mask.
+    struct FaceLoad {
+        int PeakPoints{0};
+        uint64_t Batches{0}, FlaggedTiles{0}, TotalTiles{0};
+        void Report() const;
+    };
+    FaceLoad Faces;
 
     // Precomputed constants
     real RhoCcDt{0}, InvDx{0}, InvRhoDt{0};
@@ -150,8 +159,7 @@ private:
     //   [ v_bN(0) ... v_bN(T) ]
     GpuDouble CellState, ShaderMap, ShaderData;
 
-    // Per-cell shader-face lookup for the folded boundary application (layout note in
-    // KernelParams.h)
+    // Per-cell lookup for the folded boundary application (layout in KernelParams.h)
     GpuDouble ShaderFaces;
 
     bool HadTransitions{false}; // last uploaded states include Rising/Falling cells
@@ -166,6 +174,7 @@ private:
 
     // ----- Persistent scratch (sized once, reused per batch) -----
     std::vector<int> ShaderMapHost;
+    std::vector<int> FaceCells; // cells holding a boundary face this batch, in first-touch order
     std::vector<uint8_t> FloodVisited;
     std::vector<int> FloodStack;
     std::vector<uint32_t> FaceStamp[3]; // epoch-stamped per-direction used-face sets (shader setup)

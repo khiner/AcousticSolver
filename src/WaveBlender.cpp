@@ -162,7 +162,7 @@ void WaveBlender::LogZSlice(const std::string &filetag) {
 
 bool WaveBlender::RunBatch() {
     if (Step >= (Params.Tf - Params.Ts) * Params.FdtdSrate) {
-        MetalContext::Get().Sync(); // drain the final batch
+        MetalContext::Get().Drain(); // drain the final batch
         WritePendingListeners();
         Faces.Report();
         return false;
@@ -291,14 +291,23 @@ bool WaveBlender::RunBatch() {
     ctx.EndDeferred();
     if (!lazy_commit) ctx.CommitDeferred();
 
+    // A batch with no fresh cells has nothing for the host to write into the FDTD buffer's
+    // inputs, so its gate opens now rather than after the sync. That takes the whole host
+    // round trip — wake, solve, and the signal-to-start latency — off the GPU's critical
+    // path: it picks the batch up straight off the prologue. The batch still runs through
+    // the sync below, which is why Sync leaves released work alone. Half the batches of a
+    // typical animated scene qualify (Trumpet 49%, TalkFan 50%, FillerUp all of them).
+    const bool early_release = NFreshCells == 0 && !lazy_commit;
+    if (early_release) ctx.SignalDeferred();
+
     // The one sync point per batch: the fresh-cell velocity solve reads the previous
     // batch's final velocities (and this batch's prologue kernels, which clear interior
     // velocities first) on the host.
     ctx.Sync();
     PathTuner.RecordDrained(ctx.TakeBatchGpuSeconds());
-    {
-        // Host's share of the window the GPU waits out (gpu/idle_fdtd minus this is the
-        // shared event's signal latency)
+    if (!early_release) {
+        // Host's share of the window the GPU waits out; the rest of gpu/idle_fdtd is the
+        // host's wake latency plus the signal-to-start latency.
         const profile::Scope window{"cpu/sync_window"};
         {
             const profile::Scope scope{"cpu/fresh_cell_velocity"};
@@ -307,6 +316,11 @@ bool WaveBlender::RunBatch() {
         if (lazy_commit) ctx.CommitDeferred(); // prologue was committed by the sync's flush
         ctx.SignalDeferred();
     }
+    // Progress reporting, after the gate is open: it is per batch, so keeping it out of the
+    // window the GPU waits on matters more than its cost. '\n' rather than std::endl for
+    // the same reason — a flush per batch is not free at thousands of batches.
+    std::cout << std::format("  # Fresh Cells = {}\nresidual: {}\n", NFreshCells, FreshResidual);
+
     // The released batch fills the other listener slot, so the drained batch's samples
     // can be written to file with the GPU already running.
     WritePendingListeners();
@@ -524,15 +538,12 @@ void WaveBlender::DetectCavities() {
             FloodStack.push_back(ncid);
         }
     }
-    // Fill in cavities
-    for (int i = min_i; i <= max_i; ++i) {
-        for (int j = min_j; j <= max_j; ++j) {
-            for (int k = min_k; k <= max_k; ++k) {
-                const int cid = Cid(i, j, k);
-                if (!FloodVisited[cid] && passable_value[Cell2[cid]]) Cell2[cid] = CavityInterior;
-            }
-        }
-    }
+    // Fill in cavities. The test is per cell and independent of its neighbors, so the
+    // sweep runs in ascending cell order — x innermost, contiguous — rather than striding
+    // Nx*Ny cells per step.
+    ForEachCell(CavityBounds, Params.Nx, Params.Ny, [&](int cid, int, int, int) {
+        if (!FloodVisited[cid] && passable_value[Cell2[cid]]) Cell2[cid] = CavityInterior;
+    });
 }
 
 // Section 6.1 from [Xue et al. 2024]
@@ -783,6 +794,7 @@ void WaveBlender::FreshCellPressure() {
 
 void WaveBlender::AnalyzeFreshCells() {
     FreshSolves.clear();
+    FreshResidual = 0.;
     // Host pointers for the post-sync solve, captured before the FDTD encode's ping-pong
     // flips. ClearSolid (already encoded) writes these same slots on the GPU timeline.
     FreshV[0] = static_cast<real *>(Vx.Cur().RawData());
@@ -902,11 +914,7 @@ void WaveBlender::AnalyzeFreshCells() {
 }
 
 void WaveBlender::SolveFreshCells() {
-    std::cout << "  # Fresh Cells = " << NFreshCells << std::endl;
     if (FreshSolves.empty()) return;
-
-    const real *const v_host[3]{FreshV[0], FreshV[1], FreshV[2]};
-    real *const v_out[3]{FreshV[0], FreshV[1], FreshV[2]};
 
     std::vector<double> residuals(FreshSolves.size(), 0.);
     ParallelFor(FreshSolves.size(), 1, [&](size_t c) {
@@ -931,7 +939,7 @@ void WaveBlender::SolveFreshCells() {
                 const int dir = n / 2;
                 const int face_cid = (dir == 0) ? Cid(i - d, j, k) : (dir == 1) ? Cid(i, j - d, k) :
                                                                                   Cid(i, j, k - d);
-                if (FaceCol[dir][face_cid] == -1) g[row] -= sign * v_host[dir][face_cid];
+                if (FaceCol[dir][face_cid] == -1) g[row] -= sign * FreshV[dir][face_cid];
             }
             row += 1;
         }
@@ -940,9 +948,9 @@ void WaveBlender::SolveFreshCells() {
             const Eigen::VectorX<real> u = solve.Cod.solve(g);
 
             // Write fresh cell velocity solve results back to the shared buffers
-            for (const int face_cid : faces[0]) v_out[0][face_cid] = u[FaceCol[0][face_cid]];
-            for (const int face_cid : faces[1]) v_out[1][face_cid] = u[counts[0] + FaceCol[1][face_cid]];
-            for (const int face_cid : faces[2]) v_out[2][face_cid] = u[counts[0] + counts[1] + FaceCol[2][face_cid]];
+            for (const int face_cid : faces[0]) FreshV[0][face_cid] = u[FaceCol[0][face_cid]];
+            for (const int face_cid : faces[1]) FreshV[1][face_cid] = u[counts[0] + FaceCol[1][face_cid]];
+            for (const int face_cid : faces[2]) FreshV[2][face_cid] = u[counts[0] + counts[1] + FaceCol[2][face_cid]];
 
             residuals[c] = (solve.A * u - g).squaredNorm();
         }
@@ -954,7 +962,7 @@ void WaveBlender::SolveFreshCells() {
 
     double residual_sq = 0.;
     for (const double r : residuals) residual_sq += r;
-    std::cout << "residual: " << std::sqrt(residual_sq) << std::endl;
+    FreshResidual = std::sqrt(residual_sq);
 }
 
 // Section 6.2.2 from [Xue et al. 2024]

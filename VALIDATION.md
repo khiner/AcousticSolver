@@ -89,10 +89,15 @@ predicts, with energy within ±1.5%.
 
 ## Performance
 
-Eight optimization rounds took the full suite from 1170s (initial straight translation) to
+Nine optimization rounds took the full suite from 1170s (initial straight translation) to
 316s on an M5 Max, every scene beating the RTX 4090 reference wall-clock. The README has
 the per-scene table and a summary of what changed; each mechanism is documented where it
 lives in the code.
+
+The solver now sits at measured hardware limits: the fused FDTD kernel sustains 752–766 GB/s
+at 80³ and above, which is this machine's DRAM roof (a pure streaming copy of the same
+element count reaches 725–741 GB/s there), and the coupled-bubble ODE is bound by the same
+roof on its inverse matrix reads. Those two account for ~95% of the suite.
 
 Every round was gated on byte-identical listener output against the previous build, so the
 verdicts above hold unchanged across all of them.

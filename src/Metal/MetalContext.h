@@ -13,7 +13,8 @@
 //     reads the written range — either by writing after a sync point, or by writing to a
 //     buffer (or buffer region) the in-flight batch does not reference.
 //   - Flush() commits pending dispatches without waiting, so the GPU crunches one batch
-//     while the CPU prepares the next. Sync() commits and waits.
+//     while the CPU prepares the next. Sync() commits and waits — for everything except
+//     deferred work the caller deliberately released ahead of it; Drain() waits for that too.
 
 #include <cstddef>
 #include <cstdint>
@@ -59,7 +60,11 @@ struct MetalContext {
     void Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params = nullptr, size_t params_size = 0);
 
     void Flush(); // No-op when nothing is pending
-    void Sync(); // No-op when idle
+    // Waits out everything committed, except deferred work whose gate was released before
+    // this call (see SignalDeferred) — that work is running now and is waited on by the
+    // next Sync. No-op when idle.
+    void Sync();
+    void Drain(); // Sync, including early-released deferred work
 
     // Deferred command buffer: encode and commit GPU work whose host-written inputs are
     // not ready yet, gated on a shared event the host signals once they are. Between
@@ -67,6 +72,11 @@ struct MetalContext {
     // encoder. CommitDeferred() submits the buffer to the in-order queue (scheduled,
     // stalled on the event) and SignalDeferred() releases it. No buffer the deferred
     // work references may be resized between commit and signal.
+    // Releasing the gate *before* the sync (legal whenever the host has nothing left to
+    // write into the deferred buffer's inputs) is what keeps the GPU busy: the release
+    // lands a batch ahead of the GPU reaching that buffer, so the host round trip and the
+    // signal-to-start latency both fall off the critical path. On Trumpet, whose batches
+    // are mostly fresh-cell-free, that takes gpu/idle_fdtd from 1.92 s to 0.005 s.
     void BeginDeferred();
     void EndDeferred();
     void CommitDeferred(); // No-op when nothing is held
@@ -99,8 +109,15 @@ private:
     MTL::SharedEvent *GateEvent{nullptr};
     uint64_t GateValue{0};
     // Committed, not yet waited on (in-order queue: waiting on the last waits on all).
-    // The flag marks deferred (FDTD-batch) buffers, for the gpu/exec_* split instrument.
-    std::vector<std::pair<MTL::CommandBuffer *, bool>> Committed;
+    struct Submission {
+        MTL::CommandBuffer *Buffer;
+        bool Deferred; // an FDTD-batch buffer, for the gpu/exec_* and gpu/idle_* splits
+    };
+    std::vector<Submission> Committed;
+    // Trailing entries of Committed that the next Sync deliberately runs through, rather
+    // than waits out: a deferred buffer released before the sync. Any later commit clears
+    // it — waiting on a newer buffer implies the older one finished anyway.
+    size_t UnwaitedTail{0};
     double LastBatchSeconds{0.};
     double PrevGpuEndTime{0.}; // GPU end timestamp of the last drained command buffer (for the gpu/idle instrument)
     std::unordered_map<std::string, MTL::ComputePipelineState *> Pipelines;

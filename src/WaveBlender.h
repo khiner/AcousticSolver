@@ -195,6 +195,7 @@ private:
     };
     std::vector<FreshComponentSolve> FreshSolves;
     size_t NFreshCells{0};
+    double FreshResidual{0}; // reported per batch, after the batch's gate is open
     real *FreshV[3]{}; // Vx/Vy/Vz host pointers captured at analysis time (before the encode ping-pong flips)
 
     int Cid(int i, int j, int k) const { return (Params.Ny * Params.Nx) * k + Params.Nx * j + i; }

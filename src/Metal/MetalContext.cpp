@@ -17,6 +17,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 
@@ -125,9 +126,12 @@ void MetalContext::CommitDeferred() {
 void MetalContext::SignalDeferred() {
     if (!GatedCmdBuf) return;
     GateEvent->setSignaledValue(++GateValue);
-    // A gated buffer must never be Sync()'s wait target, so it joins the drain list only
-    // once signaled
-    Committed.emplace_back(GatedCmdBuf, true);
+    // A gated buffer must never be the wait target of a Sync that runs before its release —
+    // that would deadlock — so it joins the list only now, marked as the un-waited tail.
+    // Releasing after the sync (the fresh-cell path) leaves the mark stale, which the next
+    // commit clears.
+    Committed.push_back({GatedCmdBuf, true});
+    UnwaitedTail = 1;
     GatedCmdBuf = nullptr;
 }
 
@@ -139,38 +143,42 @@ void MetalContext::Flush() {
     }
     if (CmdBuf) {
         CmdBuf->commit();
-        Committed.emplace_back(CmdBuf, false); // keeps the +1 ref from ActiveEncoder()
+        Committed.push_back({CmdBuf, false}); // keeps the +1 ref from ActiveEncoder()
+        UnwaitedTail = 0; // in-order queue: waiting on this implies every earlier buffer finished
         CmdBuf = nullptr;
     }
 }
 
 void MetalContext::Sync() {
     Flush();
-    if (Committed.empty()) return;
+    // Everything before the un-waited tail. The in-order queue makes the last of these
+    // completing imply all earlier ones did, so the tail keeps running past this call.
+    const size_t n_wait = Committed.size() > UnwaitedTail ? Committed.size() - UnwaitedTail : 0;
+    if (n_wait == 0) return;
+    const auto waited = std::span{Committed}.first(n_wait);
     {
         const profile::Scope scope{"gpu/wait"};
-        // In-order queue: the last buffer completing implies all earlier ones completed.
-        // Block only up to the second-to-last buffer, then spin out the last —
+        // Block only up to the second-to-last waited buffer, then spin out the last —
         // waitUntilCompleted's ~100 us kernel wake then overlaps the last (typically
         // small) buffer's execution.
-        auto *last = Committed.back().first;
-        if (Committed.size() > 1) Committed[Committed.size() - 2].first->waitUntilCompleted();
+        auto *last = waited.back().Buffer;
+        if (n_wait > 1) waited[n_wait - 2].Buffer->waitUntilCompleted();
         for (int i = 0; i < 80000 && last->status() < MTL::CommandBufferStatusCompleted; ++i) {}
         if (last->status() < MTL::CommandBufferStatusCompleted) last->waitUntilCompleted();
     }
-    for (const auto &[cb, deferred] : Committed) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
+    for (const auto &[cb, deferred] : waited) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
     if (profile::Enabled()) {
         auto &exec = profile::Entries()["gpu/exec"];
         auto &exec_fdtd = profile::Entries()["gpu/exec_fdtd"];
         auto &exec_prologue = profile::Entries()["gpu/exec_prologue"];
-        for (const auto &[cb, deferred] : Committed) {
+        for (const auto &[cb, deferred] : waited) {
             const double seconds = cb->GPUEndTime() - cb->GPUStartTime();
             exec.Seconds += seconds;
             auto &split = deferred ? exec_fdtd : exec_prologue;
             split.Seconds += seconds;
             split.Count += 1;
         }
-        exec.Count += Committed.size();
+        exec.Count += n_wait;
 
         // GPU idle between consecutive command buffers (commit order) — the batch loop's
         // pipeline bubbles, measurable independent of machine load. `idle_prologue` is pure
@@ -178,7 +186,7 @@ void MetalContext::Sync() {
         auto &idle = profile::Entries()["gpu/idle"];
         auto &idle_fdtd = profile::Entries()["gpu/idle_fdtd"];
         auto &idle_prologue = profile::Entries()["gpu/idle_prologue"];
-        for (const auto &[cb, deferred] : Committed) {
+        for (const auto &[cb, deferred] : waited) {
             auto &split = deferred ? idle_fdtd : idle_prologue;
             if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) {
                 idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
@@ -189,15 +197,20 @@ void MetalContext::Sync() {
             split.Count += 1;
         }
     }
-    for (const auto &[cb, deferred] : Committed) cb->release();
-    Committed.clear();
+    for (const auto &[cb, deferred] : waited) cb->release();
+    Committed.erase(Committed.begin(), Committed.begin() + n_wait);
+}
+
+void MetalContext::Drain() {
+    UnwaitedTail = 0;
+    Sync();
 }
 
 void GpuBuffer::Resize(size_t bytes) {
     if (bytes <= CapacityBytes) return;
 
     auto &ctx = MetalContext::Get();
-    ctx.Sync(); // in-flight work may reference the old allocation
+    ctx.Drain(); // in-flight work may reference the old allocation
     if (Buf) {
         Buf->release();
         bytes = std::max(bytes, 2 * CapacityBytes); // geometric growth: each grow syncs the stream, so make them rare
@@ -214,7 +227,7 @@ void GpuBuffer::ResizeZeroed(size_t bytes) {
 
 void GpuBuffer::Free() {
     if (!Buf) return;
-    MetalContext::Get().Sync();
+    MetalContext::Get().Drain();
     Buf->release();
     Buf = nullptr;
     CapacityBytes = 0;
@@ -225,7 +238,7 @@ void *GpuBuffer::Contents() const {
 }
 
 void *GpuBuffer::Data() const {
-    MetalContext::Get().Sync();
+    MetalContext::Get().Drain();
     return Contents();
 }
 

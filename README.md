@@ -14,23 +14,26 @@ Wall-clock per scene, full `script/ValidateGolden` runs. CUDA reference on an RT
 
 | Scene | RTX 4090 | Initial Metal port | Current |
 |---|---|---|---|
-| CupPhone | 21.5s | 56.2s | 34.7s |
+| CupPhone | 21.5s | 56.2s | 31.8s |
 | GlassPour | 41.4s | 34.9s | 5.3s |
-| LegoDrop | 13.7s | 10.0s | 3.4s |
-| SpollingBowl | 83.5s | 61.3s | 9.5s |
-| FillerUp | 72.2s | 90.2s | 30.1s |
-| Trumpet | 45.4s | 76.8s | 38.3s |
-| TalkFan | 132.2s | 128.2s | 54.0s |
-| HandShake | 102.5s | 124.9s | 54.1s |
-| 2016Pour | 127.4s | 187.0s | 79.8s |
-| PaddleSplash | 615.1s | 400.5s | 60.7s |
-| **Total** | **1254.9s** | **1170.0s** | **369.9s** |
+| LegoDrop | 13.7s | 10.0s | 2.9s |
+| SpollingBowl | 83.5s | 61.3s | 7.5s |
+| FillerUp | 72.2s | 90.2s | 29.2s |
+| Trumpet | 45.4s | 76.8s | 35.2s |
+| TalkFan | 132.2s | 128.2s | 46.7s |
+| HandShake | 102.5s | 124.9s | 50.0s |
+| 2016Pour | 127.4s | 187.0s | 71.4s |
+| PaddleSplash | 615.1s | 400.5s | 54.1s |
+| **Total** | **1254.9s** | **1170.0s** | **334.1s** |
 
 Notable performance changes relative to upstream WaveBlender:
 
 - One fused full-grid kernel per FDTD step (velocity + pressure, ping-pong buffers)
   instead of separate passes, with byte cell states and blending weights derived
   in-kernel.
+- PML split-pressure fields packed into dense shell slabs (full-grid storage left most
+  of each cache line untouched in the x-tapered strips), and threadgroup shapes chosen
+  per scene grid size.
 - The GPU runs batch N while the CPU prepares batch N+1, with one sync per batch. The
   next batch's command buffers are encoded and committed before the sync (gated on a
   shared event the host signals after its fresh-cell writes), and the fresh-cell

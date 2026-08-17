@@ -98,7 +98,9 @@ private:
     MTL::CommandBuffer *GatedCmdBuf{nullptr}; // committed, stalled on GateEvent until SignalDeferred()
     MTL::SharedEvent *GateEvent{nullptr};
     uint64_t GateValue{0};
-    std::vector<MTL::CommandBuffer *> Committed; // committed, not yet waited on (in-order queue: waiting on the last waits on all)
+    // Committed, not yet waited on (in-order queue: waiting on the last waits on all).
+    // The flag marks deferred (FDTD-batch) buffers, for the gpu/exec_* split instrument.
+    std::vector<std::pair<MTL::CommandBuffer *, bool>> Committed;
     double LastBatchSeconds{0.};
     double PrevGpuEndTime{0.}; // GPU end timestamp of the last drained command buffer (for the gpu/idle instrument)
     std::unordered_map<std::string, MTL::ComputePipelineState *> Pipelines;

@@ -43,11 +43,31 @@ inline real Beta0Of(uchar state) {
     return (state == CellSolid || state == CellFalling) ? 1.f : 0.f;
 }
 
+// Index into the shell-packed PML split-field storage: the shell (any cell within
+// PmlWidth of a domain face) as six disjoint dense slabs, z before y before x, each
+// contiguous along x. Call only for shell cells.
+inline int PsiIndex(int i, int j, int k, int nx, int ny, int nz) {
+    const int w = PmlWidth;
+    if (k < w) return (k * ny + j) * nx + i; // z-lo
+    int off = nx * ny * w;
+    if (k >= nz - w) return off + (((k - (nz - w)) * ny + j) * nx + i); // z-hi
+    off += nx * ny * w;
+    const int kz = k - w, nzi = nz - 2 * w;
+    if (j < w) return off + ((kz * w + j) * nx + i); // y-lo
+    off += nx * w * nzi;
+    if (j >= ny - w) return off + ((kz * w + (j - (ny - w))) * nx + i); // y-hi
+    off += nx * w * nzi;
+    const int jy = j - w, nyi = ny - 2 * w;
+    if (i < w) return off + ((kz * nyi + jy) * w + i); // x-lo
+    off += w * nyi * nzi;
+    return off + ((kz * nyi + jy) * w + (i - (nx - w))); // x-hi
+}
+
 // Pressure update kernel (Eq. 8a from [Xue et al. 2024])
 kernel void StepPressure(device real *p [[buffer(0)]],
                          device real *px [[buffer(1)]], device real *py [[buffer(2)]], device real *pz [[buffer(3)]],
                          device const real *vx [[buffer(4)]], device const real *vy [[buffer(5)]], device const real *vz [[buffer(6)]],
-                         device const real *pml_n [[buffer(9)]], device const real *pml_d [[buffer(10)]],
+                         constant real *pml_n [[buffer(9)]], constant real *pml_d [[buffer(10)]],
                          constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
                          uint3 tid [[thread_position_in_grid]]) {
     int i = tid.x, j = tid.y, k = tid.z;
@@ -72,15 +92,16 @@ kernel void StepPressure(device real *p [[buffer(0)]],
     real divz = (vz_c - vz_f) * batch.InvDx;
 
     if (min_xdist < PmlWidth || min_ydist < PmlWidth || min_zdist < PmlWidth) { // Inside the PML: split pressure update
-        real px_c = px[cid], py_c = py[cid], pz_c = pz[cid];
+        int pidx = PsiIndex(i, j, k, batch.Nx, batch.Ny, batch.Nz);
+        real px_c = px[pidx], py_c = py[pidx], pz_c = pz[pidx];
 
         px_c = (pml_n[min_xdist] * px_c - batch.RhoCcDt * divx) * pml_d[min_xdist];
         py_c = (pml_n[min_ydist] * py_c - batch.RhoCcDt * divy) * pml_d[min_ydist];
         pz_c = (pml_n[min_zdist] * pz_c - batch.RhoCcDt * divz) * pml_d[min_zdist];
 
-        px[cid] = px_c;
-        py[cid] = py_c;
-        pz[cid] = pz_c;
+        px[pidx] = px_c;
+        py[pidx] = py_c;
+        pz[pidx] = pz_c;
         p[cid] = px_c + py_c + pz_c;
     } else {
         p[cid] = p[cid] - batch.RhoCcDt * (divx + divy + divz);
@@ -139,8 +160,7 @@ inline device const int *FaceBids(device const uchar *face_mask, int g) {
 
 // Whether this threadgroup's tile can read a nonzero face mask.
 inline bool TileFlagged(device const uchar *face_mask, int g, constant FdtdBatchParams &batch, uint3 tgid) {
-    int ntx = (batch.Nx + FdtdTgX - 1) / FdtdTgX, nty = (batch.Ny + FdtdTgY - 1) / FdtdTgY;
-    return face_mask[ShaderFacesTilesOffset(g) + FdtdTileIndex(tgid.x, tgid.y, tgid.z, ntx, nty)] != 0;
+    return face_mask[ShaderFacesTilesOffset(g) + FdtdTileIndex(tgid.x, tgid.y, tgid.z, batch.NTilesX, batch.NTilesY)] != 0;
 }
 
 // The pending boundary application for the face at `cid` in direction `dir`, folded into a
@@ -165,7 +185,7 @@ inline real ApplyPending(real v, real beta_face, int dir, int cid, uchar mask,
 // arithmetic.
 inline real FaceVelocityX(int i, int j, int k, device const real *p, device const real *vx, device const uchar *state,
                           uchar mask, device const int *face_bids, device const real *shader_data,
-                          device const real *pml_n, device const real *pml_d,
+                          constant real *pml_n, constant real *pml_d,
                           constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
     int min_xdist = min(i + 1, batch.Nx - i - 1);
@@ -181,7 +201,7 @@ inline real FaceVelocityX(int i, int j, int k, device const real *p, device cons
 }
 inline real FaceVelocityY(int i, int j, int k, device const real *p, device const real *vy, device const uchar *state,
                           uchar mask, device const int *face_bids, device const real *shader_data,
-                          device const real *pml_n, device const real *pml_d,
+                          constant real *pml_n, constant real *pml_d,
                           constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
     int min_ydist = min(j + 1, batch.Ny - j - 1);
@@ -196,7 +216,7 @@ inline real FaceVelocityY(int i, int j, int k, device const real *p, device cons
 }
 inline real FaceVelocityZ(int i, int j, int k, device const real *p, device const real *vz, device const uchar *state,
                           uchar mask, device const int *face_bids, device const real *shader_data,
-                          device const real *pml_n, device const real *pml_d,
+                          constant real *pml_n, constant real *pml_d,
                           constant FdtdBatchParams &batch, constant FdtdStepParams &step) {
     int cid = Cid(i, j, k, batch.Nx, batch.Ny);
     int min_zdist = min(k + 1, batch.Nz - k - 1);
@@ -216,9 +236,9 @@ inline real FaceVelocityZ(int i, int j, int k, device const real *p, device cons
 kernel void StepVelocity(device const real *p [[buffer(0)]],
                          device real *vx [[buffer(4)]], device real *vy [[buffer(5)]], device real *vz [[buffer(6)]],
                          device const uchar *face_mask [[buffer(7)]], device const uchar *state [[buffer(8)]],
-                         device const real *pml_n [[buffer(11)]], device const real *pml_d [[buffer(12)]],
+                         constant real *pml_n [[buffer(11)]], constant real *pml_d [[buffer(12)]],
                          device const real *shader_data [[buffer(13)]],
-                         device const int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
+                         constant int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
                          constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
                          constant FdtdStepParams &step [[buffer(FdtdStepParamsIndex)]],
                          uint3 tid [[thread_position_in_grid]],
@@ -254,10 +274,10 @@ kernel void StepVelocityPressure(device const real *p [[buffer(0)]],
                                  device real *px [[buffer(1)]], device real *py [[buffer(2)]], device real *pz [[buffer(3)]],
                                  device const real *vx [[buffer(4)]], device const real *vy [[buffer(5)]], device const real *vz [[buffer(6)]],
                                  device const uchar *face_mask [[buffer(7)]], device const uchar *state [[buffer(8)]],
-                                 device const real *pml_np [[buffer(9)]], device const real *pml_dp [[buffer(10)]],
-                                 device const real *pml_nv [[buffer(11)]], device const real *pml_dv [[buffer(12)]],
+                                 constant real *pml_np [[buffer(9)]], constant real *pml_dp [[buffer(10)]],
+                                 constant real *pml_nv [[buffer(11)]], constant real *pml_dv [[buffer(12)]],
                                  device const real *shader_data [[buffer(13)]],
-                                 device const int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
+                                 constant int *listener_cids [[buffer(15)]], device real *listener_out [[buffer(16)]],
                                  device real *p_out [[buffer(21)]],
                                  device real *vx_out [[buffer(22)]], device real *vy_out [[buffer(23)]], device real *vz_out [[buffer(24)]],
                                  constant FdtdBatchParams &batch [[buffer(FdtdBatchParamsIndex)]],
@@ -308,15 +328,16 @@ kernel void StepVelocityPressure(device const real *p [[buffer(0)]],
     real divz = (vz_c - vz_f) * batch.InvDx;
 
     if (min_xdist < PmlWidth || min_ydist < PmlWidth || min_zdist < PmlWidth) { // Inside the PML: split pressure update
-        real px_c = px[cid], py_c = py[cid], pz_c = pz[cid];
+        int pidx = PsiIndex(i, j, k, batch.Nx, batch.Ny, batch.Nz);
+        real px_c = px[pidx], py_c = py[pidx], pz_c = pz[pidx];
 
         px_c = (pml_np[min_xdist] * px_c - batch.RhoCcDt * divx) * pml_dp[min_xdist];
         py_c = (pml_np[min_ydist] * py_c - batch.RhoCcDt * divy) * pml_dp[min_ydist];
         pz_c = (pml_np[min_zdist] * pz_c - batch.RhoCcDt * divz) * pml_dp[min_zdist];
 
-        px[cid] = px_c;
-        py[cid] = py_c;
-        pz[cid] = pz_c;
+        px[pidx] = px_c;
+        py[pidx] = py_c;
+        pz[pidx] = pz_c;
         p_out[cid] = px_c + py_c + pz_c;
     } else {
         p_out[cid] = p_s - batch.RhoCcDt * (divx + divy + divz);

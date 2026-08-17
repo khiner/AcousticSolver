@@ -468,6 +468,98 @@ bandwidth-coupled scenes; the eager schedule is the default.
 Remaining measured slack: ~0.2 ms/batch of wake-and-solve on many-batch scenes, and
 GlassPour/2016Pour/PaddleSplash's CPU-bound bursts (the round-3/4 AMX equilibrium).
 
+## Performance, round 7 (2026-08-16)
+
+A seventh pass, reopening the fused FDTD kernel's memory traffic — which rounds 2 and 4
+had measured as within ~12% of a pure-copy floor — plus dispatch-shape tuning and two
+startup/robustness items. Every change is **bit-exact**: listener outputs are
+byte-identical to the round-6 build on all 10 scenes (per-scene interleaved A/B `cmp`,
+quiet machine), and the full golden suite reproduces every verdict and error metric
+above to all displayed digits.
+
+1. **Shell-packed PML split fields** (`PsiIndex` in Kernels.metal). The split-pressure
+   arrays were allocated full-grid but touched only in the PML shell (45–58% of cells at
+   these grid sizes). In the x-tapered strips — 8 cells of a row, the rest interior —
+   that layout used 8 floats of each 128-byte cache line, so px/py/pz streamed ~3–4×
+   their useful bytes there. The three fields now live in six dense slabs (z, then y,
+   then x, each contiguous along x with the x slabs packed 8-wide), indexed by a
+   closed-form slab walk. Same values, same arithmetic, different addresses — bit-exact,
+   and the extra index ALU is free in a traffic-bound kernel. Microbenchmark (real MSL,
+   1000-step batches): 17.4→16.5 µs/step at 64³, 33.7→31.0 at 80³, 42.6→41.0 at 88³,
+   53.5→50.2 at 96³. `Px/Py/Pz` remain as the fresh-cell acceleration scratch only (the
+   two roles shared a buffer; their regions never overlapped).
+2. **Per-scene threadgroup shape.** Wide-x tiles measurably beat 32×4×4 at 88³
+   (41.1→39.7 µs/step with 128×4×1, −3.6%) and lose at 48³ (+9% with 256-wide tiles from
+   partial-row lanes); 64³/80³/96³ are ties. The host now picks 128×4×1 when Nx ≥ 88 and
+   32×4×4 otherwise. The kernel-side tile-flag lookup takes the tile-grid extents from
+   `FdtdBatchParams` instead of compile-time constants, so the shape is a pure host
+   choice.
+3. **`constant` address space** for the PML weight LUTs and listener cell indices
+   (broadcast-friendly small tables; ~1% at small grids).
+4. **Apply-path tuner robustness.** FillerUp regressed ~4% at first: its plain path
+   gained more from (1) than its folded path, flipping the probe decision to plain —
+   but its impulse count grows through the scene, and the plain path's scattered
+   per-step force applies degrade with load while folded's overhead is fixed. The tuner
+   now (a) re-opens probing when the shader-point count leaves [½×, 2×] of its value at
+   lock, and (b) prefers folded within a 3% probe tie when force points are present.
+   FillerUp: 31.0s → 29.3s (better than the round-6 baseline's 29.5s).
+5. **Bubble-file parser** (BubbleUtils.cpp). The per-line `istringstream` parse of
+   `trackedBubInfo.txt` (52 MB for 2016Pour) is now a cursor walk with `from_chars`
+   (correctly rounded, so values are bit-identical; stream quirks including the eofbit
+   emulated). 2016Pour scene load 0.81→0.57s, GlassPour 0.24→0.14s. A
+   `startup/scene_load` profile scope now reports this phase.
+6. **`gpu/exec_fdtd` / `gpu/exec_prologue` instrument** (kept). Splits GPU execution
+   between the deferred FDTD command buffers and the prologue buffers (vb-generation
+   shader kernels + fresh-cell kernels). It localized this round's targets — prologue
+   execution is negligible on every scene measured (≤1.5s on 2016Pour, ≤0.4s
+   elsewhere), so the shader matmul kernels are not worth attacking.
+
+Per-scene interleaved A/B (round-6 baseline vs round 7, quiet machine, base first in
+each pair; the three scenes whose first pairing regressed were re-paired in reversed
+order and averaged — Trumpet and HandShake's regressions were thermal position bias,
+FillerUp's was real and item (4) fixed it):
+
+| Scene | base wall | r7 wall | base exec | r7 exec |
+|---|---|---|---|---|
+| 2016Pour | 87.3s | 85.1s | 86.1s | 83.9s |
+| CupPhone | 38.3s | 34.7s | 38.0s | 34.4s |
+| FillerUp | 30.0s | 29.3s | 29.3s | 28.4s |
+| GlassPour | 5.4s | 5.2s | 3.1s | 3.1s |
+| HandShake | 58.5s | 58.7s | 57.6s | 57.9s |
+| LegoDrop | 3.0s | 3.0s | 2.5s | 2.6s |
+| PaddleSplash | 61.4s | 59.8s | 16.4s | 15.5s |
+| SpollingBowl | 7.0s | 6.9s | 6.1s | 6.1s |
+| TalkFan | 55.1s | 52.6s | 52.5s | 50.1s |
+| Trumpet | 37.5s | 36.9s | 35.4s | 34.8s |
+
+Suite-wide roughly −11s, concentrated where grids are large enough for the psi and
+tile-shape wins to bite (CupPhone −3.5s, TalkFan −2.4s, 2016Pour −2.3s, PaddleSplash
+−1.6s).
+
+Remaining measured slack: the fused kernel now sits at its copy floor *including* the
+shell psi traffic (microbenchmark within ~2% of the 9-stream floor at 88³), prologue
+GPU work is negligible everywhere, and PaddleSplash stays at the round-3/4 AMX
+inversion equilibrium. What's left is ~2–4 µs/step of real-scene overhead over the
+synthetic kernel (apply dispatches, mixed-state SIMD divergence, per-batch bookends)
+and ~0.3–0.6s per scene of remaining startup.
+
+Measured and rejected this round (don't retry without new hardware):
+
+- **Tile-split concurrent boundary application**: split each step into a plain fused
+  dispatch that skips shader-flagged tiles and a tile-list dispatch with the fold always
+  on, encoded on a concurrent encoder with one memory barrier per step. Bit-identical in
+  the microbenchmark, and no faster — at 2k shader points it exactly matched the plain
+  path (43.1 µs/step both), at 30k it lost (45.3 vs 43.9). The serial encoder's
+  inter-dispatch cost on this hardware is far smaller than the ~2–5 µs assumed, so
+  removing the standalone apply dispatch buys nothing.
+- **Sorting impulse faces by cell id** for apply coalescing: they are already emitted in
+  ascending-cid order by the `ForEachCell` sweeps.
+
+Load caution: an early HandShake profile taken under a concurrent build showed
++16 µs/step over the microbenchmark and evaporated to +4 µs on a rested machine — the
+fused kernel is bandwidth-bound, so concurrent CPU memory traffic inflates *GPU* exec,
+not just wall clock. A/B only on a quiet machine, and treat gpu/exec as load-sensitive.
+
 ## Rerunning
 
 ```

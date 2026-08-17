@@ -14,7 +14,7 @@ enum : int { PmlWidth = 8 };
 
 // ----- Core FDTD step kernels -----
 // The batch's step kernels share one argument table:
-//   0:P(in) 1:Px 2:Py 3:Pz 4:Vx(in) 5:Vy(in) 6:Vz(in) 7:ShaderFaces 8:CellState
+//   0:P(in) 1:PsiX 2:PsiY 3:PsiZ (shell-packed) 4:Vx(in) 5:Vy(in) 6:Vz(in) 7:ShaderFaces 8:CellState
 //   9:PmlNp 10:PmlDp 11:PmlNv 12:PmlDv 13:ShaderData 14:ShaderMap 15:ListenerCids
 //   16:ListenerOut 17:FdtdBatchParams (setBytes, once per batch)
 //   18:FdtdStepParams (setBytes, once per step) 19:ApplyShaderRange (setBytes, per
@@ -47,11 +47,15 @@ enum : int {
 //     order.
 enum : int { FoldApplyFcIndex = 0 };
 
-// Threadgroup tile dims of the full-grid step kernels (host dispatch and tile flags)
+// Threadgroup tile dims of the full-grid step kernels. The host picks per scene and
+// passes the tile-grid extents in FdtdBatchParams for the kernel-side flag lookup.
 enum : int {
-    FdtdTgX = 32,
-    FdtdTgY = 4,
-    FdtdTgZ = 4,
+    FdtdTgXSmall = 32,
+    FdtdTgYSmall = 4,
+    FdtdTgZSmall = 4,
+    FdtdTgXWide = 128,
+    FdtdTgYWide = 4,
+    FdtdTgZWide = 1,
 };
 
 // ShaderFaces buffer layout, shared by the host writer and both velocity kernels:
@@ -74,6 +78,8 @@ struct FdtdBatchParams {
     int Nz;
     int NShaderSamples;
     int NListeners;
+    int NTilesX; // threadgroup counts of the full-grid dispatch, for the tile-flag lookup
+    int NTilesY;
 };
 // Timing of the step whose boundary application is pending (one step behind the
 // dispatch that consumes it: the fused step [V(q), P(q+1)] gets step q's params).

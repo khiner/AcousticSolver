@@ -127,7 +127,7 @@ void MetalContext::SignalDeferred() {
     GateEvent->setSignaledValue(++GateValue);
     // A gated buffer must never be Sync()'s wait target, so it joins the drain list only
     // once signaled
-    Committed.push_back(GatedCmdBuf);
+    Committed.emplace_back(GatedCmdBuf, true);
     GatedCmdBuf = nullptr;
 }
 
@@ -139,7 +139,7 @@ void MetalContext::Flush() {
     }
     if (CmdBuf) {
         CmdBuf->commit();
-        Committed.push_back(CmdBuf); // keeps the +1 ref from ActiveEncoder()
+        Committed.emplace_back(CmdBuf, false); // keeps the +1 ref from ActiveEncoder()
         CmdBuf = nullptr;
     }
 }
@@ -153,27 +153,35 @@ void MetalContext::Sync() {
         // Block only up to the second-to-last buffer, then spin out the last —
         // waitUntilCompleted's ~100 us kernel wake then overlaps the last (typically
         // small) buffer's execution.
-        auto *last = Committed.back();
-        if (Committed.size() > 1) Committed[Committed.size() - 2]->waitUntilCompleted();
+        auto *last = Committed.back().first;
+        if (Committed.size() > 1) Committed[Committed.size() - 2].first->waitUntilCompleted();
         for (int i = 0; i < 80000 && last->status() < MTL::CommandBufferStatusCompleted; ++i) {}
         if (last->status() < MTL::CommandBufferStatusCompleted) last->waitUntilCompleted();
     }
-    for (const auto *cb : Committed) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
+    for (const auto &[cb, deferred] : Committed) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
     if (profile::Enabled()) {
         auto &exec = profile::Entries()["gpu/exec"];
-        for (const auto *cb : Committed) exec.Seconds += cb->GPUEndTime() - cb->GPUStartTime();
+        auto &exec_fdtd = profile::Entries()["gpu/exec_fdtd"];
+        auto &exec_prologue = profile::Entries()["gpu/exec_prologue"];
+        for (const auto &[cb, deferred] : Committed) {
+            const double seconds = cb->GPUEndTime() - cb->GPUStartTime();
+            exec.Seconds += seconds;
+            auto &split = deferred ? exec_fdtd : exec_prologue;
+            split.Seconds += seconds;
+            split.Count += 1;
+        }
         exec.Count += Committed.size();
 
         // GPU idle between consecutive command buffers (commit order) — the batch
         // loop's pipeline bubbles, measurable independent of machine load
         auto &idle = profile::Entries()["gpu/idle"];
-        for (const auto *cb : Committed) {
+        for (const auto &[cb, deferred] : Committed) {
             if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
             PrevGpuEndTime = cb->GPUEndTime();
             idle.Count += 1;
         }
     }
-    for (auto *cb : Committed) cb->release();
+    for (const auto &[cb, deferred] : Committed) cb->release();
     Committed.clear();
 }
 

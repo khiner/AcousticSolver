@@ -88,6 +88,8 @@ private:
     int Step{0}; // current simulation time step
 
     int GridSize{0}; // total number of cells (Nx * Ny * Nz)
+    Dim3 FdtdTg; // threadgroup tile dims of the full-grid step kernels (per-scene, see ctor)
+    Dim3 FdtdTiles; // threadgroup counts of the full-grid dispatch
     int NFdtdSamples{0}; // number of FDTD samples (timesteps) per batch
     int NShaderSamples{0}; // number of shader samples in time per batch
     int NShaderPoints{0}; // number of shader points (object boundary faces)
@@ -99,13 +101,14 @@ private:
     // batches alternate them and measure GPU time, locking to the faster once each has
     // enough samples. Probe state resets whenever the dispatch-structure key changes.
     struct ApplyPathTuner {
-        bool Choose(bool has_points, bool has_forces); // the path for this batch (true: folded)
+        bool Choose(bool has_points, bool has_forces, int npoints); // the path for this batch (true: folded)
         void MarkInFlight(bool fold); // this batch is a probe: measure it at the next drain
         void RecordDrained(double gpu_seconds); // the last-marked probe batch just drained
 
     private:
         uint32_t Key{~0u}; // dispatch-structure key the probe state applies to
         int Locked{-1}; // -1 while probing, else the chosen path (0 plain, 1 folded)
+        int LockedPoints{0}; // shader-point count when the lock was taken (drift re-opens probing)
         double BestSeconds[2]{}; // best measured batch GPU seconds per path
         int ProbeCount[2]{}; // completed probe batches per path
         int InFlightFold{-1}; // path of the in-flight probe batch (-1: none)
@@ -129,7 +132,8 @@ private:
     // current state is always Cur().
     GpuDouble P; // pressure
     GpuDouble Vx, Vy, Vz; // velocity components
-    GpuBuffer Px, Py, Pz; // split pressure field (for PML), also used as fresh-cell acceleration scratch
+    GpuBuffer Px, Py, Pz; // fresh-cell acceleration scratch (interior cells only)
+    GpuBuffer PsiX, PsiY, PsiZ; // split pressure field (PML), shell-packed (PsiIndex in Kernels.metal)
     GpuBuffer PmlNp, PmlDp, PmlNv, PmlDv; // PML weights (separate pressure and velocity)
     GpuBuffer ListenerCids; // listener cell indices
     // Per-batch sampled pressure, double-buffered so a drained batch's samples can be

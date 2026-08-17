@@ -32,6 +32,14 @@ WaveBlender::WaveBlender(const SimParams &params)
       NFdtdSamples(Params.FdtdSrate / Params.BlendRate), NShaderSamples(Params.ShaderSrate / Params.BlendRate + 1),
       RhoCcDt(Params.Rho * Params.C * Params.C * Params.Dt), InvDx(1. / Params.Dx), InvRhoDt(1. / Params.Rho * Params.Dt),
       Damping(Params.Damping) {
+    // Wide-x threadgroup tiles win on large grids, square ones on small (partial rows).
+    FdtdTg = Params.Nx >= 88 ? Dim3{FdtdTgXWide, FdtdTgYWide, FdtdTgZWide} : Dim3{FdtdTgXSmall, FdtdTgYSmall, FdtdTgZSmall};
+    FdtdTiles = {
+        uint32_t(Params.Nx + FdtdTg.x - 1) / FdtdTg.x,
+        uint32_t(Params.Ny + FdtdTg.y - 1) / FdtdTg.y,
+        uint32_t(Params.Nz + FdtdTg.z - 1) / FdtdTg.z,
+    };
+
     for (auto *field : {&P, &Vx, &Vy, &Vz}) { // both ping-pong slots
         field->Cur().ResizeZeroed(GridSize * sizeof(real));
         field->Other().ResizeZeroed(GridSize * sizeof(real));
@@ -61,6 +69,13 @@ void WaveBlender::InitializePml() {
     Px.ResizeZeroed(GridSize * sizeof(real));
     Py.ResizeZeroed(GridSize * sizeof(real));
     Pz.ResizeZeroed(GridSize * sizeof(real));
+
+    // Shell-packed split-field storage (the slab layout PsiIndex in Kernels.metal computes)
+    const long w = PmlWidth;
+    const long shell = 2 * Params.Nx * Params.Ny * w + 2 * Params.Nx * w * (Params.Nz - 2 * w) + 2 * w * (Params.Ny - 2 * w) * (Params.Nz - 2 * w);
+    PsiX.ResizeZeroed(shell * sizeof(real));
+    PsiY.ResizeZeroed(shell * sizeof(real));
+    PsiZ.ResizeZeroed(shell * sizeof(real));
 
     const int max_half_grid_length = (std::max({Params.Nx, Params.Ny, Params.Nz}) + 1) / 2;
 
@@ -627,7 +642,7 @@ void WaveBlender::SetupShaders() {
     ShaderData.Cur().Zero(size_t(NShaderPoints) * NShaderSamples * sizeof(real));
 
     // Boundary-application path for this batch (see KernelParams.h)
-    FoldApply = PathTuner.Choose(NShaderPoints > 0, NRegularShaderPoints != NShaderPoints);
+    FoldApply = PathTuner.Choose(NShaderPoints > 0, NRegularShaderPoints != NShaderPoints, NShaderPoints);
     if (!FoldApply) return;
 
     // Per-cell face masks, shader-data row ids, and per-tile flags for the folded
@@ -635,9 +650,7 @@ void WaveBlender::SetupShaders() {
     // the mask bit is set, so only the mask and tile flags need clearing.
     const size_t bids_base = ShaderFacesBidsOffset(size_t(GridSize));
     const size_t tiles_base = ShaderFacesTilesOffset(size_t(GridSize));
-    const int ntx = (Params.Nx + FdtdTgX - 1) / FdtdTgX;
-    const int nty = (Params.Ny + FdtdTgY - 1) / FdtdTgY;
-    const int ntz = (Params.Nz + FdtdTgZ - 1) / FdtdTgZ;
+    const int ntx = FdtdTiles.x, nty = FdtdTiles.y, ntz = FdtdTiles.z;
     ShaderFaces.Flip();
     ShaderFaces.Cur().Resize(tiles_base + size_t(ntx) * nty * ntz);
     auto *mask = static_cast<uint8_t *>(ShaderFaces.Cur().RawData());
@@ -645,7 +658,7 @@ void WaveBlender::SetupShaders() {
     auto *bids = reinterpret_cast<int *>(mask + bids_base);
     auto *tiles = mask + tiles_base;
     std::memset(tiles, 0, size_t(ntx) * nty * ntz);
-    const auto mark_tile = [&](int i, int j, int k) { tiles[FdtdTileIndex(i / FdtdTgX, j / FdtdTgY, k / FdtdTgZ, ntx, nty)] = 1; };
+    const auto mark_tile = [&](int i, int j, int k) { tiles[FdtdTileIndex(i / int(FdtdTg.x), j / int(FdtdTg.y), k / int(FdtdTg.z), ntx, nty)] = 1; };
     for (int bid = 0; bid < NShaderPoints; ++bid) {
         const int entry = ShaderMapHost[bid];
         const bool is_force = entry < 0;
@@ -677,8 +690,8 @@ void WaveBlender::FreshCellPressure() {
 
     const real incr = real(Params.ShaderSrate) / Params.FdtdSrate; // For now, assumes shader rate is same for all objects
 
-    // We use split-pressure buffers as acceleration buffers for convenience (since split-pressure only used in PML)
-    // -- just make sure to clear afterwards
+    // Px/Py/Pz double as the fresh-cell acceleration buffers (the step kernels keep their
+    // split pressure in the Psi buffers) -- just make sure to clear afterwards
     const PrepareFreshCellParams prep_params{NShaderSamples, NShaderPoints, float(1. / Params.Dt), incr};
     ctx.Dispatch("PrepareFreshCell", shader_blocks, shader_threads, {&Px, &Py, &Pz, &ShaderData.Cur(), &ShaderMap.Cur()}, &prep_params, sizeof(prep_params));
 
@@ -874,12 +887,15 @@ void WaveBlender::ShaderReInit() {
     MetalContext::Get().Dispatch("ShaderReInit", shader_blocks, shader_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &ShaderData.Cur(), &ShaderMap.Cur()}, &params, sizeof(params));
 }
 
-bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces) {
+bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces, int npoints) {
     constexpr int ProbesPerPath{4};
 
     SeenForces |= has_forces;
     const uint32_t key = uint32_t(has_points) | (SeenForces ? 2u : 0u);
-    if (key != Key) {
+    // Re-open probing when the boundary-application load has drifted far from where the
+    // lock was measured (impulse counts can grow through a scene, shifting the balance).
+    const bool points_drifted = Locked >= 0 && (npoints > 2 * LockedPoints || 2 * npoints < LockedPoints);
+    if (key != Key || points_drifted) {
         Key = key;
         Locked = -1;
         BestSeconds[0] = BestSeconds[1] = std::numeric_limits<double>::max();
@@ -890,7 +906,10 @@ bool WaveBlender::ApplyPathTuner::Choose(bool has_points, bool has_forces) {
     if (Locked >= 0) return Locked == 1;
 
     if (ProbeCount[0] >= ProbesPerPath && ProbeCount[1] >= ProbesPerPath) {
-        Locked = BestSeconds[1] < BestSeconds[0] ? 1 : 0;
+        // On a within-noise tie with force points present, prefer folded: its overhead is
+        // fixed, while plain's scattered force applies degrade as the impulse load grows.
+        Locked = BestSeconds[1] < BestSeconds[0] * (SeenForces ? 1.03 : 1.0) ? 1 : 0;
+        LockedPoints = npoints;
         if (profile::Enabled()) {
             std::cout << std::format("[apply-path] locked {} (plain {:.1f} ms, folded {:.1f} ms per batch)\n", Locked == 1 ? "folded" : "plain", BestSeconds[0] * 1e3, BestSeconds[1] * 1e3);
         }
@@ -921,8 +940,8 @@ void WaveBlender::RunFdtd() {
     const profile::Scope scope{"encode/fdtd"};
     auto &ctx = MetalContext::Get();
 
-    const MTL::Size fdtd_threads{FdtdTgX, FdtdTgY, FdtdTgZ};
-    const MTL::Size fdtd_blocks{uint32_t(Params.Nx + FdtdTgX - 1) / FdtdTgX, uint32_t(Params.Ny + FdtdTgY - 1) / FdtdTgY, uint32_t(Params.Nz + FdtdTgZ - 1) / FdtdTgZ};
+    const MTL::Size fdtd_threads{FdtdTg.x, FdtdTg.y, FdtdTg.z};
+    const MTL::Size fdtd_blocks{FdtdTiles.x, FdtdTiles.y, FdtdTiles.z};
 
     auto *pressure_pso = ctx.Pipeline("StepPressure");
     auto *fused_pso = ctx.Pipeline("StepVelocityPressure", FoldApply);
@@ -938,14 +957,14 @@ void WaveBlender::RunFdtd() {
 
     auto *encoder = ctx.ActiveEncoder();
     const GpuBuffer *const table[]{
-        nullptr, &Px, &Py, &Pz, nullptr, nullptr, nullptr, &ShaderFaces.Cur(), &CellState.Cur(), &PmlNp, &PmlDp, &PmlNv, &PmlDv,
+        nullptr, &PsiX, &PsiY, &PsiZ, nullptr, nullptr, nullptr, &ShaderFaces.Cur(), &CellState.Cur(), &PmlNp, &PmlDp, &PmlNv, &PmlDv,
         &ShaderData.Cur(), &ShaderMap.Cur(), &ListenerCids, &ListenerOut.Cur()
     };
     for (uint32_t index = 1; index < std::size(table); ++index) {
         if (table[index]) encoder->setBuffer(table[index]->Handle(), 0, index);
     }
 
-    const FdtdBatchParams batch_params{RhoCcDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size())};
+    const FdtdBatchParams batch_params{RhoCcDt, InvDx, InvRhoDt, Params.Nx, Params.Ny, Params.Nz, NShaderSamples, int(Listeners.size()), int(FdtdTiles.x), int(FdtdTiles.y)};
     encoder->setBytes(&batch_params, sizeof(batch_params), FdtdBatchParamsIndex);
 
     const auto bind_fields = [&] { // in slots 0, 4-6; out slots 21-24

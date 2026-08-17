@@ -106,14 +106,17 @@ void WaveBlender::InitializeListeners() {
 
     ListenerCids.Resize(std::max<size_t>(1, cids.size()) * sizeof(int));
     ListenerCids.Upload(cids.data(), cids.size() * sizeof(int));
-    ListenerOut.ResizeZeroed(std::max<size_t>(1, size_t(NFdtdSamples) * cids.size()) * sizeof(real));
+    ListenerOut.Cur().ResizeZeroed(std::max<size_t>(1, size_t(NFdtdSamples) * cids.size()) * sizeof(real));
+    ListenerOut.Other().ResizeZeroed(std::max<size_t>(1, size_t(NFdtdSamples) * cids.size()) * sizeof(real));
 }
 
 void WaveBlender::WritePendingListeners() {
     if (!ListenerPending) return;
     ListenerPending = false;
 
-    const auto *samples = ListenerOut.As<real>(); // completed at this batch's sync point
+    // The slot was drained at the last sync point, and the running batch fills the other
+    // slot — so read without syncing (As<> would wait out the whole running batch).
+    const auto *samples = static_cast<const real *>(PendingListenerSlot->RawData());
     const int n = Listeners.size();
     std::vector<real> deinterleaved(n > 1 ? NFdtdSamples : 0);
     for (int l = 0; l < n; ++l) {
@@ -240,22 +243,47 @@ bool WaveBlender::RunBatch() {
         const profile::Scope scope{"encode/fresh_cell_pressure"};
         FreshCellPressure();
     }
+    // The prologue command buffer is complete: commit it now so the GPU picks it up the
+    // moment the previous batch's FDTD steps drain, while the CPU keeps preparing.
+    // ACOUSTIC_LAZY_COMMIT=1 defers both commits to the sync point, isolating the commit
+    // policy for A/B on scenes where prologue GPU work and AMX-saturated CPU prep share
+    // memory bandwidth.
+    static const bool lazy_commit = std::getenv("ACOUSTIC_LAZY_COMMIT") != nullptr;
+    auto &ctx = MetalContext::Get();
+    if (!lazy_commit) ctx.Flush();
+
+    // Factorize the fresh-cell systems (geometry-only) while the GPU still runs
+    {
+        const profile::Scope scope{"cpu/fresh_cell_analyze"};
+        AnalyzeFreshCells();
+    }
+
+    // 5. Encode the batch's FDTD update (shader re-init + all timesteps) into a deferred
+    // command buffer, committed now but gated on a shared event signaled after the host
+    // fresh-cell writes below — the GPU has it scheduled and restarts the moment they land.
+    ctx.BeginDeferred();
+    ShaderReInit();
+    RunFdtd();
+    ctx.EndDeferred();
+    if (!lazy_commit) ctx.CommitDeferred();
 
     // The one sync point per batch: the fresh-cell velocity solve reads the previous
     // batch's final velocities (and this batch's prologue kernels, which clear interior
     // velocities first) on the host.
-    MetalContext::Get().Sync();
-    PathTuner.RecordDrained(MetalContext::Get().TakeBatchGpuSeconds());
-    WritePendingListeners();
+    ctx.Sync();
+    PathTuner.RecordDrained(ctx.TakeBatchGpuSeconds());
     {
         const profile::Scope scope{"cpu/fresh_cell_velocity"};
-        FreshCellVelocity();
+        SolveFreshCells();
     }
-
-    ShaderReInit(); // Shader velocity re-initialization
-
-    // 5. Run FDTD update (encoded and committed, not waited on)
-    RunFdtd();
+    if (lazy_commit) ctx.CommitDeferred(); // prologue was committed by the sync's flush
+    ctx.SignalDeferred();
+    // The released batch fills the other listener slot, so the drained batch's samples
+    // can be written to file with the GPU already running.
+    WritePendingListeners();
+    ListenerPending = true;
+    PendingListenerSlot = &ListenerOut.Cur();
+    if (NShaderPoints > 0) PathTuner.MarkInFlight(FoldApply); // measure this batch at the next sync
 
     return true;
 }
@@ -661,7 +689,14 @@ void WaveBlender::FreshCellPressure() {
     ctx.Dispatch("ClearSolid", fdtd_blocks, fdtd_threads, {&Vx.Cur(), &Vy.Cur(), &Vz.Cur(), &Px, &Py, &Pz, &CellState.Cur()}, &cs_params, sizeof(cs_params));
 }
 
-void WaveBlender::FreshCellVelocity() {
+void WaveBlender::AnalyzeFreshCells() {
+    FreshSolves.clear();
+    // Host pointers for the post-sync solve, captured before the FDTD encode's ping-pong
+    // flips. ClearSolid (already encoded) writes these same slots on the GPU timeline.
+    FreshV[0] = static_cast<real *>(Vx.Cur().RawData());
+    FreshV[1] = static_cast<real *>(Vy.Cur().RawData());
+    FreshV[2] = static_cast<real *>(Vz.Cur().RawData());
+
     // point_value[v]: cell value v belongs to a point source
     bool point_value[256]{};
     for (int oid = 0; oid < int(Objects.size()); ++oid) {
@@ -676,7 +711,7 @@ void WaveBlender::FreshCellVelocity() {
     ForEachCell(prev_box, Params.Nx, Params.Ny, [&](int cid, int, int, int) {
         if (Cell2[cid] == 0 && Cell1[cid] > 0 && Cell1[cid] != CavityInterior && !point_value[Cell1[cid]]) fresh_cids.push_back(cid);
     });
-    std::cout << "  # Fresh Cells = " << fresh_cids.size() << std::endl;
+    NFreshCells = fresh_cids.size();
     if (fresh_cids.empty()) return;
 
     // Label connected components of fresh cells (6-adjacency). The least-squares system
@@ -707,23 +742,21 @@ void WaveBlender::FreshCellVelocity() {
     // ACOUSTIC_GLOBAL_LSTSQ=1 solves one global system instead, for exactness validation.
     static const bool global_lstsq = std::getenv("ACOUSTIC_GLOBAL_LSTSQ") != nullptr;
     if (global_lstsq) n_components = 1;
-    std::vector<std::vector<int>> components(n_components);
-    if (n_components == 1) components[0] = fresh_cids;
+    FreshSolves.resize(n_components);
+    if (n_components == 1) FreshSolves[0].Cells = std::move(fresh_cids);
     else
-        for (const int cid : fresh_cids) components[FreshComponent[cid]].push_back(cid);
-    for (const int cid : fresh_cids) FreshComponent[cid] = -1; // reset scratch
+        for (const int cid : fresh_cids) FreshSolves[FreshComponent[cid]].Cells.push_back(cid);
+    for (const auto &solve : FreshSolves)
+        for (const int cid : solve.Cells) FreshComponent[cid] = -1; // reset scratch
 
-    const real *const v_host[3]{Vx.Cur().As<real>(), Vy.Cur().As<real>(), Vz.Cur().As<real>()};
-    real *const v_out[3]{Vx.Cur().As<real>(), Vy.Cur().As<real>(), Vz.Cur().As<real>()};
-
-    std::vector<double> residuals(n_components, 0.);
     ParallelFor(n_components, 1, [&](size_t c) {
-        const auto &cells = components[c];
+        auto &solve = FreshSolves[c];
+        const auto &cells = solve.Cells;
 
         // Pass 1: assign a column to each interior face (a face whose Cell1 neighbor is
         // nonzero), in row-traversal order, grouped x then y then z.
-        int counts[3]{};
-        std::vector<int> faces[3];
+        int (&counts)[3] = solve.Counts;
+        std::vector<int>(&faces)[3] = solve.Faces;
         for (const int cid : cells) {
             const int i = cid % Params.Nx;
             const int j = (cid / Params.Nx) % Params.Ny;
@@ -747,10 +780,11 @@ void WaveBlender::FreshCellVelocity() {
             }
         }
 
-        // Pass 2: build the least-squares system enforcing zero net flux per fresh cell
+        // Pass 2: build the least-squares system enforcing zero net flux per fresh cell,
+        // and factorize it. The right-hand side needs the drained velocities, so it waits
+        // for the post-sync solve.
         const int n_dof = counts[0] + counts[1] + counts[2];
-        Eigen::MatrixX<real> a = Eigen::MatrixX<real>::Zero(cells.size(), n_dof);
-        Eigen::VectorX<real> g = Eigen::VectorX<real>::Zero(cells.size());
+        solve.A = Eigen::MatrixX<real>::Zero(cells.size(), n_dof);
 
         int row = 0;
         for (const int cid : cells) {
@@ -767,23 +801,58 @@ void WaveBlender::FreshCellVelocity() {
 
                 int col = FaceCol[dir][face_cid];
                 if (col != -1) col += (dir >= 1 ? counts[0] : 0) + (dir >= 2 ? counts[1] : 0);
+                if (col != -1) solve.A(row, col) = sign;
+            }
+            row += 1;
+        }
+        if (n_dof > 0) solve.Cod.compute(solve.A); // least squares
+    });
+}
 
-                if (col != -1) a(row, col) = sign;
-                else g[row] -= sign * v_host[dir][face_cid];
+void WaveBlender::SolveFreshCells() {
+    std::cout << "  # Fresh Cells = " << NFreshCells << std::endl;
+    if (FreshSolves.empty()) return;
+
+    const real *const v_host[3]{FreshV[0], FreshV[1], FreshV[2]};
+    real *const v_out[3]{FreshV[0], FreshV[1], FreshV[2]};
+
+    std::vector<double> residuals(FreshSolves.size(), 0.);
+    ParallelFor(FreshSolves.size(), 1, [&](size_t c) {
+        auto &solve = FreshSolves[c];
+        const auto &cells = solve.Cells;
+        const int (&counts)[3] = solve.Counts;
+        const std::vector<int>(&faces)[3] = solve.Faces;
+        const int n_dof = counts[0] + counts[1] + counts[2];
+
+        // Right-hand side: boundary-face flux from the drained velocities, accumulated in
+        // the same cell-and-face order as the one-pass build.
+        Eigen::VectorX<real> g = Eigen::VectorX<real>::Zero(cells.size());
+        int row = 0;
+        for (const int cid : cells) {
+            const int i = cid % Params.Nx;
+            const int j = (cid / Params.Nx) % Params.Ny;
+            const int k = (cid / Params.Nx) / Params.Ny;
+
+            for (int n = 0; n < 6; ++n) {
+                const int d = (n % 2 == 0);
+                const real sign = (n % 2 == 0) ? -1. : 1.;
+                const int dir = n / 2;
+                const int face_cid = (dir == 0) ? Cid(i - d, j, k) : (dir == 1) ? Cid(i, j - d, k) :
+                                                                                  Cid(i, j, k - d);
+                if (FaceCol[dir][face_cid] == -1) g[row] -= sign * v_host[dir][face_cid];
             }
             row += 1;
         }
 
         if (n_dof > 0) {
-            const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixX<real>> qr{a}; // least squares
-            const Eigen::VectorX<real> u = qr.solve(g);
+            const Eigen::VectorX<real> u = solve.Cod.solve(g);
 
             // Write fresh cell velocity solve results back to the shared buffers
             for (const int face_cid : faces[0]) v_out[0][face_cid] = u[FaceCol[0][face_cid]];
             for (const int face_cid : faces[1]) v_out[1][face_cid] = u[counts[0] + FaceCol[1][face_cid]];
             for (const int face_cid : faces[2]) v_out[2][face_cid] = u[counts[0] + counts[1] + FaceCol[2][face_cid]];
 
-            residuals[c] = (a * u - g).squaredNorm();
+            residuals[c] = (solve.A * u - g).squaredNorm();
         }
         // Reset column scratch (each face belongs to exactly one component)
         for (int dir = 0; dir < 3; ++dir) {
@@ -841,12 +910,11 @@ void WaveBlender::ApplyPathTuner::RecordDrained(double gpu_seconds) {
     InFlightFold = -1;
 }
 
-// Encodes all timesteps of the batch into one command buffer with a persistent argument
-// table, then commits without waiting — the GPU crunches while the CPU prepares the next
-// batch. Each step's sequence is [pressure, boundary application, velocity]. With the
-// boundary application folded in and beta derived in-kernel, the loop is one full-grid
-// pass per step (the fused StepVelocityPressure kernel), book-ended by a StepPressure
-// prologue and a StepVelocity tail:
+// Encodes all timesteps of the batch into the deferred command buffer with a persistent
+// argument table. Each step's sequence is [pressure, boundary application, velocity].
+// With the boundary application folded in and beta derived in-kernel, the loop is one
+// full-grid pass per step (the fused StepVelocityPressure kernel), book-ended by a
+// StepPressure prologue and a StepVelocity tail:
 //   P(0) | [V(0),P(1)] | ... | [V(N-2),P(N-1)] | V(N-1)
 // The dispatch computing V(q) gets step q's params (tb, ss, and the listener slot for p(q)).
 void WaveBlender::RunFdtd() {
@@ -866,10 +934,12 @@ void WaveBlender::RunFdtd() {
     const MTL::Size shader_threads{32, 1, 1};
     const ApplyShaderRange shader_ranges[2]{{0, NRegularShaderPoints}, {NRegularShaderPoints, NShaderPoints}};
 
+    ListenerOut.Flip(); // this batch's samples fill the spare slot (see WritePendingListeners)
+
     auto *encoder = ctx.ActiveEncoder();
     const GpuBuffer *const table[]{
         nullptr, &Px, &Py, &Pz, nullptr, nullptr, nullptr, &ShaderFaces.Cur(), &CellState.Cur(), &PmlNp, &PmlDp, &PmlNv, &PmlDv,
-        &ShaderData.Cur(), &ShaderMap.Cur(), &ListenerCids, &ListenerOut
+        &ShaderData.Cur(), &ShaderMap.Cur(), &ListenerCids, &ListenerOut.Cur()
     };
     for (uint32_t index = 1; index < std::size(table); ++index) {
         if (table[index]) encoder->setBuffer(table[index]->Handle(), 0, index);
@@ -932,7 +1002,4 @@ void WaveBlender::RunFdtd() {
     encoder->dispatchThreadgroups(fdtd_blocks, fdtd_threads);
 
     Step += NFdtdSamples;
-    ctx.Flush();
-    ListenerPending = true;
-    if (NShaderPoints > 0) PathTuner.MarkInFlight(FoldApply); // measure this batch at the next sync
 }

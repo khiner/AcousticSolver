@@ -31,6 +31,7 @@ class ComputePipelineState;
 class Buffer;
 class CommandBuffer;
 class ComputeCommandEncoder;
+class SharedEvent;
 } // namespace MTL
 
 struct Dim3 {
@@ -60,6 +61,17 @@ struct MetalContext {
     void Flush(); // No-op when nothing is pending
     void Sync(); // No-op when idle
 
+    // Deferred command buffer: encode and commit GPU work whose host-written inputs are
+    // not ready yet, gated on a shared event the host signals once they are. Between
+    // BeginDeferred() and EndDeferred(), ActiveEncoder()/Dispatch() target the deferred
+    // encoder. CommitDeferred() submits the buffer to the in-order queue (scheduled,
+    // stalled on the event) and SignalDeferred() releases it. No buffer the deferred
+    // work references may be resized between commit and signal.
+    void BeginDeferred();
+    void EndDeferred();
+    void CommitDeferred(); // No-op when nothing is held
+    void SignalDeferred(); // No-op when nothing is gated
+
     // GPU execution time of the longest command buffer drained since the last call
     // (a running max, so intermediate syncs during batch prep don't hide it).
     double TakeBatchGpuSeconds() { return std::exchange(LastBatchSeconds, 0.); }
@@ -81,8 +93,14 @@ private:
 
     MTL::CommandBuffer *CmdBuf{nullptr};
     MTL::ComputeCommandEncoder *Encoder{nullptr};
+    MTL::CommandBuffer *DeferredCmdBuf{nullptr};
+    MTL::ComputeCommandEncoder *DeferredEncoder{nullptr};
+    MTL::CommandBuffer *GatedCmdBuf{nullptr}; // committed, stalled on GateEvent until SignalDeferred()
+    MTL::SharedEvent *GateEvent{nullptr};
+    uint64_t GateValue{0};
     std::vector<MTL::CommandBuffer *> Committed; // committed, not yet waited on (in-order queue: waiting on the last waits on all)
     double LastBatchSeconds{0.};
+    double PrevGpuEndTime{0.}; // GPU end timestamp of the last drained command buffer (for the gpu/idle instrument)
     std::unordered_map<std::string, MTL::ComputePipelineState *> Pipelines;
 };
 
@@ -116,6 +134,13 @@ struct GpuBuffer {
 
     size_t Capacity() const { return CapacityBytes; }
     MTL::Buffer *Handle() const { return Buf; }
+
+    // Exchanges the underlying allocations (handles only — no data copies). The caller
+    // must guarantee no in-flight GPU work references either buffer.
+    void Swap(GpuBuffer &o) {
+        std::swap(Buf, o.Buf);
+        std::swap(CapacityBytes, o.CapacityBytes);
+    }
 
 private:
     void *Contents() const; // host-visible pointer, no synchronization

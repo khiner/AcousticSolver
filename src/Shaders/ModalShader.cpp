@@ -11,7 +11,9 @@
 #include "Parallel.h"
 #include "Profile.h"
 
+#include <algorithm>
 #include <numbers>
+#include <numeric>
 
 namespace {
 // Bit equality, deliberately stricter than float equality (reuse must be exact).
@@ -20,9 +22,10 @@ bool RowBitsEqual(const Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> 
 }
 } // namespace
 
-void Modal::SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse_previous) {
+bool Modal::SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse_previous) {
     const profile::Scope scope{"modal/mode_to_boundary"};
     const auto &base = Obj;
+    const auto n_modes = mode_to_boundary.cols();
     const Eigen::Quaterniond quat1{base.Rotation1[0], base.Rotation1[1], base.Rotation1[2], base.Rotation1[3]};
     const Eigen::Quaterniond quat2{base.Rotation2[0], base.Rotation2[1], base.Rotation2[2], base.Rotation2[3]};
 
@@ -36,20 +39,38 @@ void Modal::SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse
     Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> b = base.B.rowwise() - translation;
     b = b.eval() * inv_rot.transpose();
 
-    // Copy any row whose face key, query point, and normal match the snapshot, and list
-    // the rest for fresh computation.
+    // Match rows against the snapshot (face key, query point, and normal must all
+    // bit-match), listing hits for copying and the rest for fresh computation.
     std::vector<int> fresh;
+    HitBids.clear();
+    HitRows.clear();
     if (reuse_previous) {
         fresh.reserve(base.NPoints);
         for (int bid = 0; bid < base.NPoints; ++bid) {
             const int key = base.SampleKeys[bid];
             const int row = key >= 0 && key < int(KeyToRow.size()) ? KeyToRow[key] : -1;
             if (row >= 0 && RowBitsEqual(b, bid, PrevQ, row) && RowBitsEqual(base.BN, bid, PrevBN, row)) {
-                mode_to_boundary.row(bid) = ModeToBoundary2.row(row);
+                HitBids.push_back(bid);
+                HitRows.push_back(row);
             } else {
                 fresh.push_back(bid);
             }
         }
+        // Every row hit at its own position — leave the matrix unpopulated for the
+        // caller to reuse the previous upload
+        if (fresh.empty() && int(HitBids.size()) == int(ModeToBoundary2.rows()) &&
+            std::ranges::equal(HitBids, HitRows)) {
+            return true;
+        }
+        // Copy hits column by column — per-row copies of column-major matrices would
+        // stride the full matrix.
+        ParallelChunks(n_modes, 16, [&](size_t begin, size_t end) {
+            for (size_t j = begin; j < end; ++j) {
+                real *dst = mode_to_boundary.col(j).data();
+                const real *src = ModeToBoundary2.col(j).data();
+                for (size_t h = 0; h < HitBids.size(); ++h) dst[HitBids[h]] = src[HitRows[h]];
+            }
+        });
     } else {
         fresh.resize(base.NPoints);
         std::iota(fresh.begin(), fresh.end(), 0);
@@ -61,10 +82,11 @@ void Modal::SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse
     for (size_t i = 0; i < fresh.size(); ++i) b_fresh.row(i) = b.row(fresh[i]);
     base.ClosestPoint(indices, weights, b_fresh, base.V0);
 
-    // Set entries of mode-to-boundary matrix (assumes already allocated). Each point's
-    // three weighted eigenvector rows accumulate into a contiguous scratch row first —
-    // the matrix itself is column-major (the GPU kernel wants points contiguous), so
-    // accumulating in place would stride every element access.
+    // Each fresh point's three weighted eigenvector rows accumulate into a contiguous
+    // scratch row (the matrix is column-major — the GPU kernel wants points contiguous —
+    // so accumulating in place would stride every element access), then scratch rows
+    // move into the matrix in one blocked transpose sweep.
+    RowScratch.resize(fresh.size(), n_modes);
     ParallelChunks(fresh.size(), 64, [&](size_t begin, size_t end) {
         Eigen::RowVectorX<real> acc(EvnReal.cols());
         for (size_t i = begin; i < end; ++i) {
@@ -80,7 +102,18 @@ void Modal::SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse
 
                 acc += weight * EvnReal.row(vertex_id);
             }
-            mode_to_boundary.row(bid) += acc;
+            RowScratch.row(i) = acc;
+        }
+    });
+    constexpr size_t ModeBlock{16}; // wide enough to reuse scratch cache lines per sweep
+    ParallelChunks((n_modes + ModeBlock - 1) / ModeBlock, 1, [&](size_t begin, size_t end) {
+        for (size_t blk = begin; blk < end; ++blk) {
+            const size_t j0 = blk * ModeBlock, j1 = std::min(j0 + ModeBlock, size_t(n_modes));
+            for (size_t i = 0; i < fresh.size(); ++i) {
+                const real *src = RowScratch.data() + i * n_modes;
+                real *dst = mode_to_boundary.data() + fresh[i];
+                for (size_t j = j0; j < j1; ++j) dst[j * size_t(mode_to_boundary.rows())] = src[j];
+            }
         }
     });
 
@@ -99,6 +132,7 @@ void Modal::SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse
         PrevQ = std::move(b);
         PrevBN = base.BN;
     }
+    return false;
 }
 
 void Modal::Compute(GpuBuffer &vb, int global_bid) {
@@ -107,12 +141,17 @@ void Modal::Compute(GpuBuffer &vb, int global_bid) {
     const Eigen::Quaterniond quat1{base.Rotation1[0], base.Rotation1[1], base.Rotation1[2], base.Rotation1[3]};
     const Eigen::Quaterniond quat2{base.Rotation2[0], base.Rotation2[1], base.Rotation2[2], base.Rotation2[3]};
 
-    // Build mode-to-boundary matrix at batch start (we will eventually interpolate in between batch start and end)
-    ModeToBoundary1.setZero(base.NPoints, n_modes);
-    SetModeToBoundary(ModeToBoundary1, true);
-
-    GpuModeToBoundary1.Resize(ModeToBoundary1.size() * sizeof(real));
-    GpuModeToBoundary1.Upload(ModeToBoundary1.data(), ModeToBoundary1.size() * sizeof(real));
+    // Build mode-to-boundary matrix at batch start (we will eventually interpolate in
+    // between batch start and end). Every row is written, so size without zeroing. On a
+    // full identity hit the matrix is bitwise the previous ModeToBoundary2, so rebind
+    // that upload instead — neither buffer is in flight after the previous batch's sync.
+    ModeToBoundary1.resize(base.NPoints, n_modes);
+    if (SetModeToBoundary(ModeToBoundary1, true)) {
+        GpuModeToBoundary1.Swap(GpuModeToBoundary2);
+    } else {
+        GpuModeToBoundary1.Resize(ModeToBoundary1.size() * sizeof(real));
+        GpuModeToBoundary1.Upload(ModeToBoundary1.data(), ModeToBoundary1.size() * sizeof(real));
+    }
 
     ModeVels.setZero(n_modes, base.NSamples);
     AccelNoise.setZero(base.NPoints, base.NSamples);
@@ -197,7 +236,7 @@ void Modal::Compute(GpuBuffer &vb, int global_bid) {
     // Read next animation data in order to build mode-to-boundary matrix at batch end
     if (base.AnimFile.is_open()) base.ReadAnimation();
 
-    ModeToBoundary2.setZero(base.NPoints, n_modes);
+    ModeToBoundary2.resize(base.NPoints, n_modes); // every row is written by the populating call
     SetModeToBoundary(ModeToBoundary2, false);
 
     GpuModeToBoundary2.Resize(ModeToBoundary2.size() * sizeof(real));

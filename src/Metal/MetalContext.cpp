@@ -75,6 +75,7 @@ MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool fold_ap
 }
 
 MTL::ComputeCommandEncoder *MetalContext::ActiveEncoder() {
+    if (DeferredEncoder) return DeferredEncoder;
     if (!CmdBuf) {
         CmdBuf = Queue->commandBuffer();
         CmdBuf->retain();
@@ -99,6 +100,37 @@ void MetalContext::Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::
     encoder->dispatchThreadgroups(MTL::Size{blocks.x, blocks.y, blocks.z}, MTL::Size{threads.x, threads.y, threads.z});
 }
 
+void MetalContext::BeginDeferred() {
+    if (!GateEvent) GateEvent = Device->newSharedEvent();
+    DeferredCmdBuf = Queue->commandBuffer();
+    DeferredCmdBuf->retain();
+    DeferredCmdBuf->encodeWait(GateEvent, GateValue + 1); // released by SignalDeferred()
+    DeferredEncoder = DeferredCmdBuf->computeCommandEncoder(); // serial dispatch type: in-order execution
+    DeferredEncoder->retain();
+}
+
+void MetalContext::EndDeferred() {
+    DeferredEncoder->endEncoding();
+    DeferredEncoder->release();
+    DeferredEncoder = nullptr;
+}
+
+void MetalContext::CommitDeferred() {
+    if (!DeferredCmdBuf) return;
+    DeferredCmdBuf->commit(); // scheduled now, stalled on the event
+    GatedCmdBuf = DeferredCmdBuf; // keeps the +1 ref from BeginDeferred()
+    DeferredCmdBuf = nullptr;
+}
+
+void MetalContext::SignalDeferred() {
+    if (!GatedCmdBuf) return;
+    GateEvent->setSignaledValue(++GateValue);
+    // A gated buffer must never be Sync()'s wait target, so it joins the drain list only
+    // once signaled
+    Committed.push_back(GatedCmdBuf);
+    GatedCmdBuf = nullptr;
+}
+
 void MetalContext::Flush() {
     if (Encoder) {
         Encoder->endEncoding();
@@ -117,13 +149,29 @@ void MetalContext::Sync() {
     if (Committed.empty()) return;
     {
         const profile::Scope scope{"gpu/wait"};
-        Committed.back()->waitUntilCompleted(); // in-order queue: implies all earlier command buffers completed
+        // In-order queue: the last buffer completing implies all earlier ones completed.
+        // Block only up to the second-to-last buffer, then spin out the last —
+        // waitUntilCompleted's ~100 us kernel wake then overlaps the last (typically
+        // small) buffer's execution.
+        auto *last = Committed.back();
+        if (Committed.size() > 1) Committed[Committed.size() - 2]->waitUntilCompleted();
+        for (int i = 0; i < 80000 && last->status() < MTL::CommandBufferStatusCompleted; ++i) {}
+        if (last->status() < MTL::CommandBufferStatusCompleted) last->waitUntilCompleted();
     }
     for (const auto *cb : Committed) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
     if (profile::Enabled()) {
         auto &exec = profile::Entries()["gpu/exec"];
         for (const auto *cb : Committed) exec.Seconds += cb->GPUEndTime() - cb->GPUStartTime();
         exec.Count += Committed.size();
+
+        // GPU idle between consecutive command buffers (commit order) — the batch
+        // loop's pipeline bubbles, measurable independent of machine load
+        auto &idle = profile::Entries()["gpu/idle"];
+        for (const auto *cb : Committed) {
+            if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+            PrevGpuEndTime = cb->GPUEndTime();
+            idle.Count += 1;
+        }
     }
     for (auto *cb : Committed) cb->release();
     Committed.clear();

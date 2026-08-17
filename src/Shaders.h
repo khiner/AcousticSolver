@@ -212,13 +212,23 @@ private:
     // previous batch's ModeToBoundary2, so with reuse_previous set, rows whose rest-frame
     // query point and normal bit-match a snapshot row are copied from ModeToBoundary2.
     // Without it, every row is computed fresh and the inputs are snapshotted.
-    void SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse_previous);
+    // Returns true when every row hit the snapshot at its own position — the matrix is
+    // then bitwise ModeToBoundary2 and is left unpopulated (the caller reuses the
+    // previous upload).
+    bool SetModeToBoundary(Eigen::MatrixX<real> &mode_to_boundary, bool reuse_previous);
 
     // The reuse snapshot: rest-frame query points, normals, and face keys of the last
     // populating call, plus a direct-indexed map from face key to snapshot row.
     Eigen::Matrix<real, Eigen::Dynamic, 3, Eigen::RowMajor> PrevQ, PrevBN;
     std::vector<int> PrevKeys;
     std::vector<int32_t> KeyToRow;
+
+    // Per-call scratch: snapshot hits (destination row, snapshot row), and the fresh
+    // rows' accumulation buffer. Rows accumulate contiguously here (row-major), then
+    // move into the column-major matrix in one blocked sweep — accumulating in place
+    // would stride every element access.
+    std::vector<int> HitBids, HitRows;
+    Eigen::Matrix<real, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowScratch;
 
     // --- Host (CPU) ---
     Eigen::MatrixX<real> ModeToBoundary1, ModeToBoundary2;

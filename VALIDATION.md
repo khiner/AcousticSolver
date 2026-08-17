@@ -384,6 +384,90 @@ stream traffic, PML split-field extra over the ~2/3 of a 64³ grid inside the PM
 0.3–0.7s/scene of per-batch sync-window CPU (FDTD encode, fresh-cell solve, listener
 writes) — recoverable in principle by encoding before the sync and committing after.
 
+## Performance, round 6 (2026-08-16)
+
+A sixth pass, closing the per-batch sync window that round 5 left as the last measured
+slack. Every change is **bit-exact**: listener outputs are byte-identical to the round-5
+build on all 10 scenes (per-scene interleaved A/B `cmp`, quiet machine), and the full
+golden suite reproduces every verdict and error metric above to all displayed digits.
+
+The batch loop's serial window — the stretch per batch where the GPU idles while the
+host drains the sync, solves fresh-cell velocities, encodes, and commits — is now
+reduced to the fresh-cell right-hand-side solve plus one shared-event signal:
+
+1. **Event-gated deferred FDTD command buffer** (`MetalContext::BeginDeferred` /
+   `CommitDeferred` / `SignalDeferred`). The batch's shader re-init + all FDTD timestep
+   dispatches are encoded and *committed before the sync*, headed by an
+   `MTLSharedEvent` wait. The host signals the event right after its fresh-cell
+   velocity writes land, so the pre-scheduled buffer starts immediately — commit and
+   scheduling latency leave the serial window entirely.
+2. **Early prologue commit.** The prologue command buffer (shader kernels + fresh-cell
+   pressure/clear kernels) commits as soon as it is fully encoded, instead of inside
+   the sync — the GPU picks it up the moment the previous batch's steps drain, while
+   the CPU keeps preparing.
+3. **Fresh-cell solve split** (`AnalyzeFreshCells` / `SolveFreshCells`). The
+   least-squares matrix depends only on cell geometry, so component labeling, system
+   assembly, and the complete-orthogonal factorization all run pre-sync, overlapped
+   with the GPU. Post-sync work is just the right-hand side (drained velocities, same
+   accumulation order), the triangular solves, and the scatter — identical arithmetic,
+   bit-identical results (Trumpet: 213 µs/batch → 31 µs post-sync).
+4. **Listener output double-buffered.** A drained batch's samples are written to file
+   *after* the next batch is released (the running batch fills the other slot), moving
+   file IO out of the window.
+5. **Two-stage GPU wait.** The sync blocks on the second-to-last command buffer, so
+   `waitUntilCompleted`'s ~100 µs kernel wake overlaps the last (small, prologue)
+   buffer's execution, then spins out the remainder.
+6. **Modal mode-to-boundary locality** (`src/Shaders/ModalShader.cpp`). Snapshot-row
+   copies and fresh-row accumulation both wrote the column-major matrix row-by-row —
+   a strided full-matrix traversal. Hits now copy in a column sweep, fresh rows
+   accumulate into row-major scratch and land via a blocked transpose, the matrix is
+   sized but never zeroed (every row is written), and when every row hits at its own
+   position the previous batch's end-matrix GPU buffer is rebound wholesale (no copy,
+   no upload — fires on unchanged-raster batches, 261/2500 in SpollingBowl).
+
+A `gpu/idle` profile entry (gaps between consecutive command buffers on the GPU
+timeline) now measures the window directly — it is the structural quantity these
+changes reduce, and is robust to background-load noise in a way wall-clock is not.
+
+Per-scene interleaved A/B (round-5 baseline vs round 6, same conditions, base first in
+each pair — thermal bias runs *against* round 6). These are the canonical baseline
+numbers for future rounds:
+
+| Scene | base wall | r6 wall | base exec | r6 exec | base idle | r6 idle |
+|---|---|---|---|---|---|---|
+| 2016Pour | 79.3s | 81.4s* | 77.5s | 80.3s* | 0.97s | 0.26s |
+| CupPhone | 35.3s | 35.1s | 34.8s | 34.8s | 0.53s | 0.22s |
+| FillerUp | 35.2s | 34.0s | 34.4s | 33.4s | 0.33s | 0.12s |
+| GlassPour | 5.3s | 5.1s | 3.1s | 3.1s | 1.90s | 1.77s |
+| HandShake | 59.2s | 57.9s | 57.5s | 57.1s | 1.56s | 0.66s |
+| LegoDrop | 3.3s | 3.2s | 2.8s | 2.8s | 0.14s | 0.07s |
+| PaddleSplash | 65.1s | 66.6s* | 16.9s | 17.7s* | 47.9s | 48.7s |
+| SpollingBowl | 8.6s | 8.9s* | 7.4s | 8.1s* | 0.83s | 0.53s |
+| TalkFan | 56.0s | 54.5s | 51.9s | 52.0s | 4.05s | 2.52s |
+| Trumpet | 40.7s | 39.5s | 37.3s | 37.2s | 3.37s | 2.25s |
+
+GPU idle fell on all 10 scenes (excluding PaddleSplash's CPU-bound idle: 13.7s → 8.4s,
+−39%). Where GPU exec stayed equal, the idle reduction lands directly on wall clock:
+TalkFan −1.5s, HandShake −1.3s, FillerUp −1.2s, Trumpet −1.2s. Scenes marked * ran
+into the pairing's thermal bias (their *exec* grew by more than their idle shrank —
+the new binary always ran second, and these are the heaviest heaters); their structural
+idle still improved. PaddleSplash's idle is the bubble-ODE AMX equilibrium (the GPU
+waits on the CPU), unchanged by design.
+
+The three * scenes were re-paired with the run order reversed: 2016Pour's verdict
+reversed with it (position, not binary) and SpollingBowl stayed a tie, both with round-6
+idle lower in either order. PaddleSplash initially lost both orderings on a heat-soaked
+machine with its AMX worker-busy inflated to 207–222s — a rested rotated three-way
+(round-5 baseline, round 6, and round 6 with `ACOUSTIC_LAZY_COMMIT=1`, two rounds each)
+put all three within 0.6s of each other at worker-busy 193–199s. The apparent
+regression was thermal drift of the AMX units, not pipeline contention.
+`ACOUSTIC_LAZY_COMMIT=1` restores the round-5 commit schedule (prologue and FDTD
+buffers committed at the sync) for isolating commit-policy effects on
+bandwidth-coupled scenes; the eager schedule is the default.
+
+Remaining measured slack: ~0.2 ms/batch of wake-and-solve on many-batch scenes, and
+GlassPour/2016Pour/PaddleSplash's CPU-bound bursts (the round-3/4 AMX equilibrium).
+
 ## Rerunning
 
 ```

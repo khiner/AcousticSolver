@@ -6,11 +6,14 @@
 // shader setup, fresh-cell extrapolation, and listeners.
 //
 // The batch loop is pipelined: the GPU executes batch N's FDTD steps while the CPU
-// prepares batch N+1 (rasterization, shader ODE stepping, shader setup). The one hard
-// sync point per batch is the fresh-cell velocity solve, which reads batch N's final
-// velocities on the host. Buffers the CPU rewrites during the overlap window are
-// double-buffered, and everything else is either GPU-written (ordered by the in-order
-// queue) or written after the sync point.
+// prepares batch N+1 (rasterization, shader ODE stepping, shader setup, and the
+// fresh-cell system factorization — its matrix depends only on cell geometry). Batch
+// N+1's FDTD steps are encoded pre-sync too, into a deferred command buffer. The one
+// hard sync point per batch is the fresh-cell velocity solve, which reads batch N's
+// final velocities on the host (after the prologue kernels clear interior velocities);
+// the deferred buffer commits right after those host writes land. Buffers the CPU
+// rewrites during the overlap window are double-buffered, and everything else is either
+// GPU-written (ordered by the in-order queue) or written after the sync point.
 //
 // NOTE: Ordering of objects matters. Point sources MUST be placed at end; later objects
 // will override previous rasterizations.
@@ -128,7 +131,11 @@ private:
     GpuDouble Vx, Vy, Vz; // velocity components
     GpuBuffer Px, Py, Pz; // split pressure field (for PML), also used as fresh-cell acceleration scratch
     GpuBuffer PmlNp, PmlDp, PmlNv, PmlDv; // PML weights (separate pressure and velocity)
-    GpuBuffer ListenerCids, ListenerOut; // listener cell indices and per-batch sampled pressure
+    GpuBuffer ListenerCids; // listener cell indices
+    // Per-batch sampled pressure, double-buffered so a drained batch's samples can be
+    // written to file after the next batch (which fills the other slot) is released.
+    GpuDouble ListenerOut;
+    const GpuBuffer *PendingListenerSlot{nullptr}; // slot holding the pending batch's samples
 
     // Per-cell blending state for the batch (the Cell* constants in KernelParams.h), the map from
     // boundary faces to shader points, and the shader sample data. All rewritten by the
@@ -162,6 +169,21 @@ private:
     std::vector<int> FreshComponent; // per-cell fresh-cell component id (-1 when not fresh)
     std::vector<int> FaceCol[3]; // per-direction face column ids for the fresh-cell solve (-1 when unused)
 
+    // One fresh-cell component's least-squares system, factorized pre-sync (the matrix
+    // depends only on Cell1/Cell2) while the GPU still runs the previous batch. The
+    // post-sync solve builds the right-hand side from the drained velocities, solves
+    // against the cached decomposition, and scatters.
+    struct FreshComponentSolve {
+        std::vector<int> Cells; // component cells, ascending cell order
+        std::vector<int> Faces[3]; // per-direction faces, in column order
+        int Counts[3]{}; // per-direction column counts
+        Eigen::MatrixX<real> A; // zero-net-flux system (kept for the residual report)
+        Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixX<real>> Cod;
+    };
+    std::vector<FreshComponentSolve> FreshSolves;
+    size_t NFreshCells{0};
+    real *FreshV[3]{}; // Vx/Vy/Vz host pointers captured at analysis time (before the encode ping-pong flips)
+
     int Cid(int i, int j, int k) const { return (Params.Ny * Params.Nx) * k + Params.Nx * j + i; }
     // Cell bounds of a vertex set's rasterization (padded by `pad` cells, grid-clamped)
     CellBox VertexBounds(const Eigen::MatrixX<real> &v, const Eigen::Vector3<real> &offset, int pad) const;
@@ -178,11 +200,12 @@ private:
     // ----- Per-batch overhead -----
     void DetectCavities();
     void FreshCellPressure();
-    void FreshCellVelocity();
+    void AnalyzeFreshCells(); // pre-sync: find components, build + factorize their systems
+    void SolveFreshCells(); // post-sync: right-hand sides from drained velocities, solve, scatter
     void ShaderReInit();
 
     // ----- FDTD timestepping -----
-    void RunFdtd(); // encodes all timesteps of the batch and flushes without waiting
+    void RunFdtd(); // encodes all timesteps of the batch (into the deferred command buffer)
     void InitializePml();
     void InitializeListeners();
     void WritePendingListeners();

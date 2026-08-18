@@ -1,0 +1,29 @@
+{
+  "Nx": 64,
+  "Ny": 64,
+  "Nz": 64,
+  "cellsize": 0.005,
+  "FDTD_srate": 120000,
+  "shader_srate": 48000,
+  "blendrate": 1000,
+  "ts": 0.1,
+  "tf": 1.1,
+  "damping": 0.0,
+  "objects": {
+    "1. Wineglass": {
+      "shader": "Modal",
+      "offset": [ 0.0, -0.096055, 0.0 ],
+      "meshFile": "../Scenes/WineglassTap/wine_glass.obj",
+      "animFile": "../Scenes/WineglassTap/displace.txt",
+      "dataPrefix": "../Scenes/WineglassTap/wine_glass",
+      "material": "Glass"
+    }
+  },
+  "listeners": {
+    "1. Main Listener": {
+      "format": "Mono",
+      "output": "WineglassTap_out",
+      "position": [ -0.068, 0.042, -0.041 ]
+    }
+  }
+}

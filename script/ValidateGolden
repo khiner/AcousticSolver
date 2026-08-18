@@ -9,10 +9,9 @@ run leaves the former behind, so a session should render each scene at most once
     script/ValidateGolden                      # render, then score
     script/ValidateGolden LegoDrop Trumpet     # subset (either mode)
 
-Results persist to build/validation.json so the README/VALIDATION tables regenerate with
---score. Rendered stdout/stderr lands in build/logs/<scene>.log. And if outputs are
-byte-identical to a build whose metrics are recorded, the metrics are identical too —
-`cmp` settles that more cheaply than re-rendering.
+Verdicts persist to gen/validation.json, which is committed. Rendered stdout/stderr lands in
+build/logs/<scene>.log. And if outputs are byte-identical to a build whose metrics are
+recorded, the metrics are identical too — `cmp` settles that more cheaply than re-rendering.
 
 Reference outputs come from script/generate_golden_outputs.sh (gen/cuda/<scene>/<output>.bin).
 """
@@ -29,7 +28,7 @@ import numpy as np
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 build_dir = os.path.join(root, "build")
 reference_dir = os.path.join(root, "gen", "cuda")
-results_path = os.path.join(build_dir, "validation.json")
+results_path = os.path.join(root, "gen", "validation.json")
 
 
 def config_path(scene):
@@ -121,7 +120,6 @@ for scene in scenes:
             failures += 1
             continue
         entry["wall"] = elapsed
-        entry["rendered"] = time.strftime("%Y-%m-%d %H:%M")
 
     missing = [l["output"] for l in config["listeners"].values()
                if not os.path.exists(os.path.join(build_dir, l["output"] + ".bin"))]
@@ -149,7 +147,7 @@ for scene in scenes:
         )
 
 with open(results_path, "w") as f:
-    json.dump(results, f, indent=1)
+    json.dump(results, f, indent=1, sort_keys=True)
 
 # Table rows for VALIDATION.md / README, from the persisted results
 print("\n| Scene | Verdict | rel L2 | corr | RMS ratio | spec err | wall |")

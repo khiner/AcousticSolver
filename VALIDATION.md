@@ -8,7 +8,7 @@ like the references, so a retimed scene's previous rendering stays listenable be
 
 The reference outputs are committed, so scoring works from a fresh clone without a CUDA host.
 They are filed by the rate they were generated at, so a retimed scene compares against a
-reference at the same rate. The scene data is not committed (~1.5 GB) — run
+reference at the same rate. The scene data is not committed (~12 GB) — run
 `script/FetchScenes` first. `Scenes/` is fetched and checksummed, so anything we change about
 a scene lives in `config/<scene>.json` rather than being edited in place there.
 
@@ -16,9 +16,9 @@ a scene lives in `config/<scene>.json` rather than being edited in place there.
 
 - All Metal kernels compile with **fast-math disabled**, matching nvcc's default IEEE
   behavior — this is what makes bit-exact GPU comparison possible.
-- Every floating-point expression matches the CUDA reference operation-for-operation, and
-  every optimization round was gated on byte-identical listener outputs vs the previous
-  build plus the unchanged bit-exact prefix vs CUDA below.
+- Every floating-point expression matches the CUDA reference operation-for-operation. Changes
+  are gated on byte-identical listener outputs against the previous build, plus the unchanged
+  bit-exact prefix against CUDA below.
 - Four deliberate output-observable changes, all validated:
   1. **Fresh-cell least squares per connected component.** The reference's global
      minimum-norm system is block-diagonal across connected components, so solving per
@@ -89,28 +89,54 @@ Three regimes, in decreasing strictness:
 A structural port bug would fail all three gates at once (wrong energy, wrong spectrum,
 zero bit-exact prefix); nothing does.
 
-## Results (full suite)
+## Results
 
-Established 2026-08-15 and reproduced to all displayed digits after every optimization round
-since. TalkFan and Trumpet moved once, on 2026-08-17, when their timestep was raised (1.9e-5
-→ 2.5e-5 and 2.3e-4 → 2.8e-4) — a different discretization compared against its own
-reference, not a regression:
+Per-scene verdicts and metrics are in `gen/validation.json`, written by `script/ValidateGolden`
+and committed. `ValidateGolden` exits nonzero if any scene falls outside its band or its output
+length disagrees with the reference, so the file records the run rather than gating it.
 
-| Scene | Sources | Verdict | rel L2 | corr | RMS ratio | spec err |
-|---|---|---|---|---|---|---|
-| CupPhone | Speaker + Occluder | OK | 1.3e-5 | 1.000000 | 1.0000 | 7.5e-6 |
-| TalkFan | Speaker ×2 + Occluders | OK | 2.5e-5 | 1.000000 | 1.0000 | 1.5e-5 |
-| FillerUp | Point + Density | OK | 2.0e-4 | 1.000000 | 1.0000 | 2.4e-4 |
-| Trumpet | Speaker + Occluder | OK | 2.8e-4 | 1.000000 | 1.0000 | 1.4e-4 |
-| LegoDrop | Modal | OK | 1.2e-3 | 0.999999 | 0.9999 | 6.1e-4 |
-| SpollingBowl | Modal | OK | 6.3e-3 | 0.999980 | 1.0000 | 3.0e-3 |
-| HandShake | Point + Occluders | OK(env) | 2.5e-2 | 0.999683 | 1.0004 | 1.8e-2 |
-| 2016Pour | Bubbles | OK(env) | 3.3e-1 | 0.946 | 0.9937 | 2.2e-1 |
-| GlassPour | Bubbles | OK(env) | 3.7e-1 | 0.931 | 0.9909 | 2.5e-1 |
-| PaddleSplash | Bubbles | OK(env) | 4.7e-1 | 0.894 | 1.0149 | 3.2e-1 |
+Every scene grades `OK` or `OK(env)`. The bubble scenes sit at exactly the divergence level the
+CPU-only control experiment predicts, with energy within ±1.5%.
 
-The bubble scenes sit at exactly the divergence level the CPU-only control experiment
-predicts, with energy within ±1.5%.
+### Scenes added from the wavesolver dataset
+
+Cymbal and WineglassTap are not in the WaveBlender dataset. They come from the earlier
+[wavesolver dataset](https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html)
+(Wang et al. 2018). Their thin-shell and rigid-body files are already in the formats our
+`Shell` and `Modal` shaders read, so `script/FetchScenes` only renames and moves them
+(`animation/`, `shader/`, and `<prefix>.{obj,tet,geo.txt,modes,impulses.txt}`) and converts
+nothing. Cymbal is the only scene that exercises the `Shell` path: 88200 frames of per-vertex
+displacement and acceleration at 44.1 kHz, 2481 vertices, 10 GB.
+
+The archives contain only the 2018 solver's own config, so ours are in `config/`:
+
+- **Grid and rates from the WaveBlender paper's Table 1** where it lists them (Cymbal: 10 mm,
+  80³, 88.2 kHz step rate), and from the wavesolver table otherwise (Wineglass: 5 mm, 1 s,
+  120 kHz — the same rates SpollingBowl runs at).
+- **Blend rate 980 Hz for Cymbal, not the paper's 1000.** `NSamples = shader_srate / blend_rate + 1`
+  truncates, so a blend rate that does not divide both rates exactly drifts the shader clock
+  against the FDTD clock. 980 divides 44100 (45 shader samples per batch) and 88200 (90 steps)
+  and is the closest such rate to the paper's.
+- **Shader rate pinned to 44.1 kHz for Cymbal**, because the shell reader indexes frame files
+  as `step + lookahead` and assumes that rate and a zero start time.
+- **Listeners moved inside the grid.** Both archives list far-field listening points, and the
+  2018 solver propagated to them. Cymbal's is 1.9 m from the object, on a 0.8 m grid. Ours
+  samples pressure at a grid cell, so each listener keeps the original direction from the object
+  at a radius that clears the 8-cell PML: Cymbal 0.2 m above the disc, Wineglass 3 cm from the
+  bowl.
+- **Identity vertex map** for Cymbal: the published zip's `misc/` is empty, so there is no
+  `vertex_map.txt`, and both solvers fall back to identity.
+- **A two-keyframe rest pose** for WineglassTap. The glass never moves and the scene has one
+  impulse, but a `Modal` object with no animation file leaves both solvers' pose quaternions
+  uninitialized, so the fetch script writes an identity `displace.txt`.
+
+Cymbal's `OK(env)` is amplified CPU drift, not a structural difference. The first differing
+sample is #27, at magnitude 1e-19 and a relative difference of 6e-8 — one float32 ulp, in the
+first batch, before any fresh cell exists. The moving shell amplifies it from there: cells flip
+between solid and air a batch earlier or later, and the error reaches 1.4e-2 by 10 ms. It is not
+our per-component fresh-cell solve. `ACOUSTIC_GLOBAL_LSTSQ=1` reproduces the same 8.481e-2 to
+every digit and the same first differing sample. Energy matches within 0.11% and correlation is
+0.9964.
 
 ## Bugs found during validation
 
@@ -124,20 +150,14 @@ predicts, with energy within ±1.5%.
 
 ## Performance
 
-Nine optimization rounds took the full suite from 1170s (initial straight translation) to
-316s on an M5 Max, every scene beating the RTX 4090 reference wall-clock. The README has
-the per-scene table and a summary of what changed; each mechanism is documented where it
-lives in the code.
+Per-scene wall clock is in the README. Each mechanism is documented where it lives in the code.
 
-The solver now sits at measured hardware limits: the fused FDTD kernel sustains 752–766 GB/s
+The solver sits at measured hardware limits: the fused FDTD kernel sustains 752–766 GB/s
 at 80³ and above, which is this machine's DRAM roof (a pure streaming copy of the same
 element count reaches 725–741 GB/s there), and the coupled-bubble scenes are bound by the
 matrix units' aggregate factorization throughput — the same 13,889 endpoint inversions cost
 154s of worker time on 4 threads and 306s on 8, for the same wall clock. Those two account
 for ~95% of the suite.
-
-Every round was gated on byte-identical listener output against the previous build, so the
-verdicts above hold unchanged across all of them.
 
 ### Instruments and toggles
 
@@ -169,7 +189,7 @@ verdicts above hold unchanged across all of them.
 ## Rerunning
 
 ```
-script/FetchScenes                 # download the scene data into Scenes/ (~1.5 GB, once)
+script/FetchScenes                 # download the scene data into Scenes/ (~12 GB, once)
 script/FetchScenes --verify        # checksum Scenes/ against script/scenes.sha256
 script/Build                       # build (Homebrew LLVM, C++23)
 script/ValidateGolden --profile    # render every scene once: verdicts + wall + phase timing
@@ -181,5 +201,5 @@ script/generate_golden_outputs.sh root@<pod-ip> <port>   # regenerate the refere
 
 **Render each scene at most once per session.** Scoring is a pure function of the listener
 bytes and the reference bytes, so any run leaves what a later `--score` needs, persisted in
-`build/validation.json`. And outputs byte-identical to a build whose metrics are recorded
+`gen/validation.json`. And outputs byte-identical to a build whose metrics are recorded
 here have identical metrics by construction — `cmp` settles that, re-rendering does not.

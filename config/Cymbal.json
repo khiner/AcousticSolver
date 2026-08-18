@@ -1,0 +1,29 @@
+{
+  "Nx": 80,
+  "Ny": 80,
+  "Nz": 80,
+  "cellsize": 0.01,
+  "FDTD_srate": 88200,
+  "shader_srate": 44100,
+  "blendrate": 980,
+  "ts": 0.0,
+  "tf": 1.99,
+  "damping": 0.0,
+  "objects": {
+    "1. Cymbal": {
+      "shader": "Shell",
+      "offset": [ -0.001394, -0.695861, 0.04693 ],
+      "meshFile": "../Scenes/Cymbal/cymbal.obj",
+      "animDir": "../Scenes/Cymbal/animation/",
+      "accDir": "../Scenes/Cymbal/shader/",
+      "mapFile": "../Scenes/Cymbal/vertex_map.txt"
+    }
+  },
+  "listeners": {
+    "1. Main Listener": {
+      "format": "Mono",
+      "output": "Cymbal_out",
+      "position": [ -0.14, 0.2, 0.054 ]
+    }
+  }
+}

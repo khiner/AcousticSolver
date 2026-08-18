@@ -1,8 +1,10 @@
-# sha256 of each scene's file tree, as fetched from the WaveBlender dataset.
+# sha256 of each scene's file tree, as script/FetchScenes stages it (the WaveBlender dataset,
+# plus Cymbal and WineglassTap restaged from the 2018 wavesolver dataset).
 # Regenerate with the same pipeline script/FetchScenes --verify uses:
 #   for s in Scenes/*/; do echo "$(cd $s && find . -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -d' ' -f1)  $(basename $s)"; done
 97c9f8abcdf0e5d3ffac7ad6500cdf11abeaf072ee49c37068c612958e5077ba  2016Pour
 23f5202ef016bf185250e1d25d8db59b755f72fba718b06a3ce33d811d60aeba  CupPhone
+e2fc099d81bcc3f982888007c868e0865f272b9af924680fdf035daadf8ab0fa  Cymbal
 edba1ae65b6718a7e1239329390e4f2b30efceeef5d209bab84bbb95d9a496b4  FillerUp
 12dd204dc605a791459a5918c2e508e0f6598523bbd31cf98715363f5fc8cc30  GlassPour
 3554c1f6f3bccd5539c76fc71671edd6b0413498713d60cd0af01af3c994b462  HandShake
@@ -11,3 +13,4 @@ e4697aeb65effa3f1efab996dbf1b258803109d85a7158de532b04a8912f179b  PaddleSplash
 6e32e417841907d8ad6b796fc50e842d6aaad92a35b978cbdfd83ef328b70d3e  SpollingBowl
 1489050681455a09318060b8f3f022dbd3f02be2064e25d343b655264a39f452  TalkFan
 824d848cb46ffe95a2a847bce3fd35095197b368106cb1f670868e2c1d698a89  Trumpet
+e2cf52ee4cf9ea5712aef657859e404583fcee61fcdc314b25b829e9516a05f3  WineglassTap

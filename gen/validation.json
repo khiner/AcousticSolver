@@ -1,0 +1,182 @@
+{
+ "2016Pour": {
+  "listeners": {
+   "2016Pour_out": {
+    "bitexact_prefix": 0.0048203125,
+    "corr": 0.9463558509520742,
+    "duration": 8.3,
+    "length_mismatch": false,
+    "rel_l2": 0.32657777546893274,
+    "rms_ratio": 0.9937102600553398,
+    "spec_err": 0.22110462462478775,
+    "status": "OK(env)"
+   }
+  },
+  "wall": 51.584261894226074
+ },
+ "CupPhone": {
+  "listeners": {
+   "CupPhone_out": {
+    "bitexact_prefix": 4.66109977324263,
+    "corr": 0.9999999999129825,
+    "duration": 8.0,
+    "length_mismatch": false,
+    "rel_l2": 1.3192455443046832e-05,
+    "rms_ratio": 1.0000000011443844,
+    "spec_err": 7.537988339469721e-06,
+    "status": "OK"
+   }
+  },
+  "wall": 28.926323890686035
+ },
+ "Cymbal": {
+  "listeners": {
+   "Cymbal_out": {
+    "bitexact_prefix": 0.0003061224489795918,
+    "corr": 0.9964073117190463,
+    "duration": 1.9908163265306122,
+    "length_mismatch": false,
+    "rel_l2": 0.08481059327969773,
+    "rms_ratio": 1.0011333265854345,
+    "spec_err": 0.05887574033369626,
+    "status": "OK(env)"
+   }
+  },
+  "wall": 10.24536681175232
+ },
+ "FillerUp": {
+  "listeners": {
+   "FillerUp_out": {
+    "bitexact_prefix": 0.16186666666666666,
+    "corr": 0.999999984565374,
+    "duration": 7.0,
+    "length_mismatch": false,
+    "rel_l2": 0.00019922361290154934,
+    "rms_ratio": 0.9999998378102045,
+    "spec_err": 0.0002368029192988125,
+    "status": "OK"
+   }
+  },
+  "wall": 26.853274822235107
+ },
+ "GlassPour": {
+  "listeners": {
+   "GlassPour_out": {
+    "bitexact_prefix": 0.035875,
+    "corr": 0.931448764019002,
+    "duration": 5.32,
+    "length_mismatch": false,
+    "rel_l2": 0.36869311876791433,
+    "rms_ratio": 0.9908744808342547,
+    "spec_err": 0.2504043273464286,
+    "status": "OK(env)"
+   }
+  },
+  "wall": 5.315337896347046
+ },
+ "HandShake": {
+  "listeners": {
+   "HandShake_out": {
+    "bitexact_prefix": 0.184225,
+    "corr": 0.9996825314245182,
+    "duration": 11.0,
+    "length_mismatch": false,
+    "rel_l2": 0.025206348442190753,
+    "rms_ratio": 1.0004066510672802,
+    "spec_err": 0.018411361873822054,
+    "status": "OK(env)"
+   }
+  },
+  "wall": 45.56819200515747
+ },
+ "LegoDrop": {
+  "listeners": {
+   "LegoDrop_out": {
+    "bitexact_prefix": 0.00759349593495935,
+    "corr": 0.999999328785503,
+    "duration": 0.21,
+    "length_mismatch": false,
+    "rel_l2": 0.0011628434895582704,
+    "rms_ratio": 0.9999002458436119,
+    "spec_err": 0.0006102259812969912,
+    "status": "OK"
+   }
+  },
+  "wall": 2.724498987197876
+ },
+ "PaddleSplash": {
+  "listeners": {
+   "PaddleSplash_out": {
+    "bitexact_prefix": 0.01571875,
+    "corr": 0.8935288809818267,
+    "duration": 1.88,
+    "length_mismatch": false,
+    "rel_l2": 0.46510821215023257,
+    "rms_ratio": 1.014852880747184,
+    "spec_err": 0.3227844323696396,
+    "status": "OK(env)"
+   }
+  },
+  "wall": 51.55168890953064
+ },
+ "SpollingBowl": {
+  "listeners": {
+   "SpollingBowl_out": {
+    "bitexact_prefix": 0.04348333333333333,
+    "corr": 0.9999800634872538,
+    "duration": 2.5,
+    "length_mismatch": false,
+    "rel_l2": 0.006313125789097261,
+    "rms_ratio": 1.0000234421861847,
+    "spec_err": 0.0029457458092652265,
+    "status": "OK"
+   }
+  },
+  "wall": 6.338191747665405
+ },
+ "TalkFan": {
+  "listeners": {
+   "TalkFan_out": {
+    "bitexact_prefix": 0.0008767951625094483,
+    "corr": 0.9999999996866666,
+    "duration": 10.500136054421768,
+    "length_mismatch": false,
+    "rel_l2": 2.5033424464510065e-05,
+    "rms_ratio": 1.0000000004969367,
+    "spec_err": 1.499519956563416e-05,
+    "status": "OK"
+   }
+  },
+  "wall": 33.2705979347229
+ },
+ "Trumpet": {
+  "listeners": {
+   "Trumpet_out": {
+    "bitexact_prefix": 0.001436130007558579,
+    "corr": 0.999999960188919,
+    "duration": 10.000272108843538,
+    "length_mismatch": false,
+    "rel_l2": 0.0002821739639421468,
+    "rms_ratio": 1.000000004465428,
+    "spec_err": 0.00013980287746286828,
+    "status": "OK"
+   }
+  },
+  "wall": 24.90378999710083
+ },
+ "WineglassTap": {
+  "listeners": {
+   "WineglassTap_out": {
+    "bitexact_prefix": 0.00015833333333333332,
+    "corr": 0.9999998538485348,
+    "duration": 1.0,
+    "length_mismatch": false,
+    "rel_l2": 0.0005728906427579559,
+    "rms_ratio": 0.9998103687645233,
+    "spec_err": 0.0003383098921861084,
+    "status": "OK"
+   }
+  },
+  "wall": 2.6942601203918457
+ }
+}

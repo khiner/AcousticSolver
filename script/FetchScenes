@@ -1,8 +1,14 @@
 #!/bin/bash
 
-# Populates Scenes/ with the WaveBlender dataset (Xue et al., SIGGRAPH Asia 2024), ~1.5 GB,
-# which is why it is fetched rather than vendored. It has to land at the repository root: the
-# dataset's own configs hardcode "../Scenes/<Scene>/..." and the solver runs from build/.
+# Populates Scenes/ with the scene data the solver renders, ~12 GB, which is why it is fetched
+# rather than vendored. It has to land at the repository root: the dataset configs hardcode
+# "../Scenes/<Scene>/..." and the solver runs from build/.
+#
+# Ten scenes come from the WaveBlender dataset (Xue et al., SIGGRAPH Asia 2024) and include their
+# own config.json. Cymbal and WineglassTap come from the earlier wavesolver dataset (Wang et al.
+# 2018), which the WaveBlender dataset used but never re-published. They are Google Drive zips in
+# that solver's layout, renamed and moved here into the layout config/<Scene>.json expects.
+# Cymbal is ~10 GB of the total: 88200 frames of per-vertex shell displacement and acceleration.
 #
 # Usage:
 #   script/FetchScenes                  # download every scene (skips ones already present)
@@ -13,7 +19,7 @@
 #
 # Each scene is checksummed against script/scenes.sha256 after download. The hash covers the
 # extracted file tree rather than the archive, so it also catches a partial extract or a
-# scene edited in place.
+# scene edited in place. Cymbal's tree is 352800 files, so its digest takes a few minutes.
 
 set -euo pipefail
 
@@ -22,8 +28,27 @@ ProjectRootDir="$(dirname "${ScriptDir}")"
 ScenesDir="${ProjectRootDir}/Scenes"
 BaseUrl="https://graphics.stanford.edu/papers/waveblender/dataset/data"
 
-AllScenes=(2016Pour CupPhone FillerUp GlassPour HandShake LegoDrop PaddleSplash SpollingBowl TalkFan Trumpet)
+AllScenes=(2016Pour CupPhone Cymbal FillerUp GlassPour HandShake LegoDrop PaddleSplash SpollingBowl TalkFan Trumpet WineglassTap)
 Manifest="${ScriptDir}/scenes.sha256"
+
+# Google Drive file ids for the two wavesolver-dataset scenes, from
+# https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html
+DriveId() {
+    case "$1" in
+        Cymbal) echo "1ssWk7Y8VVpRK_yoKI2MbVXk4M69kDyWh" ;;
+        WineglassTap) echo "1yyXcJbGo0HjVEwQXXBRAx2EGvGBhacpc" ;;
+        *) return 1 ;;
+    esac
+}
+
+# The file staging writes last, so a half-finished fetch is not mistaken for a complete one.
+SceneMarker() {
+    case "$1" in
+        Cymbal) echo "cymbal.obj" ;;
+        WineglassTap) echo "wine_glass.impulses.txt" ;;
+        *) echo "config.json" ;;
+    esac
+}
 
 # Digest of a scene's file tree. LC_ALL=C sort keeps it stable across systems.
 SceneDigest() {
@@ -46,6 +71,38 @@ VerifyScene() {
     echo "${scene}: verified"
 }
 
+# Moves an extracted archive's files into the scene layout, under "${2}/staged".
+StageScene() {
+    local scene=$1 tmp=$2 x="${2}/x" staged="${2}/staged"
+    case "${scene}" in
+        Cymbal)
+            # Thin-shell frames, one file per 44.1 kHz step, plus the rest shape.
+            mkdir -p "${staged}"
+            mv "${x}/cymbal/animation/cymbal" "${staged}/animation"
+            mv "${x}/cymbal/shader/cymbal" "${staged}/shader"
+            mv "${x}/cymbal/model/cymbal.obj" "${staged}/cymbal.obj"
+            ;;
+        WineglassTap)
+            # Modal data, flattened to the <prefix>.<ext> naming our Modal shader reads.
+            mkdir -p "${staged}"
+            local model="${x}/wine_glass/model/wine_glass"
+            mv "${model}/wine_glass.obj" "${model}/wine_glass.tet" "${model}/wine_glass.geo.txt" "${model}/wine_glass.modes" "${staged}/"
+            # The glass never moves, but both solvers read the rest pose from an animation file.
+            # Without one their rotation quaternions are uninitialized, so write an identity pose.
+            printf '%s\n0 0 0 0 1 0 0 0\n2 0 0 0 1 0 0 0\n' \
+                '# time translation_x translation_y translation_z quaternion_w quaternion_x quaternion_y quaternion_z' > "${staged}/displace.txt"
+            mv "${x}/wine_glass/shader/modalImpulses.txt" "${staged}/wine_glass.impulses.txt"
+            ;;
+        *)
+            # Dataset archives may or may not carry a top-level <Scene>/.
+            if [ -f "${x}/config.json" ]; then mv "${x}" "${staged}"
+            elif [ -f "${x}/${scene}/config.json" ]; then mv "${x}/${scene}" "${staged}"
+            else echo "${scene}: no config.json in the archive" >&2; return 1
+            fi
+            ;;
+    esac
+}
+
 force=0
 verify_only=0
 scenes=()
@@ -65,7 +122,7 @@ while [ $# -gt 0 ]; do
             ;;
         --force) force=1; shift ;;
         --verify) verify_only=1; shift ;;
-        -h|--help) sed -n '3,18p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,22p' "$0"; exit 0 ;;
         -*) echo "Unknown option: $1" >&2; exit 1 ;;
         *) scenes+=("$1"); shift ;;
     esac
@@ -89,28 +146,26 @@ mkdir -p "${ScenesDir}"
 
 for scene in "${scenes[@]}"; do
     dest="${ScenesDir}/${scene}"
-    if [ -f "${dest}/config.json" ] && [ "${force}" -eq 0 ]; then
+    if [ -f "${dest}/$(SceneMarker "${scene}")" ] && [ "${force}" -eq 0 ]; then
         echo "${scene}: already present"
         continue
     fi
-    tmp="$(mktemp -d)"
+    # Staged inside Scenes/ so the move into place stays on one filesystem — Cymbal is 10 GB.
+    tmp="$(mktemp -d "${ScenesDir}/.fetch.XXXXXX")"
     trap 'rm -rf "${tmp}"' EXIT
     echo "${scene}: downloading"
-    # The host 403s a bare curl UA from datacenter IPs, so identify as a browser.
-    curl -fL --progress-bar -A 'Mozilla/5.0' -e 'https://graphics.stanford.edu/papers/waveblender/dataset/' -o "${tmp}/${scene}.zip" "${BaseUrl}/${scene}.zip"
-    # Unpack aside first: archives may or may not carry a top-level <Scene>/, and a failed
-    # extract must not leave a half-populated scene behind.
-    unzip -q "${tmp}/${scene}.zip" -d "${tmp}/x"
-    if [ -f "${tmp}/x/config.json" ]; then
-        staged="${tmp}/x"
-    elif [ -f "${tmp}/x/${scene}/config.json" ]; then
-        staged="${tmp}/x/${scene}"
+    if id=$(DriveId "${scene}"); then
+        curl -fL --progress-bar -o "${tmp}/${scene}.zip" "https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t"
     else
-        echo "${scene}: no config.json in the archive" >&2
-        exit 1
+        # The host 403s a bare curl UA from datacenter IPs, so identify as a browser.
+        curl -fL --progress-bar -A 'Mozilla/5.0' -e 'https://graphics.stanford.edu/papers/waveblender/dataset/' -o "${tmp}/${scene}.zip" "${BaseUrl}/${scene}.zip"
     fi
+    # Unpack aside first: a failed extract must not leave a half-populated scene behind.
+    unzip -q "${tmp}/${scene}.zip" -d "${tmp}/x"
+    rm -f "${tmp}/${scene}.zip"
+    StageScene "${scene}" "${tmp}"
     rm -rf "${dest}"
-    mv "${staged}" "${dest}"
+    mv "${tmp}/staged" "${dest}"
     rm -rf "${tmp}"
     trap - EXIT
     VerifyScene "${scene}"

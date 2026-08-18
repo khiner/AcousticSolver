@@ -151,21 +151,28 @@ Exemplar Metal codebases:
 ## Data
 
 **WaveBlender dataset** — https://graphics.stanford.edu/papers/waveblender/dataset/ — 10 scenes, 1.5 GB
-extracted, checked in under `Scenes/`.
+extracted, downloaded into `Scenes/` by `script/FetchScenes`, which also downloads two more
+scenes (`Cymbal`, `WineglassTap`, ~10 GB) from the predecessor dataset below.
 
 | Source type | Scenes | Input formats |
 |---|---|---|
 | Water (bubbles) | `2016Pour`, `GlassPour`, `PaddleSplash` | `trackedBubInfo.txt`, surface `.obj` at 10 ms intervals |
-| Rigid bodies (modal) | `LegoDrop`, `SpollingBowl` | `displace.txt`, `.tet`, `.tet.obj`, `.geo.txt`, `.modes`, `.impulses.txt` |
+| Rigid bodies (modal) | `LegoDrop`, `SpollingBowl`, `WineglassTap` | `displace.txt`, `.tet`, `.tet.obj`, `.geo.txt`, `.modes`, `.impulses.txt` |
 | Speaker (audio) | `CupPhone`, `TalkFan`, `Trumpet` | `*_anim.txt` + input `.wav` |
 | Point force | `FillerUp`, `HandShake` | `*ptsrcData.txt`, `betas/*.txt` |
+| Thin shell | `Cymbal` | per-frame `.displacement` and `.wsacc` (plus their constrained-vertex halves) at 44.1 kHz |
 
-No published scene exercises the Shell, Monopole, or Density shaders — the paper's Cymbal and Metal Sheet Shake
-examples were never released.
+No published scene exercises the Monopole shader (a test source with no scene of its own).
 
 The predecessor **Wang et al. 2018 dataset** —
-https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html — same lab, earlier formats,
-relevant only if we go beyond WaveBlender's scenes.
+https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html — same lab. Its thin-shell and
+rigid-body files are in the formats our Shell and Modal shaders read. `Cymbal` (10 GB) and `WineglassTap`
+(202 MB) come from here. The WaveBlender dataset page has both thin-shell rows commented out and Cymbal's
+link blanked, so this is the only page that still links that data. Also available here, not used: Metal Sheet
+Shake (40 GB, the other thin-shell example), Dripping Faucet and the 17 GB raw Pouring Faucet, and ABCD
+(characters). The two water scenes would need work: their bubble data is per-timestep snapshots, and
+converting it to the tracked `trackedBubInfo.txt` our Bubbles shader reads needs the Langlois et al. 2016
+bubble tracker, which neither codebase includes. The paper's "2016 Water Step" was never published.
 
 ## Authors
 

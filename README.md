@@ -5,7 +5,10 @@ Exploring acoustic radiation transfer GPU solvers
 
 A from-scratch Metal port of [WaveBlender](https://github.com/kangruix/WaveBlender) (Xue et al., SIGGRAPH Asia 2024), an FDTD acoustic wave solver that renders sound for animated scenes from coupled sources: vibrating rigid bodies (modal), water bubbles, speakers, point impulses, and occluders.
 Output is validated per-scene against the CUDA reference's listener outputs, committed under `gen/cuda/` — see [VALIDATION.md](VALIDATION.md).
-The ~1.5 GB scene dataset is not vendored: run `script/FetchScenes` to download it into `Scenes/` (checksummed against `script/scenes.sha256`).
+
+The ~12 GB of scene data is not vendored: run `script/FetchScenes` to download it into `Scenes/` (checksummed against `script/scenes.sha256`).
+Ten scenes come from the WaveBlender dataset and include their own `config.json`. Cymbal and WineglassTap come from the earlier wavesolver dataset ([Wang et al. 2018](https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html)), which WaveBlender used but never re-published.
+The fetch script renames and moves their files into our layout, and their configs are in `config/`.
 
 Wall-clock per scene. CUDA reference on an RTX 4090 (Linux, CUDA 12.8), Metal on an Apple M5 Max.
 The Metal column is a cool sweep — one scene per idle GPU, two minutes apart, on an otherwise
@@ -24,7 +27,13 @@ quiet machine — because this GPU's thermal drift is large enough (a scene meas
 | HandShake | 102.5s | 124.9s | 45.6s |
 | 2016Pour | 127.4s | 187.0s | 51.6s |
 | PaddleSplash | 615.1s | 400.5s | 51.6s |
-| **Total** | **1254.9s** | **1170.0s** | **277.1s** |
+| Cymbal | 67.4s | — | 10.2s |
+| WineglassTap | 32.0s | — | 2.7s |
+| **Total** | **1354.3s** | **1170.0s** (ten scenes) | **290.0s** |
+
+Cymbal and WineglassTap were added after the initial port, so the middle column is empty for
+them. Cymbal's 10.2s reads its 11 GB of per-frame shell data from the page cache. The first read
+from disk takes 40.9s. The reference read the same data from a RAM disk.
 
 Notable performance changes relative to upstream WaveBlender:
 

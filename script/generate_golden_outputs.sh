@@ -11,13 +11,14 @@
 # Requirements on the remote host: Ubuntu-ish with CUDA toolkit at
 # /usr/local/cuda (any RunPod CUDA/PyTorch template works), root apt access.
 # The run streams over one SSH session (ServerAliveInterval keeps it up) and
-# takes on the order of an hour for all 10 scenes.
+# takes on the order of two hours for all 12 scenes. Most of that is Cymbal: 10 GB
+# of per-frame shell data to download, then its render.
 #
 # Layout assumptions (override via env vars):
 #   WAVEBLENDER_DIR  CUDA reference repo      (default: <this repo>/../WaveBlender)
 #   FLUIDSOUND_DIR   FluidSound clone         (default: <this repo>/../FluidSound)
 #   REFERENCE_DIR    local output destination (default: <this repo>/gen/cuda)
-#   SCENES           space-separated subset to regenerate (default: all ten)
+#   SCENES           space-separated subset to regenerate (default: all twelve)
 set -euo pipefail
 
 HOST=${1:?usage: generate_golden_outputs.sh <user@host> <ssh_port> [identity_file]}
@@ -34,7 +35,7 @@ SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
 run() { ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
 RSYNC_RSH="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -p $PORT"
 
-SCENES=${SCENES:-"CupPhone 2016Pour GlassPour PaddleSplash LegoDrop SpollingBowl TalkFan Trumpet HandShake FillerUp"}
+SCENES=${SCENES:-"CupPhone 2016Pour GlassPour PaddleSplash LegoDrop SpollingBowl TalkFan Trumpet HandShake FillerUp WineglassTap Cymbal"}
 
 echo "==> Installing dependencies on $HOST"
 run 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null && apt-get install -y -qq libeigen3-dev unzip rsync >/dev/null'
@@ -44,15 +45,12 @@ echo "==> Uploading WaveBlender source ($WAVEBLENDER_DIR) and FluidSound ($FLUID
 rsync -az --exclude '.git' --exclude 'Scenes' --exclude 'build' -e "$RSYNC_RSH" "$WAVEBLENDER_DIR"/ "$HOST":'~/WaveBlender/'
 rsync -az --exclude '.git' -e "$RSYNC_RSH" "$FLUIDSOUND_DIR"/ "$HOST":'~/WaveBlender/Source/FluidSound/'
 rsync -az -e "$RSYNC_RSH" "$REPO_ROOT/script/run_golden.py" "$HOST":'~/WaveBlender/'
-# The reference must run the same configs we do, retimed rates included.
+# The reference must run the same configs we do, retimed rates and our own scenes included.
 rsync -az --delete -e "$RSYNC_RSH" "$REPO_ROOT/config/" "$HOST":'~/WaveBlender/config/'
+rsync -az -e "$RSYNC_RSH" "$REPO_ROOT/script/FetchScenes" "$REPO_ROOT/script/scenes.sha256" "$HOST":'~/WaveBlender/script/'
 
-echo "==> Fetching scene data from the Stanford dataset (skips scenes already present)"
-run 'cd ~/WaveBlender && mkdir -p Scenes && cd Scenes && for f in '"$SCENES"'; do
-       [ -d "$f" ] && { echo "have $f"; continue; }
-       curl -sSfLO -A 'Mozilla/5.0' -e 'https://graphics.stanford.edu/papers/waveblender/dataset/' "https://graphics.stanford.edu/papers/waveblender/dataset/data/$f.zip" \
-         && unzip -qo "$f.zip" && rm "$f.zip" && echo "fetched $f" || echo "FAILED: $f"
-     done'
+echo "==> Fetching scene data (skips scenes already present)"
+run 'cd ~/WaveBlender && script/FetchScenes '"$SCENES"
 
 echo "==> Building"
 run 'export PATH=/usr/local/cuda/bin:$PATH && cd ~/WaveBlender && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. > cmake.log && make -j"$(nproc)" 2>&1 | tail -3'

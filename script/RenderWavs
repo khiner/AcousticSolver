@@ -21,9 +21,14 @@ import soundfile as sf
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 reference_dir = os.path.join(root, "gen", "cuda")
 build_dir = os.path.join(root, "build")
+
+def config_path(scene):
+    """Repo-owned override if there is one, else the dataset's own — Scenes/ is checksummed."""
+    override = os.path.join(root, "config", scene + ".json")
+    return override if os.path.isfile(override) else os.path.join(root, "Scenes", scene, "config.json")
+
 wav_dir = os.path.join(root, "gen", "wav")
-for kind in ("cuda", "metal"):
-    os.makedirs(os.path.join(wav_dir, kind), exist_ok=True)
+# Filed by rate, like the references, so retiming a scene does not overwrite its old rendering.
 
 scenes = sys.argv[1:] or sorted(
     s for s in os.listdir(reference_dir) if os.path.isdir(os.path.join(reference_dir, s))
@@ -39,7 +44,7 @@ def render(bin_path, wav_path, srate):
 
 
 for scene in scenes:
-    with open(os.path.join(root, "Scenes", scene, "config.json")) as f:
+    with open(config_path(scene)) as f:
         config = json.load(f)
     srate = config["FDTD_srate"]
 
@@ -47,10 +52,12 @@ for scene in scenes:
     for listener in config["listeners"].values():
         name = listener["output"]
         for kind, bin_path in (
-            ("cuda", os.path.join(reference_dir, scene, name + ".bin")),
+            ("cuda", os.path.join(reference_dir, scene, str(srate), name + ".bin")),
             ("metal", os.path.join(build_dir, name + ".bin")),
         ):
             if os.path.exists(bin_path):
-                duration = render(bin_path, os.path.join(wav_dir, kind, f"{scene}.wav"), srate)
+                out_dir = os.path.join(wav_dir, kind, scene)
+                os.makedirs(out_dir, exist_ok=True)
+                duration = render(bin_path, os.path.join(out_dir, f"{srate}.wav"), srate)
                 rendered.append(f"{kind} ({duration:.1f}s)")
     print(f"{scene}: {' + '.join(rendered) if rendered else 'no output found'} @ {srate} Hz")

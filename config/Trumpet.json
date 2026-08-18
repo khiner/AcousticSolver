@@ -1,0 +1,57 @@
+{
+  "Nx": 80,
+  "Ny": 80,
+  "Nz": 80,
+  "cellsize": 0.01,
+  "FDTD_srate": 66150,
+  "shader_srate": 44100,
+  "blendrate": 1000,
+  "ts": 0.0,
+  "tf": 10.0,
+  "damping": 0.0,
+  "objects": {
+    "1. Trumpet Speaker": {
+      "shader": "Speaker",
+      "offset": [
+        0.0,
+        -0.2,
+        0.0
+      ],
+      "meshFile": "../Scenes/Trumpet/trumpet_horn_speaker.obj",
+      "wavFile": "../Scenes/Trumpet/trumpet_2_low_mono.wav",
+      "direction": 0,
+      "animFile": ""
+    },
+    "2. Trumpet Horn": {
+      "shader": "Occluder",
+      "offset": [
+        0.0,
+        -0.2,
+        0.0
+      ],
+      "meshFile": "../Scenes/Trumpet/trumpet_horn.obj",
+      "animFile": ""
+    },
+    "3. Plunger": {
+      "shader": "Occluder",
+      "offset": [
+        0.0,
+        -0.2,
+        0.0
+      ],
+      "meshFile": "../Scenes/Trumpet/plunger_close.obj",
+      "animFile": "../Scenes/Trumpet/plunger_close_anim.txt"
+    }
+  },
+  "listeners": {
+    "1. Main Listener": {
+      "format": "Mono",
+      "output": "Trumpet_out",
+      "position": [
+        -0.284,
+        0.192,
+        -0.152
+      ]
+    }
+  }
+}

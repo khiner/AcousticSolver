@@ -1,0 +1,67 @@
+{
+  "Nx": 88,
+  "Ny": 88,
+  "Nz": 88,
+  "cellsize": 0.01,
+  "FDTD_srate": 66150,
+  "shader_srate": 44100,
+  "blendrate": 1000,
+  "ts": 0.0,
+  "tf": 10.5,
+  "damping": 0.0,
+  "objects": {
+    "1. Speaker": {
+      "shader": "Speaker",
+      "offset": [
+        0.0,
+        -0.97,
+        0.0
+      ],
+      "meshFile": "../Scenes/TalkFan/head_speaker.obj",
+      "wavFile": "../Scenes/TalkFan/luke_I_am_your_father.wav",
+      "direction": 5,
+      "animFile": ""
+    },
+    "2. Fan1": {
+      "shader": "Occluder",
+      "offset": [
+        0.0,
+        -0.97,
+        0.0
+      ],
+      "meshFile": "../Scenes/TalkFan/single_blade_thick_1p0_1.obj",
+      "animFile": "../Scenes/TalkFan/blade_1_anim.txt"
+    },
+    "3. Fan2": {
+      "shader": "Occluder",
+      "offset": [
+        0.0,
+        -0.97,
+        0.0
+      ],
+      "meshFile": "../Scenes/TalkFan/single_blade_thick_1p0_2.obj",
+      "animFile": "../Scenes/TalkFan/blade_2_anim.txt"
+    },
+    "4. Fan3": {
+      "shader": "Occluder",
+      "offset": [
+        0.0,
+        -0.97,
+        0.0
+      ],
+      "meshFile": "../Scenes/TalkFan/single_blade_thick_1p0_3.obj",
+      "animFile": "../Scenes/TalkFan/blade_3_anim.txt"
+    }
+  },
+  "listeners": {
+    "1. Main Listener": {
+      "format": "Mono",
+      "output": "TalkFan_out",
+      "position": [
+        0.06,
+        0.0,
+        0.3
+      ]
+    }
+  }
+}

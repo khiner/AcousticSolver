@@ -102,7 +102,11 @@ void MetalContext::Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::
 }
 
 void MetalContext::BeginDeferred() {
-    if (!GateEvent) GateEvent = Device->newSharedEvent();
+    if (!GateEvent) {
+        GateEvent = Device->newSharedEvent();
+        // Unchecked, the nil reaches encodeWait as an opaque ObjC exception.
+        if (!GateEvent) throw std::runtime_error("MTLSharedEvent creation failed");
+    }
     DeferredCmdBuf = Queue->commandBuffer();
     DeferredCmdBuf->retain();
     DeferredCmdBuf->encodeWait(GateEvent, GateValue + 1); // released by SignalDeferred()

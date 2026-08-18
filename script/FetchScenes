@@ -96,7 +96,8 @@ for scene in "${scenes[@]}"; do
     tmp="$(mktemp -d)"
     trap 'rm -rf "${tmp}"' EXIT
     echo "${scene}: downloading"
-    curl -fL --progress-bar -o "${tmp}/${scene}.zip" "${BaseUrl}/${scene}.zip"
+    # The host 403s a bare curl UA from datacenter IPs, so identify as a browser.
+    curl -fL --progress-bar -A 'Mozilla/5.0' -e 'https://graphics.stanford.edu/papers/waveblender/dataset/' -o "${tmp}/${scene}.zip" "${BaseUrl}/${scene}.zip"
     # Unpack aside first: archives may or may not carry a top-level <Scene>/, and a failed
     # extract must not leave a half-populated scene behind.
     unzip -q "${tmp}/${scene}.zip" -d "${tmp}/x"

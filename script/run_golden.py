@@ -7,7 +7,13 @@ generate_golden_outputs.sh). Outputs land in build/cuda/<scene>/.
 import json, os, shutil, subprocess, sys, time
 
 SCENES_DIR = "../Scenes"
+CONFIG_DIR = "../config"  # repo-owned overrides, e.g. a retimed FDTD rate
 OUT_DIR = "cuda"
+
+
+def config_path(scene):
+    override = os.path.join(CONFIG_DIR, scene + ".json")
+    return override if os.path.isfile(override) else os.path.join(SCENES_DIR, scene, "config.json")
 
 
 def write_wav(bin_path, srate):
@@ -25,18 +31,17 @@ def write_wav(bin_path, srate):
     sf.write(os.path.splitext(bin_path)[0] + ".wav", data, srate)
 
 results = []
-for scene in sorted(os.listdir(SCENES_DIR)):
-    config_path = os.path.join(SCENES_DIR, scene, "config.json")
-    if not os.path.isfile(config_path):
+for scene in sys.argv[1:] or sorted(os.listdir(SCENES_DIR)):
+    if not os.path.isfile(config_path(scene)):
         continue
-    with open(config_path) as f:
+    with open(config_path(scene)) as f:
         config = json.load(f)
     srate = config["FDTD_srate"]
     outputs = [l["output"] for l in config["listeners"].values()]
 
     print(f"=== {scene} (srate={srate}, tf={config['tf']}) ===", flush=True)
     t0 = time.time()
-    proc = subprocess.run(["./WaveBlender", config_path])
+    proc = subprocess.run(["./WaveBlender", config_path(scene)])
     elapsed = time.time() - t0
     status = "OK" if proc.returncode == 0 else f"EXIT {proc.returncode}"
     results.append((scene, status, elapsed))
@@ -44,7 +49,7 @@ for scene in sorted(os.listdir(SCENES_DIR)):
     if proc.returncode != 0:
         continue
 
-    dest = os.path.join(OUT_DIR, scene)
+    dest = os.path.join(OUT_DIR, scene, str(srate))
     os.makedirs(dest, exist_ok=True)
     for name in outputs:
         bin_path = name + ".bin"

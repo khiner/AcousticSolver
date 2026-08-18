@@ -3,10 +3,14 @@
 The Metal port is validated against listener outputs from the reference CUDA implementation
 (RTX 4090, CUDA 12.8, gcc, Linux — `script/generate_golden_outputs.sh`, committed under
 `gen/cuda/`). `script/ValidateGolden` runs every scene and compares the listener pressure
-output sample-for-sample. `gen/wav/{cuda,metal}/` holds paired renderings for listening.
+output sample-for-sample. `gen/wav/{cuda,metal}/<scene>/<rate>.wav` holds paired renderings for listening, filed by rate
+like the references, so a retimed scene's previous rendering stays listenable beside its new one.
 
 The reference outputs are committed, so scoring works from a fresh clone without a CUDA host.
-The scene data is not (~1.5 GB) — run `script/FetchScenes` first.
+They are filed by the rate they were generated at, so a retimed scene compares against a
+reference at the same rate. The scene data is not committed (~1.5 GB) — run
+`script/FetchScenes` first. `Scenes/` is fetched and checksummed, so anything we change about
+a scene lives in `config/<scene>.json` rather than being edited in place there.
 
 ## Key numerics decisions
 
@@ -15,7 +19,7 @@ The scene data is not (~1.5 GB) — run `script/FetchScenes` first.
 - Every floating-point expression matches the CUDA reference operation-for-operation, and
   every optimization round was gated on byte-identical listener outputs vs the previous
   build plus the unchanged bit-exact prefix vs CUDA below.
-- Three deliberate output-observable changes, all validated:
+- Four deliberate output-observable changes, all validated:
   1. **Fresh-cell least squares per connected component.** The reference's global
      minimum-norm system is block-diagonal across connected components, so solving per
      component is identical in exact arithmetic and differs only in float rounding, while
@@ -36,6 +40,32 @@ The scene data is not (~1.5 GB) — run `script/FetchScenes` first.
      quantization). A derived inverse is always exactly one update from a fresh
      factorization, so rounding error never compounds. The inline fallback path factors
      and substitutes exactly as the reference does.
+  4. **FDTD timestep raised toward the CFL limit** on TalkFan, Trumpet and 2016Pour. The
+     paper sets the step rate from the audio rate rather than from the grid — *"our FDTD
+     timestep size is often higher (88.2 kHz and above) than our target grid resolutions—as
+     determined by the CFL condition"* (§6.1) — leaving those three at Courant numbers of
+     0.357–0.389 against the 7-point scheme's limit of 1/√3 = 0.577. They now run at
+     0.519–0.536: 1.34× fewer steps for the speaker scenes, 1.5× for 2016Pour.
+
+     **This lowers numerical dispersion rather than raising it.** The scheme's spatial and
+     temporal truncation errors partially cancel, maximally at the stability limit — the
+     dispersion relation is exact along body diagonals at exactly 1/√3 — so at fixed Δx the
+     *largest* stable timestep is the most accurate one, and Δt → 0 converges to the
+     semi-discrete solution, not the true one. Axis-aligned phase error at 4 kHz falls from
+     1.90% to 1.65%, widening the 2%-dispersion bandwidth from 4.1 to 4.4 kHz.
+
+     The listener is sampled once per step, so the output rate drops with the step rate.
+     Nothing representable is lost: the grid's own bandwidth is c/2Δx = 17.2 kHz for the
+     speaker scenes, far below either Nyquist. References were regenerated at the new rates
+     (`gen/cuda/<scene>/<rate>/`, originals kept), so the comparison stays
+     same-discretization and all three verdicts are unchanged.
+
+     **Constraint when retiming:** the FDTD and shader batch durations must be equal under
+     integer division — `(FdtdSrate/BlendRate)/FdtdSrate == (ShaderSrate/BlendRate)/ShaderSrate`.
+     Violating it drifts the source clock against the acoustic clock (66000 Hz gives
+     1.00000 ms against the shader's 0.99773 ms, 24 ms of skew over a run) and decorrelates
+     the output uniformly across every octave — unlike real dispersion, which is always
+     monotonic in frequency. 66150 satisfies it; 66000 does not.
 
 ## What "matching" means across platforms
 
@@ -61,15 +91,17 @@ zero bit-exact prefix); nothing does.
 
 ## Results (full suite)
 
-Established 2026-08-15, reproduced to all displayed digits after every optimization round
-since:
+Established 2026-08-15 and reproduced to all displayed digits after every optimization round
+since. TalkFan and Trumpet moved once, on 2026-08-17, when their timestep was raised (1.9e-5
+→ 2.5e-5 and 2.3e-4 → 2.8e-4) — a different discretization compared against its own
+reference, not a regression:
 
 | Scene | Sources | Verdict | rel L2 | corr | RMS ratio | spec err |
 |---|---|---|---|---|---|---|
 | CupPhone | Speaker + Occluder | OK | 1.3e-5 | 1.000000 | 1.0000 | 7.5e-6 |
-| TalkFan | Speaker ×2 + Occluders | OK | 1.9e-5 | 1.000000 | 1.0000 | 1.1e-5 |
+| TalkFan | Speaker ×2 + Occluders | OK | 2.5e-5 | 1.000000 | 1.0000 | 1.5e-5 |
 | FillerUp | Point + Density | OK | 2.0e-4 | 1.000000 | 1.0000 | 2.4e-4 |
-| Trumpet | Speaker + Occluder | OK | 2.3e-4 | 1.000000 | 1.0000 | 1.1e-4 |
+| Trumpet | Speaker + Occluder | OK | 2.8e-4 | 1.000000 | 1.0000 | 1.4e-4 |
 | LegoDrop | Modal | OK | 1.2e-3 | 0.999999 | 0.9999 | 6.1e-4 |
 | SpollingBowl | Modal | OK | 6.3e-3 | 0.999980 | 1.0000 | 3.0e-3 |
 | HandShake | Point + Occluders | OK(env) | 2.5e-2 | 0.999683 | 1.0004 | 1.8e-2 |

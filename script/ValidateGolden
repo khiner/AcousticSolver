@@ -31,6 +31,13 @@ build_dir = os.path.join(root, "build")
 reference_dir = os.path.join(root, "gen", "cuda")
 results_path = os.path.join(build_dir, "validation.json")
 
+
+def config_path(scene):
+    """Repo-owned override if there is one, else the dataset's own — Scenes/ is checksummed."""
+    override = os.path.join(root, "config", scene + ".json")
+    return override if os.path.isfile(override) else os.path.join(root, "Scenes", scene, "config.json")
+
+
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument("scenes", nargs="*")
 parser.add_argument("--score", action="store_true", help="score existing build/*.bin without rendering")
@@ -64,9 +71,9 @@ def render(scene, config_path):
 
 
 def score(name, srate):
-    """Metrics for one listener's output against its CUDA reference counterpart."""
+    """Metrics for one listener's output against its CUDA reference at the same rate."""
     metal = np.fromfile(os.path.join(build_dir, name + ".bin"), dtype=np.float32)
-    cuda = np.fromfile(os.path.join(reference_dir, scene, name + ".bin"), dtype=np.float32)
+    cuda = np.fromfile(os.path.join(reference_dir, scene, str(srate), name + ".bin"), dtype=np.float32)
     n = min(len(metal), len(cuda))
     m, c = metal[:n].astype(np.float64), cuda[:n].astype(np.float64)
 
@@ -102,15 +109,14 @@ def score(name, srate):
 
 failures = 0
 for scene in scenes:
-    config_path = os.path.join(root, "Scenes", scene, "config.json")
-    with open(config_path) as f:
+    with open(config_path(scene)) as f:
         config = json.load(f)
     srate = config["FDTD_srate"]
 
     print(f"=== {scene} (tf={config['tf']}s @ {srate} Hz) ===", flush=True)
     entry = results.setdefault(scene, {})
     if not args.score:
-        elapsed = render(scene, config_path)
+        elapsed = render(scene, config_path(scene))
         if elapsed is None:
             failures += 1
             continue

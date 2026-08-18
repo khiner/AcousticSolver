@@ -19,15 +19,16 @@ quiet machine — because this GPU's thermal drift is large enough (a scene meas
 | LegoDrop | 13.7s | 10.0s | 2.7s |
 | SpollingBowl | 83.5s | 61.3s | 6.3s |
 | FillerUp | 72.2s | 90.2s | 26.9s |
-| Trumpet | 45.4s | 76.8s | 30.5s |
-| TalkFan | 132.2s | 128.2s | 40.1s |
+| Trumpet | 45.4s | 76.8s | 24.9s |
+| TalkFan | 132.2s | 128.2s | 33.3s |
 | HandShake | 102.5s | 124.9s | 45.6s |
-| 2016Pour | 127.4s | 187.0s | 68.7s |
-| PaddleSplash | 615.1s | 400.5s | 50.5s |
-| **Total** | **1254.9s** | **1170.0s** | **305.5s** |
+| 2016Pour | 127.4s | 187.0s | 51.6s |
+| PaddleSplash | 615.1s | 400.5s | 51.6s |
+| **Total** | **1254.9s** | **1170.0s** | **277.1s** |
 
 Notable performance changes relative to upstream WaveBlender:
 
+- Three scenes step at the grid's Courant limit rather than at the audio rate they inherited (TalkFan/Trumpet 88.2 → 66.15 kHz, 2016Pour 192 → 128 kHz): 1.34–1.5× fewer timesteps, and *less* numerical dispersion, since this scheme's spatial and temporal truncation errors cancel most fully at the stability limit. Retimed configs live in `config/`; the CUDA reference was regenerated at the matching rates so the validation verdicts are unchanged.
 - One fused full-grid kernel per FDTD step (velocity + pressure, ping-pong buffers) instead of separate passes, with byte cell states and blending weights derived in-kernel.
 - PML split-pressure fields packed into dense shell slabs (full-grid storage left most of each cache line untouched in the x-tapered strips), and threadgroup shapes chosen per scene grid size.
 - Boundary conditions applied to the velocities as they are written by the fused step, rather than by a separate dispatch per timestep, so each thread transforms exactly the faces it owns.

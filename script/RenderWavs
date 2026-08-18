@@ -2,11 +2,11 @@
 """Render listenable WAVs from raw listener output (.bin float32 pressure samples).
 
 Usage (from anywhere):
-    script/RenderWavs                # all scenes with golden and/or Metal output
+    script/RenderWavs                # all scenes with reference and/or Metal output
     script/RenderWavs GlassPour ...  # just these scenes
 
-For each scene, writes wav/<scene>_cuda.wav from golden/<scene>/<output>.bin and
-wav/<scene>_metal.wav from build/<output>.bin, whichever exist. Follows the reference
+For each scene, writes gen/wav/cuda/<scene>.wav from gen/cuda/<scene>/<output>.bin and
+gen/wav/metal/<scene>.wav from build/<output>.bin, whichever exist. Follows the reference
 write_wav.py convention: peak-normalized, at the scene's FDTD sample rate.
 Pure CPU — no GPU needed. Requires numpy + soundfile.
 """
@@ -19,13 +19,14 @@ import numpy as np
 import soundfile as sf
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-golden_dir = os.path.join(root, "golden")
+reference_dir = os.path.join(root, "gen", "cuda")
 build_dir = os.path.join(root, "build")
-wav_dir = os.path.join(root, "wav")
-os.makedirs(wav_dir, exist_ok=True)
+wav_dir = os.path.join(root, "gen", "wav")
+for kind in ("cuda", "metal"):
+    os.makedirs(os.path.join(wav_dir, kind), exist_ok=True)
 
 scenes = sys.argv[1:] or sorted(
-    s for s in os.listdir(golden_dir) if os.path.isdir(os.path.join(golden_dir, s))
+    s for s in os.listdir(reference_dir) if os.path.isdir(os.path.join(reference_dir, s))
 )
 
 
@@ -46,10 +47,10 @@ for scene in scenes:
     for listener in config["listeners"].values():
         name = listener["output"]
         for kind, bin_path in (
-            ("cuda", os.path.join(golden_dir, scene, name + ".bin")),
+            ("cuda", os.path.join(reference_dir, scene, name + ".bin")),
             ("metal", os.path.join(build_dir, name + ".bin")),
         ):
             if os.path.exists(bin_path):
-                duration = render(bin_path, os.path.join(wav_dir, f"{scene}_{kind}.wav"), srate)
+                duration = render(bin_path, os.path.join(wav_dir, kind, f"{scene}.wav"), srate)
                 rendered.append(f"{kind} ({duration:.1f}s)")
     print(f"{scene}: {' + '.join(rendered) if rendered else 'no output found'} @ {srate} Hz")

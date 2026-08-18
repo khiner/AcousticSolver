@@ -1,0 +1,119 @@
+#!/bin/bash
+
+# Populates Scenes/ with the WaveBlender dataset (Xue et al., SIGGRAPH Asia 2024), ~1.5 GB,
+# which is why it is fetched rather than vendored. It has to land at the repository root: the
+# dataset's own configs hardcode "../Scenes/<Scene>/..." and the solver runs from build/.
+#
+# Usage:
+#   script/FetchScenes                  # download every scene (skips ones already present)
+#   script/FetchScenes CupPhone TalkFan # only these
+#   script/FetchScenes --verify         # checksum what is on disk, download nothing
+#   script/FetchScenes --link <path>    # symlink an existing copy instead of downloading
+#   script/FetchScenes --force          # re-download even if present
+#
+# Each scene is checksummed against script/scenes.sha256 after download. The hash covers the
+# extracted file tree rather than the archive, so it also catches a partial extract or a
+# scene edited in place.
+
+set -euo pipefail
+
+ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
+ProjectRootDir="$(dirname "${ScriptDir}")"
+ScenesDir="${ProjectRootDir}/Scenes"
+BaseUrl="https://graphics.stanford.edu/papers/waveblender/dataset/data"
+
+AllScenes=(2016Pour CupPhone FillerUp GlassPour HandShake LegoDrop PaddleSplash SpollingBowl TalkFan Trumpet)
+Manifest="${ScriptDir}/scenes.sha256"
+
+# Digest of a scene's file tree. LC_ALL=C sort keeps it stable across systems.
+SceneDigest() {
+    (cd "${ScenesDir}/$1" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -d' ' -f1)
+}
+
+# Checks a scene against the manifest, skipping any the manifest does not list.
+VerifyScene() {
+    local scene=$1 want have
+    want=$(awk -v s="$scene" '$2 == s { print $1 }' "${Manifest}" 2>/dev/null || true)
+    [ -n "${want}" ] || { echo "${scene}: not in $(basename "${Manifest}") — skipping checksum"; return 0; }
+    have=$(SceneDigest "${scene}")
+    if [ "${have}" != "${want}" ]; then
+        echo "${scene}: CHECKSUM MISMATCH" >&2
+        echo "  expected ${want}" >&2
+        echo "  got      ${have}" >&2
+        echo "  Re-fetch with: script/FetchScenes --force ${scene}" >&2
+        return 1
+    fi
+    echo "${scene}: verified"
+}
+
+force=0
+verify_only=0
+scenes=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --link)
+            [ -n "${2:-}" ] || { echo "--link needs a path" >&2; exit 1; }
+            src="$(cd "$2" && pwd)"
+            [ -d "${src}" ] || { echo "not a directory: ${src}" >&2; exit 1; }
+            if [ -e "${ScenesDir}" ] && [ ! -L "${ScenesDir}" ]; then
+                echo "${ScenesDir} exists and is not a symlink — remove it first" >&2
+                exit 1
+            fi
+            ln -sfn "${src}" "${ScenesDir}"
+            echo "Scenes -> ${src}"
+            exit 0
+            ;;
+        --force) force=1; shift ;;
+        --verify) verify_only=1; shift ;;
+        -h|--help) sed -n '3,18p' "$0"; exit 0 ;;
+        -*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *) scenes+=("$1"); shift ;;
+    esac
+done
+[ ${#scenes[@]} -gt 0 ] || scenes=("${AllScenes[@]}")
+
+if [ "${verify_only}" -eq 1 ]; then
+    status=0
+    for scene in "${scenes[@]}"; do
+        [ -d "${ScenesDir}/${scene}" ] || { echo "${scene}: missing"; status=1; continue; }
+        VerifyScene "${scene}" || status=1
+    done
+    exit "${status}"
+fi
+
+if [ -L "${ScenesDir}" ]; then
+    echo "Scenes is a symlink to $(readlink "${ScenesDir}") — remove it to download in place." >&2
+    exit 1
+fi
+mkdir -p "${ScenesDir}"
+
+for scene in "${scenes[@]}"; do
+    dest="${ScenesDir}/${scene}"
+    if [ -f "${dest}/config.json" ] && [ "${force}" -eq 0 ]; then
+        echo "${scene}: already present"
+        continue
+    fi
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+    echo "${scene}: downloading"
+    curl -fL --progress-bar -o "${tmp}/${scene}.zip" "${BaseUrl}/${scene}.zip"
+    # Unpack aside first: archives may or may not carry a top-level <Scene>/, and a failed
+    # extract must not leave a half-populated scene behind.
+    unzip -q "${tmp}/${scene}.zip" -d "${tmp}/x"
+    if [ -f "${tmp}/x/config.json" ]; then
+        staged="${tmp}/x"
+    elif [ -f "${tmp}/x/${scene}/config.json" ]; then
+        staged="${tmp}/x/${scene}"
+    else
+        echo "${scene}: no config.json in the archive" >&2
+        exit 1
+    fi
+    rm -rf "${dest}"
+    mv "${staged}" "${dest}"
+    rm -rf "${tmp}"
+    trap - EXIT
+    VerifyScene "${scene}"
+done
+
+echo
+echo "Scenes/ ready. Verify with: script/ValidateGolden --score"

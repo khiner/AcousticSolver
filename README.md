@@ -4,7 +4,8 @@ Exploring acoustic radiation transfer GPU solvers
 ## WaveBlender
 
 A from-scratch Metal port of [WaveBlender](https://github.com/kangruix/WaveBlender) (Xue et al., SIGGRAPH Asia 2024), an FDTD acoustic wave solver that renders sound for animated scenes from coupled sources: vibrating rigid bodies (modal), water bubbles, speakers, point impulses, and occluders.
-Output is validated per-scene against golden outputs from the CUDA reference — see [VALIDATION.md](VALIDATION.md).
+Output is validated per-scene against the CUDA reference's listener outputs, committed under `gen/cuda/` — see [VALIDATION.md](VALIDATION.md).
+The ~1.5 GB scene dataset is not vendored: run `script/FetchScenes` to download it into `Scenes/` (checksummed against `script/scenes.sha256`).
 
 Wall-clock per scene. CUDA reference on an RTX 4090 (Linux, CUDA 12.8), Metal on an Apple M5 Max.
 The Metal column is a cool sweep — one scene per idle GPU, two minutes apart, on an otherwise

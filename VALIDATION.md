@@ -1,9 +1,12 @@
 # Validation
 
-The Metal port is validated against golden outputs from the reference CUDA implementation
-(RTX 4090, CUDA 12.8, gcc, Linux — `script/generate_golden_outputs.sh`, stored in
-`golden/`). `script/ValidateGolden` runs every scene and compares the listener pressure
-output sample-for-sample. `wav/` holds paired renderings for listening.
+The Metal port is validated against listener outputs from the reference CUDA implementation
+(RTX 4090, CUDA 12.8, gcc, Linux — `script/generate_golden_outputs.sh`, committed under
+`gen/cuda/`). `script/ValidateGolden` runs every scene and compares the listener pressure
+output sample-for-sample. `gen/wav/{cuda,metal}/` holds paired renderings for listening.
+
+The reference outputs are committed, so scoring works from a fresh clone without a CUDA host.
+The scene data is not (~1.5 GB) — run `script/FetchScenes` first.
 
 ## Key numerics decisions
 
@@ -23,13 +26,13 @@ output sample-for-sample. `wav/` holds paired renderings for listening.
      raced by two threads, making output **nondeterministic run-to-run** (reproduced on
      both the CUDA structure and the original port). Blend and force points now dispatch
      as two ordered ranges; non-colliding faces are bit-unaffected. The fix moved
-     FillerUp from envelope-level to full waveform agreement with the golden (rel L2
+     FillerUp from envelope-level to full waveform agreement with the reference (rel L2
      3.4e-2 → 2.0e-4) and tightened HandShake (6.5e-2 → 2.5e-2).
   3. **Explicit bubble mass-matrix inverses.** The coupled-bubble solve applies
      precomputed explicit inverses (`dpotrf`/`dpotri`, chained by SPD Schur updates — see
      Performance) instead of factor-and-substitute. Same linear systems, different
      operation order: bubble-scene outputs differ at rel L2 ~1e-6, five orders below the
-     CUDA-golden comparison level (byte-identical for GlassPour, below float32 output
+     CUDA-reference comparison level (byte-identical for GlassPour, below float32 output
      quantization). A derived inverse is always exactly one update from a fresh
      factorization, so rounding error never compounds. The inline fallback path factors
      and substitutes exactly as the reference does.
@@ -134,15 +137,17 @@ verdicts above hold unchanged across all of them.
 ## Rerunning
 
 ```
+script/FetchScenes                 # download the scene data into Scenes/ (~1.5 GB, once)
+script/FetchScenes --verify        # checksum Scenes/ against script/scenes.sha256
 script/Build                       # build (Homebrew LLVM, C++23)
 script/ValidateGolden --profile    # render every scene once: verdicts + wall + phase timing
 script/ValidateGolden --score      # re-score build/*.bin — no rendering
 script/ValidateGolden GlassPour    # one scene (either mode)
 ACOUSTIC_GLOBAL_LSTSQ=1 ...        # reference-bit-identical fresh-cell solve
-script/generate_golden_outputs.sh root@<pod-ip> <port>   # regenerate goldens (CUDA host)
+script/generate_golden_outputs.sh root@<pod-ip> <port>   # regenerate the reference (CUDA host)
 ```
 
 **Render each scene at most once per session.** Scoring is a pure function of the listener
-bytes and the golden bytes, so any run leaves what a later `--score` needs, persisted in
+bytes and the reference bytes, so any run leaves what a later `--score` needs, persisted in
 `build/validation.json`. And outputs byte-identical to a build whose metrics are recorded
 here have identical metrics by construction — `cmp` settles that, re-rendering does not.

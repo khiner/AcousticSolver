@@ -1,1 +1,3 @@
 src/ThirdParty/** linguist-vendored
+gen/**/*.bin binary
+gen/**/*.wav binary

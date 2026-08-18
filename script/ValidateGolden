@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Score listener output against the CUDA golden outputs, rendering only if asked to.
+"""Score listener output against the CUDA reference outputs, rendering only if asked to.
 
-Scoring is a pure function of build/<listener>.bin and the golden bytes, and every solver
+Scoring is a pure function of build/<listener>.bin and the reference bytes, and every solver
 run leaves the former behind, so a session should render each scene at most once:
 
     script/ValidateGolden --score              # score what is already in build/, no renders
@@ -14,7 +14,7 @@ Results persist to build/validation.json so the README/VALIDATION tables regener
 byte-identical to a build whose metrics are recorded, the metrics are identical too —
 `cmp` settles that more cheaply than re-rendering.
 
-Golden outputs come from script/generate_golden_outputs.sh (golden/<scene>/<output>.bin).
+Reference outputs come from script/generate_golden_outputs.sh (gen/cuda/<scene>/<output>.bin).
 """
 
 import argparse
@@ -28,7 +28,7 @@ import numpy as np
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 build_dir = os.path.join(root, "build")
-golden_dir = os.path.join(root, "golden")
+reference_dir = os.path.join(root, "gen", "cuda")
 results_path = os.path.join(build_dir, "validation.json")
 
 parser = argparse.ArgumentParser(add_help=True)
@@ -38,7 +38,7 @@ parser.add_argument("--profile", action="store_true", help="render with ACOUSTIC
 args = parser.parse_args()
 
 scenes = args.scenes or sorted(
-    s for s in os.listdir(golden_dir) if os.path.isdir(os.path.join(golden_dir, s))
+    s for s in os.listdir(reference_dir) if os.path.isdir(os.path.join(reference_dir, s))
 )
 
 results = {}
@@ -64,9 +64,9 @@ def render(scene, config_path):
 
 
 def score(name, srate):
-    """Metrics for one listener's output against its golden counterpart."""
+    """Metrics for one listener's output against its CUDA reference counterpart."""
     metal = np.fromfile(os.path.join(build_dir, name + ".bin"), dtype=np.float32)
-    cuda = np.fromfile(os.path.join(golden_dir, scene, name + ".bin"), dtype=np.float32)
+    cuda = np.fromfile(os.path.join(reference_dir, scene, name + ".bin"), dtype=np.float32)
     n = min(len(metal), len(cuda))
     m, c = metal[:n].astype(np.float64), cuda[:n].astype(np.float64)
 

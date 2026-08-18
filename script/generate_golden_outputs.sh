@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate golden CUDA reference outputs for all WaveBlender scenes on a remote
+# Generate the CUDA reference listener outputs for all WaveBlender scenes on a remote
 # NVIDIA GPU host (e.g. a RunPod RTX 4090 pod) and fetch them back.
 #
 # Usage:
@@ -16,7 +16,7 @@
 # Layout assumptions (override via env vars):
 #   WAVEBLENDER_DIR  CUDA reference repo      (default: <this repo>/../WaveBlender)
 #   FLUIDSOUND_DIR   FluidSound clone         (default: <this repo>/../FluidSound)
-#   GOLDEN_DIR       local output destination (default: <this repo>/golden)
+#   REFERENCE_DIR    local output destination (default: <this repo>/gen/cuda)
 set -euo pipefail
 
 HOST=${1:?usage: generate_golden_outputs.sh <user@host> <ssh_port> [identity_file]}
@@ -26,7 +26,7 @@ KEY=${3:-$HOME/.ssh/id_rsa}
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WAVEBLENDER_DIR=${WAVEBLENDER_DIR:-$REPO_ROOT/../WaveBlender}
 FLUIDSOUND_DIR=${FLUIDSOUND_DIR:-$REPO_ROOT/../FluidSound}
-GOLDEN_DIR=${GOLDEN_DIR:-$REPO_ROOT/golden}
+REFERENCE_DIR=${REFERENCE_DIR:-$REPO_ROOT/gen/cuda}
 
 SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
           -o ServerAliveInterval=30 -p "$PORT")
@@ -55,11 +55,11 @@ echo "==> Building"
 run 'export PATH=/usr/local/cuda/bin:$PATH && cd ~/WaveBlender && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. > cmake.log && make -j"$(nproc)" 2>&1 | tail -3'
 
 echo "==> Running all scenes (streams progress; this takes a while)"
-run 'cd ~/WaveBlender/build && cp ../run_golden.py . && python3 run_golden.py 2>&1 | tee golden_run.log'
+run 'cd ~/WaveBlender/build && cp ../run_golden.py . && python3 run_golden.py 2>&1 | tee run.log'
 
 echo "==> Fetching outputs to $GOLDEN_DIR"
 mkdir -p "$GOLDEN_DIR"
-rsync -az -e "$RSYNC_RSH" "$HOST":'~/WaveBlender/build/golden/' "$GOLDEN_DIR"/
-rsync -az -e "$RSYNC_RSH" "$HOST":'~/WaveBlender/build/golden_run.log' "$GOLDEN_DIR"/
+rsync -az -e "$RSYNC_RSH" "$HOST":'~/WaveBlender/build/cuda/' "$REFERENCE_DIR"/
+rsync -az -e "$RSYNC_RSH" "$HOST":'~/WaveBlender/build/run.log' "$REFERENCE_DIR"/
 
 echo "==> Done. Golden outputs in $GOLDEN_DIR"

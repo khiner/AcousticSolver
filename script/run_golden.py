@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Run every WaveBlender scene and collect golden outputs.
+"""Run every WaveBlender scene and collect its CUDA reference listener outputs.
 
 Executed on the GPU host from WaveBlender's build/ directory (uploaded there by
-generate_golden_outputs.sh). Outputs land in build/golden/<scene>/.
+generate_golden_outputs.sh). Outputs land in build/cuda/<scene>/.
 """
 import json, os, shutil, subprocess, sys, time
 
 SCENES_DIR = "../Scenes"
-OUT_DIR = "golden"
+OUT_DIR = "cuda"
 
 
 def write_wav(bin_path, srate):

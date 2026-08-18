@@ -22,8 +22,8 @@ quiet machine — because this GPU's thermal drift is large enough (a scene meas
 | TalkFan | 132.2s | 128.2s | 40.1s |
 | HandShake | 102.5s | 124.9s | 45.6s |
 | 2016Pour | 127.4s | 187.0s | 68.7s |
-| PaddleSplash | 615.1s | 400.5s | 52.1s |
-| **Total** | **1254.9s** | **1170.0s** | **307.1s** |
+| PaddleSplash | 615.1s | 400.5s | 50.5s |
+| **Total** | **1254.9s** | **1170.0s** | **305.5s** |
 
 Notable performance changes relative to upstream WaveBlender:
 
@@ -35,6 +35,7 @@ Notable performance changes relative to upstream WaveBlender:
   The next batch's command buffers are encoded and committed before the sync (gated on a shared event the host signals after its fresh-cell writes), and the fresh-cell least-squares systems are factorized pre-sync, so the GPU restarts almost immediately.
   Batches with no fresh cells — half of them in a typical animated scene, all of them in some — have nothing for the host to write, so their gate opens *before* the sync and the host round trip leaves the GPU's critical path entirely.
 - Bubble mass-matrix inverses are precomputed on worker threads with Accelerate (AMX) and chained across adjacent event intervals by low-rank updates, so the coupled-bubble solve applies two matrix-vector products per RK4 stage.
+  Those two products are independent, so they run on separate cores once an inverse outgrows the cache, which also keeps the solve thread out of the precompute workers' memory bandwidth.
 - The fresh-cell least-squares solve runs per connected component, in parallel.
 - Modal filter coefficients are computed once, and modal transfer-matrix rows are reused across batches when the pose and boundary face are unchanged.
 - Flat, data-oriented CPU batch prep: lookup tables instead of sets/maps, bounds-limited grid sweeps, time-windowed impulse queries, and parallel rasterization and closest-point queries.

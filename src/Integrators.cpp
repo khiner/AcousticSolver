@@ -6,6 +6,7 @@
 #include "Integrators.h"
 
 #include "Parallel.h"
+#include "Profile.h"
 
 // AMX-backed matrix-vector products for the precomputed-inverse solve path
 // (see InverseProvider in Integrators.h)
@@ -17,6 +18,9 @@
 namespace FluidSound {
 
 void CoupledDirect::Step(double time) {
+    static profile::Entry &phase = profile::Phase("bubble/rk4");
+    const profile::Scope scope{phase};
+
     const Eigen::ArrayXd &k1 = Solve(States, time);
     Acc = k1;
     Y = States + Dt / 2. * k1;
@@ -77,8 +81,6 @@ void CoupledDirect::UpdateData(const std::vector<Oscillator *> &coupled, const s
 }
 
 void CoupledDirect::ComputeKcf(double time) {
-    const auto coeff_start = std::chrono::steady_clock::now();
-
     const double alpha = (time - T1) / (T2 - T1);
 
     // Stiffness at the current time, K = w0^2. The fused .square() avoids a w0 temporary.
@@ -96,8 +98,6 @@ void CoupledDirect::ComputeKcf(double time) {
         const double cutoff = force(1, i), weight = force(2, i), t = time - force(0, i);
         FVals[i] = (t < cutoff) * weight * t * t;
     }
-
-    CoeffTime += std::chrono::steady_clock::now() - coeff_start;
 }
 
 void CoupledDirect::ConstructMass(const Eigen::Array<double, 6, Eigen::Dynamic> &solve_data1, const Eigen::Array<double, 6, Eigen::Dynamic> &solve_data2, double t1, double t2, double time, int n_coupled, Matrix &m) {
@@ -130,11 +130,10 @@ void CoupledDirect::ConstructMass(const Eigen::Array<double, 6, Eigen::Dynamic> 
 // Takes endpoint inverses from the precompute pipeline when one is installed, otherwise
 // constructs and factors the two independent endpoints concurrently (the reference path).
 void CoupledDirect::Refactor() {
-    const auto mass_start = std::chrono::steady_clock::now();
+    const profile::Scope scope{"bubble/refactor"};
 
     if (InverseProvider && InverseProvider(T1, T2, NCoupled, Inv1, Inv2)) {
         UseInverse = true;
-        MassTime += std::chrono::steady_clock::now() - mass_start;
         return;
     }
     UseInverse = false;
@@ -149,14 +148,10 @@ void CoupledDirect::Refactor() {
         }
     });
     if (Factor1.info() == Eigen::NumericalIssue || Factor2.info() == Eigen::NumericalIssue) throw std::runtime_error("Non positive definite matrix!");
-
-    MassTime += std::chrono::steady_clock::now() - mass_start;
 }
 
 const Eigen::ArrayXd &CoupledDirect::Solve(const Eigen::ArrayXd &states, double time) {
     ComputeKcf(time);
-
-    const auto solve_start = std::chrono::steady_clock::now();
 
     const double alpha = (time - T1) / (T2 - T1);
     Radii = (1. - alpha) * SolveData1.row(0) + alpha * SolveData2.row(0);
@@ -166,22 +161,37 @@ const Eigen::ArrayXd &CoupledDirect::Solve(const Eigen::ArrayXd &states, double 
     Rhs = (FVals - CVals * states.segment(NTotal, NTotal) - KVals * states.segment(0, NTotal)) / SqrtRadii;
     // With precomputed endpoint inverses the blended solve is two matrix-vector products.
     // Otherwise, substitute against the inline Cholesky factors.
-    if (UseInverse) {
-        if (NCoupled > 0) {
-            Sol1.resize(NCoupled);
-            Sol2.resize(NCoupled);
-            cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv1.data(), NCoupled, Rhs.data(), 1, 0., Sol1.data(), 1);
-            cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv2.data(), NCoupled, Rhs.data(), 1, 0., Sol2.data(), 1);
-            Rhs.head(NCoupled) = (1. - alpha) * Sol1 + alpha * Sol2;
+    {
+        static profile::Entry &phase = profile::Phase("bubble/apply");
+        const profile::Scope scope{phase};
+        if (UseInverse) {
+            if (NCoupled > 0) {
+                Sol1.resize(NCoupled);
+                Sol2.resize(NCoupled);
+                // The two products are independent, so splitting them across cores is
+                // bit-identical as long as each stays one unsplit Accelerate call (splitting a
+                // *single* product is not — see VALIDATION.md). Only worth the thread hop once
+                // an inverse outgrows the last-level cache and one core can no longer saturate
+                // the read.
+                if (size_t(NCoupled) * NCoupled * sizeof(double) > (size_t{2} << 20)) {
+                    ParallelFor(2, 1, [&](size_t which) {
+                        const double *inv = which == 0 ? Inv1.data() : Inv2.data();
+                        double *sol = which == 0 ? Sol1.data() : Sol2.data();
+                        cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., inv, NCoupled, Rhs.data(), 1, 0., sol, 1);
+                    });
+                } else {
+                    cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv1.data(), NCoupled, Rhs.data(), 1, 0., Sol1.data(), 1);
+                    cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv2.data(), NCoupled, Rhs.data(), 1, 0., Sol2.data(), 1);
+                }
+                Rhs.head(NCoupled) = (1. - alpha) * Sol1 + alpha * Sol2;
+            }
+        } else {
+            Rhs.head(NCoupled) = (1. - alpha) * Factor1.solve(Rhs.head(NCoupled)) + alpha * Factor2.solve(Rhs.head(NCoupled));
         }
-    } else {
-        Rhs.head(NCoupled) = (1. - alpha) * Factor1.solve(Rhs.head(NCoupled)) + alpha * Factor2.solve(Rhs.head(NCoupled));
     }
 
     Derivs.segment(0, NTotal) = states.segment(NTotal, NTotal);
     Derivs.segment(NTotal, NTotal) = Rhs.array() * SqrtRadii;
-
-    SolveTime += std::chrono::steady_clock::now() - solve_start;
 
     return Derivs;
 }

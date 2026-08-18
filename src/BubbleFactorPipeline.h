@@ -59,6 +59,7 @@ struct BubbleFactorPipeline {
         for (auto &worker : Workers) worker.join();
         if (profile::Enabled() && StatIntervals > 0) {
             fprintf(stderr, "[bubble-pipeline] %llu intervals, mean N %.0f, worker busy %.1fs across %zu workers, %llu chained (mean churn %.1f), %llu chain fallbacks\n", static_cast<unsigned long long>(StatIntervals.load()), double(StatSumN) / double(StatIntervals), StatBusyNs * 1e-9, Workers.size(), static_cast<unsigned long long>(StatChained.load()), StatChained ? double(StatChurn) / double(StatChained) : 0., static_cast<unsigned long long>(StatChainFallbacks.load()));
+            fprintf(stderr, "[bubble-pipeline] worker phases: mass %.1fs, factor %.1fs, symmetrize %.1fs, derive %.1fs (derive includes its own symmetrize)\n", StatMassNs * 1e-9, StatFactorNs * 1e-9, StatSymNs * 1e-9, StatDeriveNs * 1e-9);
         }
     }
 
@@ -95,7 +96,8 @@ private:
     // (all Invert reads). Divide- and sqrt-throughput bound rather than matrix-unit bound, so
     // the column split runs alongside the other workers' LAPACK rather than competing with
     // it. Each entry is written once from read-only inputs, so the split is bit-identical.
-    static void ConstructMassLower(const EndpointData &e, Eigen::MatrixXd &m) {
+    void ConstructMassLower(const EndpointData &e, Eigen::MatrixXd &m) const {
+        const Timer timer{StatMassNs};
         const int n = int(e.R.size());
         m.resize(n, n);
         ParallelChunks(n, 64, [&](size_t begin, size_t end) {
@@ -111,18 +113,38 @@ private:
         });
     }
 
-    // In-place SPD inversion (Cholesky) via Accelerate's AMX-backed LAPACK, symmetrized
-    // to full storage (the dgemv apply and the chained derivation's gathers read both
-    // triangles). Returns false if the matrix is not positive definite.
-    static bool Invert(Eigen::MatrixXd &m) {
+    // Accumulates elapsed time into a shared counter, for the phase report below.
+    struct Timer {
+        explicit Timer(std::atomic<uint64_t> &acc) : Acc(acc), Start(std::chrono::steady_clock::now()) {}
+        ~Timer() { Acc += uint64_t((std::chrono::steady_clock::now() - Start).count()); }
+        std::atomic<uint64_t> &Acc;
+        std::chrono::steady_clock::time_point Start;
+    };
+
+    // In-place SPD inversion (Cholesky) via Accelerate's AMX-backed LAPACK. Fills the lower
+    // triangle; Symmetrize completes it. Returns false if the matrix is not positive definite.
+    bool InvertLower(Eigen::MatrixXd &m) const {
+        const Timer timer{StatFactorNs};
         const __LAPACK_int n = __LAPACK_int(m.rows());
         __LAPACK_int info = 0;
         if (n == 0) return true; // LAPACK rejects lda = 0
         dpotrf_("L", &n, m.data(), &n, &info);
         if (info != 0) return false;
         dpotri_("L", &n, m.data(), &n, &info); // Fills the lower triangle
-        m.triangularView<Eigen::StrictlyUpper>() = m.transpose();
         return info == 0;
+    }
+
+    // Mirrors the lower triangle into the upper: the dgemv apply and the chained
+    // derivation's gathers both read full storage.
+    void Symmetrize(Eigen::MatrixXd &m) const {
+        const Timer timer{StatSymNs};
+        m.triangularView<Eigen::StrictlyUpper>() = m.transpose();
+    }
+
+    bool Invert(Eigen::MatrixXd &m) const {
+        const bool ok = InvertLower(m);
+        Symmetrize(m);
+        return ok;
     }
 
     // Event-dense stretches consume intervals faster than workers can produce them, so
@@ -182,6 +204,7 @@ private:
     // (set mismatch, empty retained block, oversized churn, or a failed small Cholesky)
     // and the caller inverts from scratch.
     bool DeriveNextInverse(const Eigen::MatrixXd &h, const std::vector<int> &cur, const std::vector<int> &next, const EndpointData &e, double t2, std::vector<int> &cursors, Eigen::MatrixXd &out, int &churn) const {
+        const Timer timer{StatDeriveNs};
         const int n = int(cur.size()), n2 = int(next.size());
         if (n == 0 || n2 == 0) return false;
 
@@ -205,10 +228,15 @@ private:
             if (next[j] <= cur[n - 1]) return false;
         }
 
-        // Delete-downdate: p = inv of the retained principal block, lower triangle valid
-        Eigen::MatrixXd p(m, m);
+        // The retained block is the result's top-left corner, so build it there directly,
+        // with `out`'s leading dimension, rather than in scratch and copied across.
+        out.resize(n2, n2);
+        double *const p_data = out.data();
+        const __LAPACK_int p_ld = n2;
+
+        // Delete-downdate: the retained principal block's inverse, lower triangle valid
         if (d == 0) {
-            p = h;
+            out.topLeftCorner(m, m) = h;
         } else {
             std::vector<int> didx;
             didx.reserve(d);
@@ -219,7 +247,7 @@ private:
             Eigen::MatrixXd hdd(d, d), w(m, d);
             for (int j = 0; j < m; ++j) {
                 const double *col = h.data() + size_t(ridx[j]) * n;
-                double *dst = p.data() + size_t(j) * m;
+                double *dst = p_data + size_t(j) * p_ld;
                 for (int i = 0; i < m; ++i) dst[i] = col[ridx[i]];
             }
             for (int j = 0; j < d; ++j) {
@@ -234,13 +262,11 @@ private:
             dpotrf_("L", &dn, hdd.data(), &dn, &info);
             if (info != 0) return false;
             cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, d, 1., hdd.data(), d, w.data(), m);
-            cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, d, -1., w.data(), m, 1., p.data(), m);
+            cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, d, -1., w.data(), m, 1., p_data, p_ld);
         }
 
         if (a == 0) {
-            out.resize(m, m);
-            out.triangularView<Eigen::Lower>() = p.triangularView<Eigen::Lower>();
-            out.triangularView<Eigen::StrictlyUpper>() = p.transpose();
+            Symmetrize(out);
             return true;
         }
 
@@ -279,7 +305,7 @@ private:
         }
 
         Eigen::MatrixXd x2(m, a);
-        cblas_dsymm(CblasColMajor, CblasLeft, CblasLower, m, a, 1., p.data(), m, u.data(), m, 0., x2.data(), m);
+        cblas_dsymm(CblasColMajor, CblasLeft, CblasLower, m, a, 1., p_data, p_ld, u.data(), m, 0., x2.data(), m);
         cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans, a, a, m, -1., u.data(), m, x2.data(), m, 1., s.data(), a);
         const __LAPACK_int an = a;
         __LAPACK_int info = 0;
@@ -287,16 +313,14 @@ private:
         if (info != 0) return false;
         Eigen::MatrixXd v = x2;
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, a, 1., s.data(), a, v.data(), m);
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, a, 1., v.data(), m, 1., p.data(), m); // Top-left, lower
+        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, a, 1., v.data(), m, 1., p_data, p_ld); // Top-left, lower
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasNoTrans, CblasNonUnit, m, a, -1., s.data(), a, v.data(), m); // v = top-right
         dpotri_("L", &an, s.data(), &an, &info); // s = inv(Schur complement), lower
         if (info != 0) return false;
 
-        out.resize(n2, n2);
-        out.topLeftCorner(m, m).triangularView<Eigen::Lower>() = p.triangularView<Eigen::Lower>();
         out.block(m, 0, a, m) = v.transpose();
         out.bottomRightCorner(a, a).triangularView<Eigen::Lower>() = s.triangularView<Eigen::Lower>();
-        out.triangularView<Eigen::StrictlyUpper>() = out.transpose();
+        Symmetrize(out);
         return true;
     }
 
@@ -445,4 +469,6 @@ private:
     // Worker-side stats, reported at teardown under ACOUSTIC_PROFILE
     std::atomic<uint64_t> StatBusyNs{0}, StatIntervals{0}, StatSumN{0};
     std::atomic<uint64_t> StatChained{0}, StatChurn{0}, StatChainFallbacks{0};
+    // Per-phase worker time. Derive does its own mirror, so it overlaps StatSymNs.
+    mutable std::atomic<uint64_t> StatMassNs{0}, StatFactorNs{0}, StatSymNs{0}, StatDeriveNs{0};
 };

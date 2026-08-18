@@ -14,6 +14,7 @@
 #include "Shaders.h"
 
 #include "KernelParams.h"
+#include "Profile.h"
 
 #include <iomanip>
 #include <iostream>
@@ -73,17 +74,20 @@ void Bubbles::Compute(GpuBuffer &vb, int global_bid) {
 
     for (int m = 0; m < n_minibatches; ++m) {
         // Construct bubble-to-boundary projection matrix (NPoints x n_bubs)
-        for (int j = 0; j < n_bubs; ++j) {
-            auto &osc = Solver.Oscillators[ActiveOscIds[j]];
+        {
+            const profile::Scope scope{"bubble/pack_data"};
+            for (int j = 0; j < n_bubs; ++j) {
+                auto &osc = Solver.Oscillators[ActiveOscIds[j]];
 
-            if ((base.Step * base.Dt + base.Ts) > osc.EndTime && osc.IsDead()) continue;
-            const auto data = osc.Interp(base.Step * base.Dt + base.Ts); // fixed-size: no heap temporary
-            BubData[4 * j] = data[0]; // r
-            BubData[4 * j + 1] = data[2]; // xbub
-            BubData[4 * j + 2] = data[3]; // ybub
-            BubData[4 * j + 3] = data[4]; // zbub
+                if ((base.Step * base.Dt + base.Ts) > osc.EndTime && osc.IsDead()) continue;
+                const auto data = osc.Interp(base.Step * base.Dt + base.Ts); // fixed-size: no heap temporary
+                BubData[4 * j] = data[0]; // r
+                BubData[4 * j + 1] = data[2]; // xbub
+                BubData[4 * j + 2] = data[3]; // ybub
+                BubData[4 * j + 3] = data[4]; // zbub
+            }
+            GpuBubData.Upload(BubData.data(), data_slot_bytes, m * data_slot_bytes);
         }
-        GpuBubData.Upload(BubData.data(), data_slot_bytes, m * data_slot_bytes);
         const BubToBoundaryParams btb_params{base.NPoints, n_bubs};
         ctx.Dispatch("BubToBoundary", blocks, threads, {&BubToBoundary, &base.GpuB, &base.GpuBN, {&GpuBubData, m * data_slot_bytes}}, &btb_params, sizeof(btb_params));
 
@@ -95,9 +99,13 @@ void Bubbles::Compute(GpuBuffer &vb, int global_bid) {
         const int start = m * minibatchsize;
         int stop = (m + 1) * minibatchsize;
         for (int k = start; k < stop; ++k) {
-            for (int j = 0; j < n_bubs; ++j) {
-                const auto &osc = Solver.Oscillators[ActiveOscIds[j]];
-                BubVels(j, k % minibatchsize) = osc.State[1];
+            {
+                static profile::Entry &phase = profile::Phase("bubble/pack_vels");
+                const profile::Scope scope{phase};
+                for (int j = 0; j < n_bubs; ++j) {
+                    const auto &osc = Solver.Oscillators[ActiveOscIds[j]];
+                    BubVels(j, k % minibatchsize) = osc.State[1];
+                }
             }
             Solver.Step();
             base.Step += 1;
@@ -117,5 +125,6 @@ void Bubbles::Compute(GpuBuffer &vb, int global_bid) {
         ctx.Dispatch("BubMatmul", matmul_blocks, threads, {&vb, &BubToBoundary, {&GpuBubVels, m * vels_slot_bytes}, &Flux}, &mm_params, sizeof(mm_params));
     }
 
+    const profile::Scope scope{"bubble/read_mesh"};
     ReadFluidMesh();
 }

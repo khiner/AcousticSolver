@@ -96,8 +96,10 @@ lives in the code.
 
 The solver now sits at measured hardware limits: the fused FDTD kernel sustains 752–766 GB/s
 at 80³ and above, which is this machine's DRAM roof (a pure streaming copy of the same
-element count reaches 725–741 GB/s there), and the coupled-bubble ODE is bound by the same
-roof on its inverse matrix reads. Those two account for ~95% of the suite.
+element count reaches 725–741 GB/s there), and the coupled-bubble scenes are bound by the
+matrix units' aggregate factorization throughput — the same 13,889 endpoint inversions cost
+154s of worker time on 4 threads and 306s on 8, for the same wall clock. Those two account
+for ~95% of the suite.
 
 Every round was gated on byte-identical listener output against the previous build, so the
 verdicts above hold unchanged across all of them.
@@ -107,8 +109,14 @@ verdicts above hold unchanged across all of them.
 - `ACOUSTIC_PROFILE=1`: per-phase wall time at exit — `gpu/exec` (total GPU busy) and its
   `gpu/exec_fdtd` / `gpu/exec_prologue` split, `gpu/idle` (gaps between command buffers on
   the GPU timeline, the pipeline-bubble measure) and its `gpu/idle_fdtd` /
-  `gpu/idle_prologue` split, `cpu/sync_window`, `gpu/wait`, `startup/scene_load`, and the
-  `[apply-path]`, `[shader-faces]` and `[bubble-pipeline]` lines.
+  `gpu/idle_prologue` split, `cpu/sync_window`, `gpu/wait`, `startup/scene_load`, the
+  coupled-bubble main-thread breakdown (`bubble/rk4` and, within it, `bubble/apply` — the two
+  endpoint matrix-vector products, ~85% of the bubble scenes' CPU time — plus
+  `bubble/refactor`, `bubble/fetch`, `bubble/unpack`, `bubble/pack_data`, `bubble/pack_vels`,
+  `bubble/read_mesh`), and the `[apply-path]`, `[shader-faces]` and `[bubble-pipeline]` lines,
+  the last of which also splits worker time into mass fill, factor, symmetrize and derive.
+  Scopes on per-timestep paths resolve their accumulator once (`profile::Phase`) — the map
+  lookup otherwise costs more than the phase, and inflated a bubble scene 40%.
 - `ACOUSTIC_APPLY_PATH=plain|folded`: pin the boundary-application path.
 - `ACOUSTIC_GLOBAL_LSTSQ=1`: reference-bit-identical global fresh-cell solve.
 - `ACOUSTIC_LAZY_COMMIT=1`: commit prologue/FDTD buffers at the sync instead of eagerly.

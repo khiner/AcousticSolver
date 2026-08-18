@@ -2,6 +2,8 @@
 
 #include "FluidSound.h"
 
+#include "Profile.h"
+
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -61,7 +63,10 @@ double Solver::Step() {
             }
 
             // Prepare the integrator for timestepping: transfer data + refactor the mass matrix
-            Integ.UpdateData(CoupledOsc, UncoupledOsc, time1, time2);
+            {
+                const profile::Scope scope{"bubble/update_data"};
+                Integ.UpdateData(CoupledOsc, UncoupledOsc, time1, time2);
+            }
             Integ.Refactor();
         }
         ++EventIndex;
@@ -80,6 +85,8 @@ double Solver::Step() {
     Integ.Step(time);
 
     // Unpack the integrator's states back into the oscillators
+    static profile::Entry &phase = profile::Phase("bubble/unpack");
+    const profile::Scope scope{phase};
     double total_response = 0.;
     for (size_t i = 0; i < n_total; ++i) {
         TotalOsc[i]->State(0) = Integ.States(i);

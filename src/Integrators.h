@@ -6,9 +6,7 @@
 
 #include "Oscillator.h"
 
-#include <chrono>
 #include <functional>
-#include <iostream>
 
 namespace FluidSound {
 
@@ -49,14 +47,6 @@ struct CoupledDirect {
 
     Eigen::ArrayXd States; // Packed state vectors [v ... v' ...] across all active oscillators
     Eigen::ArrayXd Derivs; // Packed derivatives [v' ... v'' ...] across all active oscillators
-
-    std::chrono::duration<double> CoeffTime{}, MassTime{}, SolveTime{};
-
-    void PrintTimings() const {
-        std::cout << "K,C,F time: " << CoeffTime.count() << std::endl;
-        std::cout << "M^-1 time:  " << MassTime.count() << std::endl;
-        std::cout << "Solve time: " << SolveTime.count() << std::endl;
-    }
 
 private:
     // Interpolates the stiffness, damping, and forcing terms at `time`.

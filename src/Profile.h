@@ -27,21 +27,32 @@ inline std::map<std::string, Entry> &Entries() {
     return entries;
 }
 
+// A phase's accumulator. The map lookup costs more than the shortest phases being timed, so
+// per-timestep call sites resolve theirs once into a `static profile::Entry &` and pass it to
+// Scope. std::map never invalidates references, so one stays valid across later insertions.
+inline Entry &Phase(const char *name) {
+    if (!Enabled()) {
+        static Entry unused; // Nothing reads it: a disabled scope never accumulates
+        return unused;
+    }
+    return Entries()[name];
+}
+
 struct Scope {
-    explicit Scope(const char *name) : Name(name) {
+    explicit Scope(Entry &entry) : E(entry) {
         if (Enabled()) Start = std::chrono::steady_clock::now();
     }
+    explicit Scope(const char *name) : Scope(Phase(name)) {} // per-batch and cold call sites
     ~Scope() {
         if (!Enabled()) return;
-        auto &entry = Entries()[Name];
-        entry.Seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - Start).count();
-        entry.Count += 1;
+        E.Seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - Start).count();
+        E.Count += 1;
     }
     Scope(const Scope &) = delete;
     Scope &operator=(const Scope &) = delete;
 
 private:
-    const char *Name;
+    Entry &E;
     std::chrono::steady_clock::time_point Start;
 };
 

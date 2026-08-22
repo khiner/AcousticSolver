@@ -219,8 +219,12 @@ void Modal::Compute(GpuBuffer &vb, int global_bid) {
                 if (bn_axis[bid] >= 0) AccelNoise(bid, k) = AccelSum[bn_axis[bid]];
             }
 
-            Solver.Step(base.Step * base.Dt + base.Ts);
+            // A batch's last sample and the next batch's first are the same instant, so the
+            // oscillators must not advance across it — stepping here as well as there ran
+            // them NSamples / (NSamples - 1) fast, sharpening every modal frequency by that
+            // ratio and leaving a discontinuity once per batch.
             if (k >= base.NSamples - 1) break;
+            Solver.Step(base.Step * base.Dt + base.Ts);
 
             AccelSum += (accel_pulse1 + accel_pulse2) / 2.f * base.Dt; // trapezoidal rule integrator
             base.Step += 1;

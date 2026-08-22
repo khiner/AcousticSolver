@@ -15,8 +15,14 @@
 // only by the oscillators dying (rows/cols removed, order preserved) and born
 // (appended) at that event. Ticket k's worker derives interval k+1's T1 inverse from
 // its own fresh T2 inverse (see DeriveNextInverse): O(N²r) for churn r instead of
-// O(N³), always one update from a fresh dpotrf/dpotri so error never compounds. This
+// O(N³), always one update from a fresh spotrf/spotri so error never compounds. This
 // halves the load on the saturated matrix units, the throughput floor of bubble scenes.
+//
+// The whole inverse path is single precision -- construction, factorization, inversion,
+// derivation, and the apply products in CoupledDirect::Solve. These matrix units turn fp32
+// over 3x faster than fp64, and the apply is bound by reading the inverses, so this is the
+// dominant lever on bubble scenes. The oscillator state, the RK4 integration, and the
+// inline Cholesky fallback all stay double.
 
 #include "FluidSound.h"
 #include "Parallel.h"
@@ -40,7 +46,7 @@ struct BubbleFactorPipeline {
           Integ(&solver.Integ), Dt(dt), Ts(ts) {
         if (Events->size() < 2) return;
 
-        Integ->InverseProvider = [this](double t1, double t2, int n, Eigen::MatrixXd &i1, Eigen::MatrixXd &i2) { return Fetch(t1, t2, n, i1, i2); };
+        Integ->InverseProvider = [this](double t1, double t2, int n, Eigen::MatrixXf &i1, Eigen::MatrixXf &i2) { return Fetch(t1, t2, n, i1, i2); };
         // A handful of concurrent LAPACK calls saturate the matrix units' aggregate
         // throughput. Further workers (at any QoS — measured) only stretch every call,
         // including the main thread's own solve applies.
@@ -73,7 +79,7 @@ private:
         bool ChainI1{false}; // T1 continues the previous interval's T2: I1 arrives from that ticket's worker
     };
     struct Inverses {
-        Eigen::MatrixXd I1, I2; // Full symmetric endpoint inverses
+        Eigen::MatrixXf I1, I2; // Full symmetric endpoint inverses
         bool HasI1{false}, HasI2{false}; // Two producers: a chained I1 comes from ticket k-1's worker
         bool Ok{true}; // False: an endpoint inversion failed (not positive definite)
     };
@@ -96,19 +102,19 @@ private:
     // (all Invert reads). Divide- and sqrt-throughput bound rather than matrix-unit bound, so
     // the column split runs alongside the other workers' LAPACK rather than competing with
     // it. Each entry is written once from read-only inputs, so the split is bit-identical.
-    void ConstructMassLower(const EndpointData &e, Eigen::MatrixXd &m) const {
+    void ConstructMassLower(const EndpointData &e, Eigen::MatrixXf &m) const {
         const Timer timer{StatMassNs};
         const int n = int(e.R.size());
         m.resize(n, n);
         ParallelChunks(n, 64, [&](size_t begin, size_t end) {
             for (int i = int(begin); i < int(end); ++i) {
-                m(i, i) = 1.;
+                m(i, i) = 1.f;
                 const int len = n - i - 1;
                 if (len <= 0) continue;
                 const auto dx = e.Cx.segment(i + 1, len) - e.Cx(i);
                 const auto dy = e.Cy.segment(i + 1, len) - e.Cy(i);
                 const auto dz = e.Cz.segment(i + 1, len) - e.Cz(i);
-                m.col(i).segment(i + 1, len).array() = ((dx * dx + dy * dy + dz * dz) / (e.R(i) * e.R.segment(i + 1, len)) + Integrator::EpsSq).sqrt().inverse();
+                m.col(i).segment(i + 1, len).array() = ((dx * dx + dy * dy + dz * dz) / (e.R(i) * e.R.segment(i + 1, len)) + Integrator::EpsSq).sqrt().inverse().cast<float>();
             }
         });
     }
@@ -122,26 +128,28 @@ private:
     };
 
     // In-place SPD inversion (Cholesky) via Accelerate's AMX-backed LAPACK. Fills the lower
-    // triangle; Symmetrize completes it. Returns false if the matrix is not positive definite.
-    bool InvertLower(Eigen::MatrixXd &m) const {
+    // triangle; Symmetrize completes it. Returns false if the matrix is not positive
+    // definite, which sends the caller to the inline double Cholesky — so single precision
+    // here can cost time, never correctness.
+    bool InvertLower(Eigen::MatrixXf &m) const {
         const Timer timer{StatFactorNs};
         const __LAPACK_int n = __LAPACK_int(m.rows());
         __LAPACK_int info = 0;
         if (n == 0) return true; // LAPACK rejects lda = 0
-        dpotrf_("L", &n, m.data(), &n, &info);
+        spotrf_("L", &n, m.data(), &n, &info);
         if (info != 0) return false;
-        dpotri_("L", &n, m.data(), &n, &info); // Fills the lower triangle
+        spotri_("L", &n, m.data(), &n, &info); // Fills the lower triangle
         return info == 0;
     }
 
-    // Mirrors the lower triangle into the upper: the dgemv apply and the chained
+    // Mirrors the lower triangle into the upper: the sgemv apply and the chained
     // derivation's gathers both read full storage.
-    void Symmetrize(Eigen::MatrixXd &m) const {
+    void Symmetrize(Eigen::MatrixXf &m) const {
         const Timer timer{StatSymNs};
         m.triangularView<Eigen::StrictlyUpper>() = m.transpose();
     }
 
-    bool Invert(Eigen::MatrixXd &m) const {
+    bool Invert(Eigen::MatrixXf &m) const {
         const bool ok = InvertLower(m);
         Symmetrize(m);
         return ok;
@@ -176,7 +184,7 @@ private:
                         if (t1 < oscs[CursorOs].EndTime) CursorCoupled.push_back(int(CursorOs));
                         ++CursorOs;
                     }
-                    InFlightBytes += 2 * sizeof(double) * CursorCoupled.size() * CursorCoupled.size();
+                    InFlightBytes += 2 * sizeof(float) * CursorCoupled.size() * CursorCoupled.size();
                     Pending.emplace(Generated, Interval{t1, t2, CursorCoupled, Generated > 0 && t1 == LastGeneratedT2});
                     LastGeneratedT2 = t2;
                     ++Generated;
@@ -203,7 +211,7 @@ private:
     // bordered SPD extension via its Schur complement. Returns false when not derivable
     // (set mismatch, empty retained block, oversized churn, or a failed small Cholesky)
     // and the caller inverts from scratch.
-    bool DeriveNextInverse(const Eigen::MatrixXd &h, const std::vector<int> &cur, const std::vector<int> &next, const EndpointData &e, double t2, std::vector<int> &cursors, Eigen::MatrixXd &out, int &churn) const {
+    bool DeriveNextInverse(const Eigen::MatrixXf &h, const std::vector<int> &cur, const std::vector<int> &next, const EndpointData &e, double t2, std::vector<int> &cursors, Eigen::MatrixXf &out, int &churn) const {
         const Timer timer{StatDeriveNs};
         const int n = int(cur.size()), n2 = int(next.size());
         if (n == 0 || n2 == 0) return false;
@@ -231,7 +239,7 @@ private:
         // The retained block is the result's top-left corner, so build it there directly,
         // with `out`'s leading dimension, rather than in scratch and copied across.
         out.resize(n2, n2);
-        double *const p_data = out.data();
+        float *const p_data = out.data();
         const __LAPACK_int p_ld = n2;
 
         // Delete-downdate: the retained principal block's inverse, lower triangle valid
@@ -244,25 +252,25 @@ private:
                 if (ri < m && ridx[ri] == ci) ++ri;
                 else didx.push_back(ci);
             }
-            Eigen::MatrixXd hdd(d, d), w(m, d);
+            Eigen::MatrixXf hdd(d, d), w(m, d);
             for (int j = 0; j < m; ++j) {
-                const double *col = h.data() + size_t(ridx[j]) * n;
-                double *dst = p_data + size_t(j) * p_ld;
+                const float *col = h.data() + size_t(ridx[j]) * n;
+                float *dst = p_data + size_t(j) * p_ld;
                 for (int i = 0; i < m; ++i) dst[i] = col[ridx[i]];
             }
             for (int j = 0; j < d; ++j) {
-                const double *col = h.data() + size_t(didx[j]) * n;
-                double *wc = w.data() + size_t(j) * m;
+                const float *col = h.data() + size_t(didx[j]) * n;
+                float *wc = w.data() + size_t(j) * m;
                 for (int i = 0; i < m; ++i) wc[i] = col[ridx[i]];
-                double *hc = hdd.data() + size_t(j) * d;
+                float *hc = hdd.data() + size_t(j) * d;
                 for (int i = 0; i < d; ++i) hc[i] = col[didx[i]];
             }
             const __LAPACK_int dn = d;
             __LAPACK_int info = 0;
-            dpotrf_("L", &dn, hdd.data(), &dn, &info);
+            spotrf_("L", &dn, hdd.data(), &dn, &info);
             if (info != 0) return false;
-            cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, d, 1., hdd.data(), d, w.data(), m);
-            cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, d, -1., w.data(), m, 1., p_data, p_ld);
+            cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, d, 1.f, hdd.data(), d, w.data(), m);
+            cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans, m, d, -1.f, w.data(), m, 1.f, p_data, p_ld);
         }
 
         if (a == 0) {
@@ -287,35 +295,35 @@ private:
             ay(j) = sd(3);
             az(j) = sd(4);
         }
-        Eigen::MatrixXd u(m, a);
+        Eigen::MatrixXf u(m, a);
         for (int j = 0; j < a; ++j) {
             const auto dx = rx - ax(j);
             const auto dy = ry - ay(j);
             const auto dz = rz - az(j);
-            u.col(j).array() = ((dx * dx + dy * dy + dz * dz) / (rr * ar(j)) + Integrator::EpsSq).sqrt().inverse();
+            u.col(j).array() = ((dx * dx + dy * dy + dz * dz) / (rr * ar(j)) + Integrator::EpsSq).sqrt().inverse().cast<float>();
         }
-        Eigen::MatrixXd s(a, a);
+        Eigen::MatrixXf s(a, a);
         for (int j = 0; j < a; ++j) {
-            s(j, j) = 1.;
+            s(j, j) = 1.f;
             for (int i = j + 1; i < a; ++i) {
                 const double dx = ax(i) - ax(j), dy = ay(i) - ay(j), dz = az(i) - az(j);
-                s(i, j) = 1. / std::sqrt((dx * dx + dy * dy + dz * dz) / (ar(i) * ar(j)) + Integrator::EpsSq);
+                s(i, j) = float(1. / std::sqrt((dx * dx + dy * dy + dz * dz) / (ar(i) * ar(j)) + Integrator::EpsSq));
                 s(j, i) = s(i, j);
             }
         }
 
-        Eigen::MatrixXd x2(m, a);
-        cblas_dsymm(CblasColMajor, CblasLeft, CblasLower, m, a, 1., p_data, p_ld, u.data(), m, 0., x2.data(), m);
-        cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans, a, a, m, -1., u.data(), m, x2.data(), m, 1., s.data(), a);
+        Eigen::MatrixXf x2(m, a);
+        cblas_ssymm(CblasColMajor, CblasLeft, CblasLower, m, a, 1.f, p_data, p_ld, u.data(), m, 0.f, x2.data(), m);
+        cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans, a, a, m, -1.f, u.data(), m, x2.data(), m, 1.f, s.data(), a);
         const __LAPACK_int an = a;
         __LAPACK_int info = 0;
-        dpotrf_("L", &an, s.data(), &an, &info); // s holds the Schur complement's Cholesky factor
+        spotrf_("L", &an, s.data(), &an, &info); // s holds the Schur complement's Cholesky factor
         if (info != 0) return false;
-        Eigen::MatrixXd v = x2;
-        cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, a, 1., s.data(), a, v.data(), m);
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, a, 1., v.data(), m, 1., p_data, p_ld); // Top-left, lower
-        cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasNoTrans, CblasNonUnit, m, a, -1., s.data(), a, v.data(), m); // v = top-right
-        dpotri_("L", &an, s.data(), &an, &info); // s = inv(Schur complement), lower
+        Eigen::MatrixXf v = x2;
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit, m, a, 1.f, s.data(), a, v.data(), m);
+        cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans, m, a, 1.f, v.data(), m, 1.f, p_data, p_ld); // Top-left, lower
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasNoTrans, CblasNonUnit, m, a, -1.f, s.data(), a, v.data(), m); // v = top-right
+        spotri_("L", &an, s.data(), &an, &info); // s = inv(Schur complement), lower
         if (info != 0) return false;
 
         out.block(m, 0, a, m) = v.transpose();
@@ -367,7 +375,7 @@ private:
             const bool ok2 = Invert(inverses.I2);
 
             // The successor's T1 inverse, derived from this fresh T2 inverse (same time)
-            Eigen::MatrixXd derived;
+            Eigen::MatrixXf derived;
             bool derived_ok = false;
             if (next && next->ChainI1) {
                 int churn = 0;
@@ -419,7 +427,7 @@ private:
         }
     }
 
-    bool Fetch(double t1, double t2, int n, Eigen::MatrixXd &i1, Eigen::MatrixXd &i2) {
+    bool Fetch(double t1, double t2, int n, Eigen::MatrixXf &i1, Eigen::MatrixXf &i2) {
         const profile::Scope scope{"bubble/fetch"}; // Mostly waiting on workers
         std::unique_lock lock{Mutex};
         const int k = Consumed;
@@ -438,7 +446,7 @@ private:
         auto node = Ready.extract(k);
         i1 = std::move(node.mapped().I1);
         i2 = std::move(node.mapped().I2);
-        InFlightBytes -= 2 * sizeof(double) * it->second.Coupled.size() * it->second.Coupled.size();
+        InFlightBytes -= 2 * sizeof(float) * it->second.Coupled.size() * it->second.Coupled.size();
         Pending.erase(it);
         Consumed = k + 1;
         lock.unlock();

@@ -12,6 +12,10 @@ namespace FluidSound {
 
 struct CoupledDirect {
     using Matrix = Eigen::MatrixXd;
+    // Precomputed endpoint inverses are single precision: they are produced by a single
+    // precision factorization (see BubbleFactorPipeline.h), so double storage would carry
+    // no extra information, and the apply below is bound by reading them.
+    using InvMatrix = Eigen::MatrixXf;
 
     CoupledDirect(double dt) : Dt(dt) {}
 
@@ -36,7 +40,7 @@ struct CoupledDirect {
     // two pairs of triangular substitutions (same linear system, different float rounding).
     // When it returns false, Refactor computes Cholesky factors inline and Solve
     // substitutes, as in the reference.
-    std::function<bool(double, double, int, Matrix &, Matrix &)> InverseProvider;
+    std::function<bool(double, double, int, InvMatrix &, InvMatrix &)> InverseProvider;
 
     // Mass matrix over packed solve data, shared by the inline path and the background
     // precompute workers. The row fill is parallel: each element is written exactly once,
@@ -75,8 +79,8 @@ private:
 
     // Precomputed endpoint inverses and their GEMV outputs, active for the current event
     // interval when UseInverse is set (see InverseProvider).
-    Matrix Inv1, Inv2;
-    Eigen::VectorXd Sol1, Sol2;
+    InvMatrix Inv1, Inv2;
+    Eigen::VectorXf RhsF, Sol1, Sol2;
     bool UseInverse{false};
 };
 

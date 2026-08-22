@@ -168,22 +168,23 @@ const Eigen::ArrayXd &CoupledDirect::Solve(const Eigen::ArrayXd &states, double 
             if (NCoupled > 0) {
                 Sol1.resize(NCoupled);
                 Sol2.resize(NCoupled);
+                RhsF = Rhs.head(NCoupled).cast<float>();
                 // The two products are independent, so splitting them across cores is
                 // bit-identical as long as each stays one unsplit Accelerate call (splitting a
                 // *single* product is not — see VALIDATION.md). Only worth the thread hop once
                 // an inverse outgrows the last-level cache and one core can no longer saturate
                 // the read.
-                if (size_t(NCoupled) * NCoupled * sizeof(double) > (size_t{2} << 20)) {
+                if (size_t(NCoupled) * NCoupled * sizeof(float) > (size_t{2} << 20)) {
                     ParallelFor(2, 1, [&](size_t which) {
-                        const double *inv = which == 0 ? Inv1.data() : Inv2.data();
-                        double *sol = which == 0 ? Sol1.data() : Sol2.data();
-                        cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., inv, NCoupled, Rhs.data(), 1, 0., sol, 1);
+                        const float *inv = which == 0 ? Inv1.data() : Inv2.data();
+                        float *sol = which == 0 ? Sol1.data() : Sol2.data();
+                        cblas_sgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1.f, inv, NCoupled, RhsF.data(), 1, 0.f, sol, 1);
                     });
                 } else {
-                    cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv1.data(), NCoupled, Rhs.data(), 1, 0., Sol1.data(), 1);
-                    cblas_dgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1., Inv2.data(), NCoupled, Rhs.data(), 1, 0., Sol2.data(), 1);
+                    cblas_sgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1.f, Inv1.data(), NCoupled, RhsF.data(), 1, 0.f, Sol1.data(), 1);
+                    cblas_sgemv(CblasColMajor, CblasNoTrans, NCoupled, NCoupled, 1.f, Inv2.data(), NCoupled, RhsF.data(), 1, 0.f, Sol2.data(), 1);
                 }
-                Rhs.head(NCoupled) = (1. - alpha) * Sol1 + alpha * Sol2;
+                Rhs.head(NCoupled) = (1. - alpha) * Sol1.cast<double>() + alpha * Sol2.cast<double>();
             }
         } else {
             Rhs.head(NCoupled) = (1. - alpha) * Factor1.solve(Rhs.head(NCoupled)) + alpha * Factor2.solve(Rhs.head(NCoupled));

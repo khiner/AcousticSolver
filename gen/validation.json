@@ -2,13 +2,13 @@
  "2016Pour": {
   "listeners": {
    "2016Pour_out": {
-    "bitexact_prefix": 0.0048203125,
-    "corr": 0.9463558509520742,
+    "bitexact_prefix": 0.0048359375,
+    "corr": 0.9463584886010837,
     "duration": 8.3,
     "length_mismatch": false,
-    "rel_l2": 0.32657777546893274,
-    "rms_ratio": 0.9937102600553398,
-    "spec_err": 0.22110462462478775,
+    "rel_l2": 0.3265662405761184,
+    "rms_ratio": 0.9936860538397371,
+    "spec_err": 0.22109268627675116,
     "status": "OK(env)"
    }
   },
@@ -63,12 +63,12 @@
   "listeners": {
    "GlassPour_out": {
     "bitexact_prefix": 0.035875,
-    "corr": 0.931448764019002,
+    "corr": 0.9314447329667858,
     "duration": 5.32,
     "length_mismatch": false,
-    "rel_l2": 0.36869311876791433,
-    "rms_ratio": 0.9908744808342547,
-    "spec_err": 0.2504043273464286,
+    "rel_l2": 0.36870520978907145,
+    "rms_ratio": 0.9908822825194503,
+    "spec_err": 0.2503727475079222,
     "status": "OK(env)"
    }
   },
@@ -108,12 +108,12 @@
   "listeners": {
    "PaddleSplash_out": {
     "bitexact_prefix": 0.01571875,
-    "corr": 0.8935288809818267,
+    "corr": 0.8933948388513165,
     "duration": 1.88,
     "length_mismatch": false,
-    "rel_l2": 0.46510821215023257,
-    "rms_ratio": 1.014852880747184,
-    "spec_err": 0.3227844323696396,
+    "rel_l2": 0.46532129918143694,
+    "rms_ratio": 1.0145486763452267,
+    "spec_err": 0.32294983964565854,
     "status": "OK(env)"
    }
   },

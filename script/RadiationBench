@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Interleaved A/B battery for the SonicRadiation solver: one command, two builds, rounds
+alternating between them, every number either build printed reported side by side.
+
+    script/RadiationBench RadiationTest --v2 --res 60
+    script/RadiationBench --rounds 4 --base 21b7dcd AcousticSolver --radiation ../config/WineglassTap_move.json
+    script/RadiationBench --env ACOUSTIC_RAD_BUILD_TIMES=1 AcousticSolver --radiation ../config/WineglassTap_move.json
+
+The command names a target (RadiationTest or AcousticSolver) and its arguments; both sides
+run it with the repo's real build/ as the working directory, so scene paths resolve the
+same way for each and the outputs land where the comparison at the end reads them.
+
+Why a worktree rather than two configurations of one tree: the Metal kernels are read at
+runtime from ACOUSTIC_RADIATION_MSL_DIR, which is the *source* directory baked in at
+compile time, so two binaries built from one tree would share one set of kernels. The
+worktree goes under build/ and is configured against build/_deps, so the base build reuses
+the dependencies that are already fetched instead of cloning them again.
+
+Do not reach for this unless the change's purpose is speed. A correctness change is
+script/ValidateRadiation's business, which is eight seconds and measures nothing that load
+or heat can move; this builds a second copy of the tree and runs the command twice per
+round. And when the purpose *is* speed, point it at the phase that changed rather than at a
+run containing it — the traps below are why.
+
+What this battery is for, and the traps it was built around:
+
+- **Whole-render wall clock is unusable on this machine, even interleaved.** Stall on one
+  4 m/s scene read 0.00, 1.14, 2.57, 3.93, 5.00 and 23.38 s across six runs of identical
+  code, because a moving render's cost is a race between a CPU worker and the GPU and any
+  other load decides which wins. Measure the phase that changed, in process:
+  ACOUSTIC_RAD_BUILD_TIMES=1 for the table build's phases, ACOUSTIC_RAD_KERNEL_TIMES=1 for
+  per-kernel GPU busy time. An element-weight optimization was rejected on a 1.6% margin in
+  whole-render time and then measured as a clean 33% win as a build phase.
+- **Load average is sampled once, before the first round.** A check between rounds measures
+  this battery's own parallel build and warns on itself.
+- **Peak RSS drifts as badly as wall clock** — 9.6 to 15.3 GB for one configuration. Claim
+  memory as arithmetic, an array's entry count times its width, and read RSS as direction.
+- **Correctness is not optional here.** A render that is 29% off looks entirely normal, so
+  the listener bytes of both sides are compared at the end. Byte identity is the gate for a
+  change that reorders work; across a deliberate approximation use the SNR, which sits near
+  98-106 dB for the approximations taken so far.
+"""
+
+import argparse
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import re
+import time
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+build_dir = os.path.join(root, "build")
+bench_dir = os.path.join(build_dir, "bench")
+
+# Every number either binary prints, so a change is measured against whatever it did not
+# touch as well as whatever it did. A label appearing on neither side is simply absent.
+METRICS = [
+    ("ms/step", r"\((\d+\.\d+) ms/step\)"),
+    ("tables MB", r"tables (\d+) MB"),
+    ("scene build s", r"epochs \d+ \| build (\d+\.\d+)s"),
+    ("epoch bind s", r"([\d.]+)s binding them"),
+    ("epoch stall s", r"([\d.]+)s stalled on table builds"),
+    ("kernel ms/step", r"^\[radiation\]   (\S+)\s+([\d.]+) ms/step"),
+    ("v1 surface dB", r"\[v1\].*surface SNR ([-\d.]+) dB"),
+    ("v1 radiated dB", r"\[v1\].*radiated SNR ([-\d.]+) dB"),
+    ("v2 grid dB", r"\[v2 r1.*grid SNR ([-\d.]+) dB"),
+    ("v2 eq5 dB", r"\[v2 r1.*eq5 SNR ([-\d.]+) dB"),
+    ("v2 run s", r"\[v2 r1.*\| ([\d.]+)s$"),
+    ("v2 build s", r"\[v2 r1.*build=([\d.]+)s"),
+]
+
+
+def parse(text):
+    """{label: value} for every metric line either binary printed. Per-kernel times get one
+    label each, since which kernel moved is the whole point of asking.
+
+    ACOUSTIC_RAD_BUILD_TIMES=1 prints one phase line per table build, and a moving scene
+    builds once an epoch. The first epoch is not like the rest — it keeps its float weights
+    for the CPU seeding pass and has no previous table to carry element weights from — so
+    it is reported on its own and the rest as their median. That split is the difference
+    between measuring a build phase and measuring a mixture of two."""
+    out = {}
+    builds = []
+    for line in text.splitlines():
+        if line.startswith("[radiation build]"):
+            body = line[len("[radiation build]"):].replace("|", "").split()
+            builds.append({body[i]: float(body[i + 1]) for i in range(0, len(body) - 1, 2)})
+            continue
+        for label, pattern in METRICS:
+            match = re.search(pattern, line, re.M)
+            if not match:
+                continue
+            if len(match.groups()) == 2:
+                out[f"{label} {match.group(1)}"] = float(match.group(2))
+            else:
+                out.setdefault(label, float(match.group(1)))
+    for index, group in (("first", builds[:1]), ("epoch", builds[1:])):
+        for phase in group[0] if group else {}:
+            out[f"build {index} {phase} s"] = statistics.median(b[phase] for b in group)
+    return out
+
+
+def run(cmd_dir, command, env, side, round_index):
+    binary = os.path.join(cmd_dir, command[0])
+    started = time.time()
+    result = subprocess.run([binary] + command[1:], cwd=build_dir, capture_output=True, text=True, env=env)
+    log = os.path.join(bench_dir, f"{side}.{round_index}.log")
+    with open(log, "w") as f:
+        f.write(result.stdout + result.stderr)
+    if result.returncode:
+        sys.exit(f"{side} round {round_index} failed (exit {result.returncode}) — see {log}")
+    # Snapshot what this run wrote: both sides write into the same build/radiation/, and
+    # renders from other sessions sit there too — comparing those would report the two
+    # sides as identical on bytes neither of them touched.
+    listener_dir = os.path.join(build_dir, "radiation")
+    stash = os.path.join(bench_dir, "out-" + side)
+    shutil.rmtree(stash, ignore_errors=True)
+    if os.path.isdir(listener_dir):
+        os.makedirs(stash)
+        for name in os.listdir(listener_dir):
+            path = os.path.join(listener_dir, name)
+            if name.endswith(".bin") and os.path.getmtime(path) >= started:
+                shutil.copyfile(path, os.path.join(stash, name))
+    return parse(result.stdout + result.stderr)
+
+
+def prepare_base(ref):
+    """A worktree of `ref` under build/, built against the dependencies build/_deps holds."""
+    tree = os.path.join(bench_dir, "base-tree")
+    head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    want = subprocess.run(["git", "-C", root, "rev-parse", ref], capture_output=True, text=True).stdout.strip()
+    if head != want:
+        subprocess.run(["git", "-C", root, "worktree", "remove", "--force", tree], capture_output=True)
+        shutil.rmtree(tree, ignore_errors=True)
+        subprocess.run(["git", "-C", root, "worktree", "add", "--detach", tree, want], check=True)
+    tree_build = os.path.join(tree, "build")
+    if not os.path.exists(os.path.join(tree_build, "build.ninja")):
+        subprocess.run(
+            ["cmake", "-G", "Ninja", "-S", tree, "-B", tree_build, "-DCMAKE_BUILD_TYPE=Release",
+             f"-DFETCHCONTENT_BASE_DIR={os.path.join(build_dir, '_deps')}"],
+            check=True, env=dict(os.environ, CC="clang", CXX="clang++"),
+        )
+    subprocess.run(["cmake", "--build", tree_build], check=True)
+    return tree_build, want
+
+
+parser = argparse.ArgumentParser(add_help=True)
+parser.add_argument("--rounds", type=int, default=3, help="rounds per side (default 3)")
+parser.add_argument("--base", default="HEAD", help="the commit to measure against (default HEAD)")
+parser.add_argument("--env", action="append", default=[], help="NAME=VALUE for both sides, repeatable")
+parser.add_argument("command", nargs=argparse.REMAINDER, help="target and arguments, e.g. RadiationTest --v2")
+args = parser.parse_args()
+command = [c for c in args.command if c != "--"]
+if not command:
+    parser.error("give a command, e.g. RadiationTest --v2 --res 60")
+
+# Sampled once, before anything runs: the one-minute average taken between rounds carries
+# the previous round and this script's own build, and warns on itself.
+load = os.getloadavg()[0]
+print(f"load average {load:.2f} before starting" + ("  <- something else is running" if load > 2.0 else ""))
+
+os.makedirs(bench_dir, exist_ok=True)
+subprocess.run([os.path.join(root, "script", "Build")], check=True, stdout=subprocess.DEVNULL)
+base_build, base_sha = prepare_base(args.base)
+print(f"base {base_sha[:7]} in {os.path.relpath(base_build, root)}, working tree in build/")
+print(f"{' '.join(command)}, {args.rounds} rounds a side\n")
+
+env = dict(os.environ)
+for pair in args.env:
+    name, _, value = pair.partition("=")
+    env[name] = value
+
+samples = {"base": [], "tree": []}
+for r in range(args.rounds):
+    for side, cmd_dir in (("base", base_build), ("tree", build_dir)):
+        started = time.time()
+        samples[side].append(run(cmd_dir, command, env, side, r))
+        print(f"  {side} round {r}: {time.time() - started:.1f}s")
+
+# Medians, with each side's spread beside them: a ratio is worth what the spread under it
+# says it is, and a round that went wide shows here rather than having to be looked for.
+print(f"\n| metric | base | tree | tree/base | base spread | tree spread |")
+print("|---|---|---|---|---|---|")
+fmt = lambda v: "-" if v is None else f"{v:.4g}"
+for label in dict.fromkeys(k for side in samples.values() for got in side for k in got):
+    middle, spread = {}, {}
+    for side in ("base", "tree"):
+        got = [s[label] for s in samples[side] if label in s]
+        middle[side] = statistics.median(got) if got else None
+        spread[side] = max(got) - min(got) if got else None
+    ratio = middle["tree"] / middle["base"] if middle["base"] else None
+    print(f"| {label} | {fmt(middle['base'])} | {fmt(middle['tree'])} |"
+          f" {'-' if ratio is None else f'{ratio:.3f}'} | {fmt(spread['base'])} | {fmt(spread['tree'])} |")
+
+# The correctness half. Which comparison to believe is the change's to say: bytes for a
+# reordering, SNR across an approximation (98-106 dB for the ones taken so far).
+base_out, tree_out = os.path.join(bench_dir, "out-base"), os.path.join(bench_dir, "out-tree")
+if os.path.isdir(base_out) and os.path.isdir(tree_out):
+    import numpy as np
+
+    print()
+    for name in sorted(f for f in os.listdir(tree_out) if f.endswith(".bin")):
+        a = np.fromfile(os.path.join(base_out, name), dtype=np.float32).astype(np.float64)
+        b = np.fromfile(os.path.join(tree_out, name), dtype=np.float32).astype(np.float64)
+        if a.shape != b.shape:
+            print(f"{name}: LENGTH MISMATCH {a.shape[0]} vs {b.shape[0]}")
+            continue
+        err = np.linalg.norm(a - b)
+        verdict = "identical" if err == 0 else f"SNR {10 * np.log10(np.dot(a, a) / (err * err)):.1f} dB"
+        print(f"{name}: {verdict}")

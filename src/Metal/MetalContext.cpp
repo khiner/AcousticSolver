@@ -12,8 +12,10 @@
 #include "KernelParams.h"
 #include "MetalContext.h"
 #include "Profile.h"
+#include "Radiation/RadiationParams.h" // RadFloorProbeFcIndex
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -40,6 +42,18 @@ std::string ReadFile(const std::string &path) {
     ss << in.rdbuf();
     return ss.str();
 }
+
+// Compiles one runtime library from concatenated MSL sources.
+MTL::Library *CompileLibrary(MTL::Device *device, const std::string &source) {
+    auto *options = MTL::CompileOptions::alloc()->init();
+    options->setFastMathEnabled(false); // nvcc-comparable IEEE behavior for validation
+
+    NS::Error *error{nullptr};
+    auto *library = device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options, &error);
+    options->release();
+    if (!library) throw std::runtime_error(std::format("MSL compilation failed:\n{}", error ? error->localizedDescription()->utf8String() : "unknown error"));
+    return library;
+}
 } // namespace
 
 MetalContext &MetalContext::Get() {
@@ -55,35 +69,47 @@ MetalContext::MetalContext() : Device(MTL::CreateSystemDefaultDevice()) {
     // KernelParams.h is shared with the host, so it is prepended in place of a #include
     // (runtime compilation has no header search path).
     const profile::Scope scope{"startup/msl_compile"};
-    const auto source = ReadFile(std::string{ACOUSTIC_MSL_DIR} + "/KernelParams.h") + ReadFile(std::string{ACOUSTIC_MSL_DIR} + "/Kernels.metal");
+    Library = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_MSL_DIR} + "/KernelParams.h") + ReadFile(std::string{ACOUSTIC_MSL_DIR} + "/Kernels.metal"));
+}
 
-    auto *options = MTL::CompileOptions::alloc()->init();
-    options->setFastMathEnabled(false); // nvcc-comparable IEEE behavior for validation
+namespace {
+// Specializes `name` out of `library` on one function constant. Both kernel libraries
+// specialize on a single constant, so the index and the value's type are all that differ
+// between the two entry points below.
+MTL::ComputePipelineState *MakePipeline(MTL::Device *device, MTL::Library *library, const char *name, const void *value, MTL::DataType type, int fc_index) {
+    const profile::Scope scope{"startup/pipeline_create"};
+    auto *constants = MTL::FunctionConstantValues::alloc()->init();
+    constants->setConstantValue(value, type, NS::UInteger(fc_index));
+    NS::Error *fn_error{nullptr};
+    auto *fn = library->newFunction(NS::String::string(name, NS::UTF8StringEncoding), constants, &fn_error);
+    constants->release();
+    if (!fn) throw std::runtime_error(std::format("Kernel not found: {}", name));
 
     NS::Error *error{nullptr};
-    Library = Device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options, &error);
-    options->release();
-    if (!Library) throw std::runtime_error(std::format("MSL compilation failed:\n{}", error ? error->localizedDescription()->utf8String() : "unknown error"));
+    auto *pso = device->newComputePipelineState(fn, &error);
+    fn->release();
+    if (!pso) throw std::runtime_error(std::format("Pipeline creation failed for {}:\n{}", name, error ? error->localizedDescription()->utf8String() : "unknown error"));
+    return pso;
+}
+} // namespace
+
+MTL::ComputePipelineState *MetalContext::RadiationPipeline(const char *name, int floor_probe) {
+    // `floor_probe` picks a cut-down build of the convolution passes; 0 is the shipping path
+    // and the rest are the fixed-cost probe documented in RadiationParams.h. Keyed into the
+    // cache, so one process can hold several levels and dispatch them side by side.
+    const std::string key = std::string{"rad/"} + name + (floor_probe ? "#probe" + std::to_string(floor_probe) : "");
+    if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    if (!RadiationLib) {
+        const profile::Scope scope{"startup/msl_compile_radiation"};
+        RadiationLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationParams.h") + ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationKernels.metal"));
+    }
+    return Pipelines[key] = MakePipeline(Device, RadiationLib, name, &floor_probe, MTL::DataTypeInt, RadFloorProbeFcIndex);
 }
 
 MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool apply_faces) {
     const std::string key = apply_faces ? std::string{name} + "#faces" : std::string{name};
     if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
-
-    const profile::Scope scope{"startup/pipeline_create"};
-    auto *constants = MTL::FunctionConstantValues::alloc()->init();
-    constants->setConstantValue(&apply_faces, MTL::DataTypeBool, NS::UInteger{ApplyFacesFcIndex});
-    NS::Error *fn_error{nullptr};
-    auto *fn = Library->newFunction(NS::String::string(name, NS::UTF8StringEncoding), constants, &fn_error);
-    constants->release();
-    if (!fn) throw std::runtime_error(std::format("Kernel not found: {}", name));
-
-    NS::Error *error{nullptr};
-    auto *pso = Device->newComputePipelineState(fn, &error);
-    fn->release();
-    if (!pso) throw std::runtime_error(std::format("Pipeline creation failed for {}:\n{}", name, error ? error->localizedDescription()->utf8String() : "unknown error"));
-    Pipelines[key] = pso;
-    return pso;
+    return Pipelines[key] = MakePipeline(Device, Library, name, &apply_faces, MTL::DataTypeBool, ApplyFacesFcIndex);
 }
 
 MTL::ComputeCommandEncoder *MetalContext::ActiveEncoder() {
@@ -100,10 +126,15 @@ MTL::ComputeCommandEncoder *MetalContext::ActiveEncoder() {
 }
 
 void MetalContext::Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params, size_t params_size) {
+    Dispatch(Pipeline(kernel), blocks, threads, buffers, params, params_size);
+}
+
+void MetalContext::Dispatch(MTL::ComputePipelineState *pso, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params, size_t params_size, size_t threadgroup_bytes) {
     if (blocks.x == 0 || blocks.y == 0 || blocks.z == 0) return;
 
     auto *encoder = ActiveEncoder();
-    encoder->setComputePipelineState(Pipeline(kernel));
+    encoder->setComputePipelineState(pso);
+    if (threadgroup_bytes > 0) encoder->setThreadgroupMemoryLength(threadgroup_bytes, 0);
 
     uint32_t index = 0;
     for (const auto &slice : buffers) encoder->setBuffer(slice.Buffer->Handle(), slice.OffsetBytes, index++);

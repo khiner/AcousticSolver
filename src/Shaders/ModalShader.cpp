@@ -193,25 +193,7 @@ void Modal::Compute(GpuBuffer &vb, int global_bid) {
             accel_pulse1 = accel_pulse2;
             accel_pulse2 = Eigen::Vector3<double>::Zero();
 
-            for (const auto *record : batch_records) {
-                const auto &impulse = *record;
-                if (!(time >= impulse.Timestamp && time < impulse.Timestamp + impulse.SupportLength)) continue;
-                if (impulse.SupportLength < 1e-12) continue;
-
-                const Eigen::Vector3d &j_vec = impulse.ImpactVector;
-                const Eigen::Vector3d r = impulse.ImpactPosition - Solver.CenterOfMass;
-
-                double s = 0.;
-                if (time <= impulse.Timestamp + impulse.SupportLength && time >= impulse.Timestamp) s = std::sin(std::numbers::pi * (time - impulse.Timestamp) / impulse.SupportLength);
-
-                // Translational acceleration
-                accel_pulse2 += j_vec * (std::numbers::pi * s / (2. * impulse.SupportLength * Solver.Mass));
-
-                // Rotational acceleration (Eq. 13) from [Chadwick et al. 2012]
-                const Eigen::Matrix3d &i_inv = Solver.InvInertia;
-                const Eigen::Vector3d rot_alpha = (i_inv * r.cross(j_vec)) * (std::numbers::pi * s) / (2. * impulse.SupportLength);
-                accel_pulse2 += rot_alpha.cross(r);
-            }
+            for (const auto *record : batch_records) accel_pulse2 += ModalSound::AccelPulse(Solver, *record, time);
 
             accel_pulse2 = quat * accel_pulse2.eval(); // rotate vector from rest frame to animation frame
 

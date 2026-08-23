@@ -58,6 +58,11 @@ struct MetalContext {
     // Buffers bind at indices 0..N-1 in order, `params` (optional) at index N via setBytes.
     // Skipped when any threadgroup count is 0, matching CUDA's no-op zero-block launches.
     void Dispatch(const char *kernel, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params = nullptr, size_t params_size = 0);
+    // As above, against an already-resolved pipeline (hot loops that cache theirs, and
+    // kernels from the radiation library). `threadgroup_bytes`, when nonzero, sizes
+    // threadgroup buffer 0 for kernels that take it dynamically, since a static array would
+    // have to be declared at its worst case and cost occupancy for the unused remainder.
+    void Dispatch(MTL::ComputePipelineState *, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params = nullptr, size_t params_size = 0, size_t threadgroup_bytes = 0);
 
     void Flush(); // No-op when nothing is pending
     // Waits out everything committed, except deferred work whose gate was released before
@@ -90,6 +95,10 @@ struct MetalContext {
     // ApplyFaces function-constant specialization (see Kernels.metal).
     MTL::ComputePipelineState *Pipeline(const char *name, bool apply_faces = false);
 
+    // The pipeline for a kernel of the radiation solver's library (src/Radiation), which
+    // is compiled on first use so WaveBlender runs never pay for it.
+    MTL::ComputePipelineState *RadiationPipeline(const char *name, int floor_probe = 0);
+
     // The active serial compute encoder, creating a command buffer/encoder if needed.
     // For hot encode loops that bypass Dispatch() and bind buffers persistently.
     MTL::ComputeCommandEncoder *ActiveEncoder();
@@ -97,6 +106,7 @@ struct MetalContext {
     MTL::Device *Device{nullptr};
     MTL::CommandQueue *Queue{nullptr};
     MTL::Library *Library{nullptr};
+    MTL::Library *RadiationLib{nullptr}; // lazily compiled, see RadiationPipeline
 
 private:
     MetalContext();

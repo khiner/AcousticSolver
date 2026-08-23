@@ -56,8 +56,12 @@ Where each mechanism in the solver comes from.
 - **Micikevicius 2009, "3D Finite Difference Computation on GPUs Using CUDA."** doi:10.1145/1513895.1513905 —
   the GPU stencil playbook the CUDA reference follows.
 
-Related recent work worth tracking: **Jin, Zhu, Wang, Li. "SonicRadiation: A Hybrid Numerical Solution for
-Sound Radiation without Ghost Cells." arXiv:2508.08775** — https://arxiv.org/abs/2508.08775.
+**Jin, Zhu, Wang, Li. "SonicRadiation: A Hybrid Numerical Solution for Sound Radiation without Ghost
+Cells." CAVW (Proc. CASA 2026)** — https://arxiv.org/abs/2508.08775. TDBEM (BDF2 convolution quadrature,
+after Lubich 1994 and Banjai & Sauter 2008) for near-field boundary potentials coupled to scalar
+second-order FDTD for far-field transport, with no ghost cells, no rasterization, and no fresh-cell
+problem. Implemented in `src/Radiation/`, with its monopole validation ladder in the `RadiationTest`
+target. No public reference implementation exists.
 
 ## FDTD, PML, and immersed boundaries
 

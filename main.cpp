@@ -4,6 +4,7 @@
 #include "WaveBlender.h"
 
 #include "Profile.h"
+#include "RadiationScene.h"
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -73,9 +74,21 @@ void Run(const std::string &config_file) {
 }
 } // namespace
 
-// Usage: ./AcousticSolver [path to config file]
+// Usage: ./AcousticSolver [--radiation [--seconds T]] [path to config file]
+// --radiation renders the scene with the SonicRadiation solver (src/Radiation) instead of
+// the WaveBlender FDTD stack, and --seconds renders only the first T seconds of it.
+// See RadiationScene.h for the scenes it covers.
 int main(int argc, char *argv[]) {
-    const std::string config_file = argc > 1 ? argv[1] : "../Scenes/CupPhone/config.json";
-    Run(config_file);
+    bool radiation = false;
+    double seconds = 0.;
+    std::string config_file = "../Scenes/CupPhone/config.json";
+    for (int a = 1; a < argc; ++a) {
+        const std::string arg = argv[a];
+        if (arg == "--radiation") radiation = true;
+        else if (arg == "--seconds" && a + 1 < argc) seconds = std::stod(argv[++a]);
+        else config_file = arg;
+    }
+    if (radiation) RunRadiationScene(config_file, seconds);
+    else Run(config_file);
     return 0;
 }

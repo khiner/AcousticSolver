@@ -27,6 +27,14 @@ struct ImpactRecord {
     int AppliedVertex{0};
 };
 
+// The half-sine contact profile at `time`, zero outside the impact's support. Scales both
+// the modal force an impact injects and the rigid-body acceleration noise it produces
+// (see AccelPulse), on both solvers' modal paths.
+inline double ContactProfile(const ImpactRecord &r, double time) {
+    if (time < r.Timestamp || time >= r.Timestamp + r.SupportLength) return 0.;
+    return std::sin(std::numbers::pi * (time - r.Timestamp) / r.SupportLength);
+}
+
 struct ImpulseSeries {
     // The vertex index must be into the surface triangle mesh, not the volumetric tet mesh.
     void Add(const ImpactRecord &record) {
@@ -52,9 +60,7 @@ struct ImpulseSeries {
             const double j = r.ImpactVector.norm();
             r.ImpactVector = (r.ImpactVector / j) * r.Gamma;
 
-            double s = 0.; // TODO: refactor (this also appears in the modal shader)
-            if (time <= r.Timestamp + r.SupportLength && time >= r.Timestamp) s = std::sin(std::numbers::pi * (time - r.Timestamp) / r.SupportLength);
-            r.ImpactVector *= s;
+            r.ImpactVector *= ContactProfile(r, time);
         }
     }
 
@@ -125,5 +131,18 @@ private:
     Eigen::VectorXd Force; // Modal-space force scratch, reused across Steps
     std::vector<ImpactRecord> ActiveScratch; // GetForces output scratch, reused across Steps
 };
+
+// Rigid-body acceleration noise from one impact, in the body's rest frame: the translational
+// term plus the rotational one (Eq. 13 of [Chadwick et al. 2012]), both scaled by the
+// half-sine contact profile. Zero outside the impact's support. Both modal paths sum this
+// over their impacts, and the cross-solver comparison depends on the two agreeing.
+inline Eigen::Vector3d AccelPulse(const Solver &solver, const ImpactRecord &impulse, double time) {
+    if (impulse.SupportLength < 1e-12) return Eigen::Vector3d::Zero();
+    const double s = ContactProfile(impulse, time);
+    if (s == 0.) return Eigen::Vector3d::Zero();
+    const Eigen::Vector3d r = impulse.ImpactPosition - solver.CenterOfMass;
+    const double scale = std::numbers::pi * s / (2. * impulse.SupportLength);
+    return impulse.ImpactVector * (scale / solver.Mass) + (solver.InvInertia * r.cross(impulse.ImpactVector) * scale).cross(r);
+}
 
 } // namespace ModalSound

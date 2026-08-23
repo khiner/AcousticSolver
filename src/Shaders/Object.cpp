@@ -3,21 +3,11 @@
 
 #include "Shaders.h"
 
+#include "Mesh.h"
 #include "Parallel.h"
 #include "Profile.h"
 
 #include <sstream>
-
-namespace {
-// Barycentric weights of `p` within triangle (a, b, c).
-Eigen::RowVector3<real> BarycentricWeights(const Eigen::RowVector3<real> &p, const Eigen::RowVector3<real> &a, const Eigen::RowVector3<real> &b, const Eigen::RowVector3<real> &c) {
-    const Eigen::RowVector3<real> v0 = b - a, v1 = c - a, v2 = p - a;
-    const real d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1), d20 = v2.dot(v0), d21 = v2.dot(v1);
-    const real denom = d00 * d11 - d01 * d01;
-    const real w1 = (d11 * d20 - d01 * d21) / denom, w2 = (d00 * d21 - d01 * d20) / denom;
-    return Eigen::RowVector3<real>{real(1) - (w1 + w2), w1, w2};
-}
-} // namespace
 
 void ObjectBase::SetSamplePoints(const Eigen::MatrixX<real> &b, const Eigen::MatrixX<real> &bn, std::vector<int> &&keys) {
     NPoints = b.rows();

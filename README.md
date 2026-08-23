@@ -50,3 +50,41 @@ Notable performance changes relative to upstream WaveBlender:
 - The fresh-cell least-squares solve runs per connected component, in parallel.
 - Modal filter coefficients are computed once, and modal transfer-matrix rows are reused across batches when the pose and boundary face are unchanged.
 - Flat, data-oriented CPU batch prep: lookup tables instead of sets/maps, bounds-limited grid sweeps, time-windowed impulse queries, and parallel rasterization and closest-point queries.
+
+## SonicRadiation
+
+A second, independent solver implementing [SonicRadiation](https://arxiv.org/abs/2508.08775) (Jin, Zhu, Wang, Li — CAVW/CASA 2026), written from the paper; no reference implementation is public.
+It shares this repo's Metal runtime, scene configs, mesh loading and listener output with the WaveBlender path, and nothing else — `src/Radiation/` is a parallel solver, not a mode of the first one.
+
+Where WaveBlender rasterizes solids into the grid and reconciles the boundary with ghost cells, fresh-cell extrapolation and per-cell blending weights, this method deletes that entire stack. Every cell is an air cell. A time-domain BEM (BDF2 convolution quadrature) carries the near-field boundary potentials on the object's own triangles, a scalar second-order FDTD grid carries far-field transport, and the two couple through purely local per-step operations:
+
+- Each cell stores only its **far-field** pressure — the contribution of boundary elements outside its Chebyshev-R1 neighbourhood. Neighbour terms in the Laplacian are corrected for the set difference between adjacent cells' far sets by direct retarded-potential evaluation (the paper's Eq. 12).
+- Element Dirichlet values close the system each step: near elements by direct BEM sums, far elements by trilinear interpolation of grid far-field values re-based onto the element's own far set (Eqs. 17–20).
+- The domain is terminated by the same quadratic-ramp split-field PML as the main solver, run as the first-order pressure–velocity system in an 8-cell shell. Eliminating the velocities from that staggered scheme yields exactly the interior's scalar update, so the seam adds no scheme mismatch beyond the PML's own reflection floor.
+
+There is no per-batch host round trip in the time loop at all — no fresh cells to solve, no rasterization to sync on. A batch uploads its Neumann samples and runs.
+
+```
+build/AcousticSolver --radiation config/WineglassTap.json                # render a scene
+build/AcousticSolver --radiation --seconds 0.3 config/WineglassTap.json  # just the first 0.3s
+build/RadiationTest                                                     # the validation ladder (~0.7s)
+build/RadiationTest --mesh <obj> --cell <metres>                        # what remeshing does to a scene mesh
+build/RadiationTest --stability --time 10                               # long-run growth probe
+build/RadiationTest --move 2.0 --epoch 16                               # dynamic geometry
+script/ValidateRadiation                                                # the regression gate (~8s)
+script/RadiationBench --rounds 3 RadiationTest --v2 --res 60            # interleaved A/B against another commit
+script/RadiationModes                                                   # per-mode cross-check against the WaveBlender path
+```
+
+The gate is the ladder under `RadiationTest --gate`, where every rung is checked against the value recorded in [VALIDATION.md](VALIDATION.md) rather than merely printed, plus a scene render byte-compared against `gen/radiation/`. `config/WineglassTap_move.json` is the moving scene it renders — 50 ms of the wineglass translating and rotating, 11 geometry epochs — since every config from the dataset carries an identity animation track and would leave the epoch path uncovered.
+
+A body that moves follows its scene's animation track: the geometry tables are rebuilt at epochs paced by how far the body has travelled rather than by a step count, each set built for the midpoint of the interval it serves, on a worker thread while the GPU steps the previous one. Two things make a rebuild affordable enough to hide. The convolution-quadrature weights of every non-self pair are a scaled sum of two universal functions of the retarded delay, tabulated once, so a rebuild costs no contour transforms at all; and an epoch carries its element-element weights over from the last one, since rigid motion leaves every quantity they are built from alone. WineglassTap's scene build is 1.8s against 6.3s before, of which the tables are 0.78s. An epoch after the first also builds its weights straight into the half-precision layout the GPU reads, so the float copies — some 2.5 GB for this scene — are never allocated.
+
+Scope is what the method covers: closed, rigid, modal bodies. Water, speakers, point impulses, occluders and thin shells stay on the WaveBlender path. Listener output is written on both paths the method offers — the grid sample and the Eq. 5 retarded-potential evaluation — into `build/radiation/` as `<output>_grid.bin` and `<output>_eq5.bin`, with the step rate in `<output>.json` (it runs at the grid's Courant limit, not the config's FDTD rate). They have opposite error profiles (grid dispersion versus convolution-quadrature frequency warping), so which one wins depends on the listener's distance.
+
+WineglassTap renders in under eight minutes on an M5 Max — 118,888 steps at the grid's Courant limit, over 13,852 boundary elements and 1.2 GB of convolution-quadrature tables. About four fifths of a step is the two convolution passes over those tables; the scalar FDTD interior that the WaveBlender path spends nearly all its time in is 0.4% here. Those passes are bound by the weight stream rather than by the arithmetic over it, which is why the weights are signed bytes with a power-of-two scale per lag window. The method buys the vanished host round trip and a boundary treatment with no ghost cells, and pays for it in the boundary integral.
+
+Departures from the paper, all forced by measurement (see [VALIDATION.md](VALIDATION.md)):
+
+- The paper's literal near-set radii leave the boundary–grid feedback loop with gain slightly above one. The defaults here are R1=2 (rather than 1) plus a one-zero filter on the interpolated far-field feedback, which nulls the grid-Nyquist mode the loop amplifies.
+- Element counts, and therefore every table built over them, scale near-quadratically with mesh density, so scene meshes are retargeted to the grid by incremental isotropic remeshing before anything else happens.

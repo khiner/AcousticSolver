@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""The SonicRadiation regression gate: the analytic ladder, then scene renders against
+committed reference bytes.
+
+    script/ValidateRadiation             # ladder, render, score
+    script/ValidateRadiation --score     # score what is already in build/radiation/
+    script/ValidateRadiation --exact     # bytes that differ at all are a failure
+    script/ValidateRadiation --update    # adopt the rendered outputs as the new references
+
+`RadiationTest --gate` runs every rung at the settings its thresholds were recorded at and
+exits nonzero on a miss, so it needs nothing from here. The renders are what covers the
+scene path — the remesh, the modal Neumann source, the epoch scheduler and the listener
+writes — none of which the analytic ladder touches.
+
+Which comparison to believe depends on the change. A reordering (a sort, a parallelization,
+a relayout) does not change the arithmetic, so bytes are the gate for it and `--exact` is
+extremely sharp. A deliberate approximation moves the last digits everywhere by
+construction: the delay kernels sit 1.3e-5 from the transform they replaced and carried
+element weights 4.9e-6 from recomputing, which is 98 and 106 dB. Both are reported every
+run, and only the SNR floor decides the exit code unless --exact is given.
+
+References live in gen/radiation/ and are this machine's own output, not a foreign
+solver's — the analytic ladder is what says the solver is right, and these say it has not
+changed.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+build_dir = os.path.join(root, "build")
+output_dir = os.path.join(build_dir, "radiation")
+reference_dir = os.path.join(root, "gen", "radiation")
+
+# Scenes short enough to run as a gate, each self-contained so no flag decides what the
+# reference bytes mean. WineglassTap_move is the only committed moving scene: every config
+# from the dataset carries an identity animation track, which leaves the epoch path with no
+# reproducible coverage.
+SCENES = ["WineglassTap_move"]
+PATHS = ["grid", "eq5"]
+SNR_FLOOR = 90.0  # dB, the floor an approximation may land on, far under a real regression
+
+parser = argparse.ArgumentParser(add_help=True)
+parser.add_argument("scenes", nargs="*", default=None)
+parser.add_argument("--score", action="store_true", help="score existing renders without re-running")
+parser.add_argument("--exact", action="store_true", help="require byte-identical output")
+parser.add_argument("--update", action="store_true", help="copy the rendered outputs over the references")
+parser.add_argument("--floor", type=float, default=SNR_FLOOR, help=f"SNR floor in dB (default {SNR_FLOOR})")
+args = parser.parse_args()
+scenes = args.scenes or SCENES
+
+failures = 0
+
+if not args.score:
+    print("=== ladder ===", flush=True)
+    if subprocess.run(["./RadiationTest", "--gate"], cwd=build_dir).returncode:
+        failures += 1
+
+for scene in scenes:
+    config = os.path.join(root, "config", scene + ".json")
+    print(f"=== {scene} ===", flush=True)
+    if not args.score:
+        t0 = time.time()
+        run = subprocess.run(
+            ["./AcousticSolver", "--radiation", os.path.relpath(config, build_dir)],
+            cwd=build_dir, capture_output=True, text=True,
+        )
+        os.makedirs(os.path.join(build_dir, "logs"), exist_ok=True)
+        with open(os.path.join(build_dir, "logs", scene + ".radiation.log"), "w") as f:
+            f.write(run.stdout + run.stderr)
+        if run.returncode:
+            print(f"  SOLVER FAILED (exit {run.returncode}) in {time.time() - t0:.1f}s")
+            print("  " + "\n  ".join((run.stdout + run.stderr).splitlines()[-5:]))
+            failures += 1
+            continue
+        print(f"  rendered in {time.time() - t0:.1f}s")
+
+    for listener in sorted(f[: -len("_grid.bin")] for f in os.listdir(output_dir) if f.startswith(scene) and f.endswith("_grid.bin")):
+        for path in PATHS:
+            name = f"{listener}_{path}.bin"
+            got_path, want_path = os.path.join(output_dir, name), os.path.join(reference_dir, name)
+            if not os.path.exists(got_path):
+                print(f"  {name}: NO OUTPUT — render this scene first (drop --score)")
+                failures += 1
+                continue
+            if args.update:
+                os.makedirs(reference_dir, exist_ok=True)
+                shutil.copyfile(got_path, want_path)
+                print(f"  {name}: reference updated ({os.path.getsize(got_path)} bytes)")
+                continue
+            if not os.path.exists(want_path):
+                print(f"  {name}: NO REFERENCE — record one with --update")
+                failures += 1
+                continue
+            got = np.fromfile(got_path, dtype=np.float32)
+            want = np.fromfile(want_path, dtype=np.float32)
+            if got.shape != want.shape:
+                print(f"  {name}: LENGTH MISMATCH {got.shape[0]} vs {want.shape[0]}")
+                failures += 1
+                continue
+            identical = bool((got == want).all())
+            g, w = got.astype(np.float64), want.astype(np.float64)
+            err = np.linalg.norm(g - w)
+            snr = float("inf") if err == 0 else 10 * np.log10(np.dot(w, w) / (err * err))
+            ok = identical if args.exact else snr >= args.floor
+            failures += not ok
+            print(f"  {name}: {'OK' if ok else 'FAIL'}  {'identical' if identical else f'SNR {snr:.1f} dB'}"
+                  f"  rms {np.sqrt((w * w).mean()):.4g}  {len(w)} samples")
+
+if not args.update:
+    print(f"\n{'FAIL' if failures else 'PASS'} ({failures} failures)")
+sys.exit(1 if failures else 0)

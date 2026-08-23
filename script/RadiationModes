@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Per-mode levels for WineglassTap: the SonicRadiation-against-WaveBlender cross-check,
+and how far each solver's modes drift when the grid is coarsened.
+
+    script/RadiationModes            # analyse what is already in build/
+    script/RadiationModes --render   # render both solvers at all three resolutions first
+
+These are the two tables in VALIDATION.md's SonicRadiation section that are not produced by
+any other check, and before this script they were assembled by hand — which is how they came
+to be quoted from a build several weight-format changes old. Anything that touches accuracy
+should re-run this.
+
+The comparison is spectral, not sample-for-sample: the two solvers use different methods and
+different sample rates (the radiation path runs at its grid's Courant limit, not the config's
+FDTD rate), so what is comparable is where the modal energy sits. Each output is normalised
+by its own loudest mode, which is why the tables are read as shape rather than level.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+import numpy as np
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+build_dir = os.path.join(root, "build")
+
+# The glass's modes, from its modal data by way of ModalSound. Fixed properties of the scene
+# and its material, so they do not move with anything this repo changes.
+MODES = [497, 559, 1975, 2106, 4506, 5131, 6416, 9318]
+# 5 mm is the reference the other two are judged against, so it leads.
+# Half-width of the band each mode is read over, in Hz. Narrow and absolute, not a
+# proportion of the frequency: a 1 s render has 1 Hz bins, so ten of them is ample slack for
+# a peak that lands slightly off its nominal frequency, and anything wider starts reporting
+# whatever else is nearby. A proportional band was tried and is badly wrong at the top of the
+# range — +/-128 Hz around 6416 Hz reads 32 dB high, because it catches a louder neighbour
+# rather than the mode.
+BAND = 10.0
+
+
+SCENES = [("WineglassTap", "5.0 mm"), ("WineglassTap_7.5mm", "7.5 mm"), ("WineglassTap_10mm", "10 mm")]
+
+
+def levels(samples, srate):
+    """dB at each mode, relative to the loudest of them in this signal, or None if the
+    signal is too short to resolve them.
+
+    A rendered peak lands a bin or two off its nominal frequency — different discretisations
+    stiffen the boundary slightly differently — so each mode is read at the largest bin in a
+    narrow band around it rather than at one bin. A truncated render (a `--seconds` probe
+    left in build/, say) has no bins inside those bands at all, and is refused rather than
+    silently reported from whichever bin happened to be nearest.
+    """
+    x = samples.astype(np.float64)
+    if len(x) < 4 * srate / BAND:
+        return None
+    spectrum = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+    freqs = np.fft.rfftfreq(len(x), 1.0 / srate)
+    out = []
+    for mode in MODES:
+        in_band = (freqs >= mode - BAND) & (freqs <= mode + BAND)
+        if not in_band.any():
+            return None
+        out.append(20.0 * np.log10(max(spectrum[in_band].max(), 1e-300)))
+    return np.array(out) - max(out)
+
+
+def waveblender(scene):
+    with open(os.path.join(root, "config", scene + ".json")) as f:
+        config = json.load(f)
+    name = next(iter(config["listeners"].values()))["output"]
+    path = os.path.join(build_dir, name + ".bin")
+    if not os.path.exists(path):
+        return None
+    return levels(np.fromfile(path, dtype=np.float32), config["FDTD_srate"])
+
+
+def radiation(scene, which):
+    with open(os.path.join(root, "config", scene + ".json")) as f:
+        name = next(iter(json.load(f)["listeners"].values()))["output"]
+    stem = os.path.join(build_dir, "radiation", name)
+    if not os.path.exists(stem + ".json") or not os.path.exists(f"{stem}_{which}.bin"):
+        return None
+    with open(stem + ".json") as f:
+        srate = json.load(f)["srate"]
+    return levels(np.fromfile(f"{stem}_{which}.bin", dtype=np.float32), srate)
+
+
+parser = argparse.ArgumentParser(add_help=True)
+parser.add_argument("--render", action="store_true", help="render both solvers at all three resolutions first")
+args = parser.parse_args()
+
+if args.render:
+    for scene, _ in SCENES:
+        for flags in ([], ["--radiation"]):
+            print(f"rendering {scene} {'radiation' if flags else 'waveblender'}...", flush=True)
+            run = subprocess.run(["./AcousticSolver", *flags, f"../config/{scene}.json"], cwd=build_dir, capture_output=True, text=True)
+            if run.returncode:
+                sys.exit(f"{scene} failed: {run.stderr.splitlines()[-1] if run.stderr else run.returncode}")
+
+rows = {(scene, kind): fn(scene) for scene, _ in SCENES
+        for kind, fn in (("WaveBlender", waveblender), ("grid", lambda s: radiation(s, "grid")), ("eq5", lambda s: radiation(s, "eq5")))}
+missing = [f"{s} {k}" for (s, k), v in rows.items() if v is None]
+if missing:
+    print(f"missing or too short: {', '.join(missing)} — re-run with --render\n")
+
+print("Cross-check at 5 mm, dB relative to each output's own peak\n")
+print("| mode (Hz) | WaveBlender | radiation, grid path | radiation, Eq. 5 path |")
+print("|---|---|---|---|")
+for i, mode in enumerate(MODES):
+    cells = [rows[("WineglassTap", k)] for k in ("WaveBlender", "grid", "eq5")]
+    print(f"| {mode} | " + " | ".join("-" if c is None else f"{c[i]:.0f}" for c in cells) + " |")
+
+print("\nPer-mode level shift when coarsening from 5 mm, rms over the eight modes\n")
+print("| | " + " | ".join(label for _, label in SCENES[1:]) + " |")
+print("|---|" + "---|" * (len(SCENES) - 1))
+for kind, label in (("WaveBlender", "WaveBlender"), ("grid", "radiation, grid path"), ("eq5", "radiation, Eq. 5 path")):
+    ref = rows[("WineglassTap", kind)]
+    cells = []
+    for scene, _ in SCENES[1:]:
+        coarse = rows[(scene, kind)]
+        cells.append("-" if ref is None or coarse is None else f"{np.sqrt(((coarse - ref) ** 2).mean()):.1f} dB")
+    print(f"| {label} | " + " | ".join(cells) + " |")

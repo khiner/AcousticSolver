@@ -24,29 +24,50 @@ FetchContent_MakeAvailable(metalcpp)
 
 file(GLOB SHADER_SOURCES src/Shaders/*.cpp)
 
+# The SonicRadiation solver [Jin et al. 2025]: CQM weight generation, the TDBEM tables, and
+# the Metal stepper. Shared by the scene runner and the validation harness.
+set(RADIATION_SOURCES
+    src/Radiation/Cqm.cpp
+    src/Radiation/RadiationMesh.cpp
+    src/Radiation/Tdbem.cpp
+    src/Radiation/RadiationTables.cpp
+    src/Radiation/RadiationGpu.cpp
+    src/Radiation/RadiationScene.cpp)
+
+# Kernels are compiled at runtime from these sources (KernelParams.h + Kernels.metal, and
+# the radiation solver's RadiationParams.h + RadiationKernels.metal). macOS caches the
+# compilation, so warm-start compiles are ~1 ms (see startup/msl_compile under
+# ACOUSTIC_PROFILE).
+set(MSL_DEFINITIONS
+    ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/FDTD"
+    ACOUSTIC_RADIATION_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Radiation")
+
+# What the scene runner and the validation harness both need. The include paths, the
+# runtime-MSL directories and the frameworks ride along as usage requirements, so the two
+# executables cannot drift apart on any of them, and the shared sources compile once.
+add_library(AcousticCore STATIC
+    src/Mesh.cpp
+    src/ModalSound.cpp
+    src/Oscillator.cpp
+    src/Metal/MetalContext.cpp
+    ${RADIATION_SOURCES}
+)
+target_include_directories(AcousticCore PUBLIC src src/FDTD src/Metal src/Radiation)
+target_include_directories(AcousticCore SYSTEM PUBLIC src/external ${metalcpp_SOURCE_DIR})
+target_compile_definitions(AcousticCore PUBLIC ${MSL_DEFINITIONS})
+target_link_libraries(AcousticCore PUBLIC "-framework Metal" "-framework Foundation" "-framework Accelerate")
+
 add_executable(${PROJECT_NAME}
     main.cpp
     src/BubbleUtils.cpp
     src/FluidSound.cpp
     src/Integrators.cpp
-    src/Mesh.cpp
-    src/ModalSound.cpp
-    src/Oscillator.cpp
     src/WaveBlender.cpp
-    src/Metal/MetalContext.cpp
     ${SHADER_SOURCES}
 )
+target_link_libraries(${PROJECT_NAME} PRIVATE AcousticCore)
 
-target_include_directories(${PROJECT_NAME} PRIVATE src src/FDTD src/Metal)
-target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
-    src/external
-    ${metalcpp_SOURCE_DIR}
-)
-
-# Kernels are compiled at runtime from these sources (KernelParams.h + Kernels.metal).
-# macOS caches the compilation, so warm-start compiles are ~1 ms (see startup/msl_compile
-# under ACOUSTIC_PROFILE).
-target_compile_definitions(${PROJECT_NAME} PRIVATE
-    ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/FDTD")
-
-target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Metal" "-framework Foundation" "-framework Accelerate")
+# The SonicRadiation solver's validation harness (see src/Radiation/RadiationTest.cpp for
+# the test ladder).
+add_executable(RadiationTest src/Radiation/RadiationTest.cpp)
+target_link_libraries(RadiationTest PRIVATE AcousticCore)

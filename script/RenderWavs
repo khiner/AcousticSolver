@@ -6,8 +6,11 @@ Usage (from anywhere):
     script/RenderWavs GlassPour ...  # just these scenes
 
 For each scene, writes gen/wav/cuda/<scene>.wav from gen/cuda/<scene>/<output>.bin and
-gen/wav/metal/<scene>.wav from build/<output>.bin, whichever exist. Follows the reference
-write_wav.py convention: peak-normalized, at the scene's FDTD sample rate.
+gen/wav/metal/<scene>.wav from build/<output>.bin, whichever exist. The SonicRadiation
+solver writes to its own build/radiation/ directory (<output>_grid.bin and <output>_eq5.bin,
+one per listener path) at the grid's Courant limit rather than the config's FDTD rate, so
+those carry the rate in an <output>.json sidecar and land under gen/wav/radiation/.
+Follows the reference write_wav.py convention: peak-normalized, at the source's rate.
 Pure CPU — no GPU needed. Requires numpy + soundfile.
 """
 
@@ -21,6 +24,7 @@ import soundfile as sf
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 reference_dir = os.path.join(root, "gen", "cuda")
 build_dir = os.path.join(root, "build")
+radiation_dir = os.path.join(build_dir, "radiation")
 
 def config_path(scene):
     """Repo-owned override if there is one, else the dataset's own — Scenes/ is checksummed."""
@@ -51,13 +55,23 @@ for scene in scenes:
     rendered = []
     for listener in config["listeners"].values():
         name = listener["output"]
-        for kind, bin_path in (
-            ("cuda", os.path.join(reference_dir, scene, str(srate), name + ".bin")),
-            ("metal", os.path.join(build_dir, name + ".bin")),
-        ):
+        sources = [
+            ("cuda", os.path.join(reference_dir, scene, str(srate), name + ".bin"), srate),
+            ("metal", os.path.join(build_dir, name + ".bin"), srate),
+        ]
+        # The radiation solver's own rate lives beside its output.
+        sidecar = os.path.join(radiation_dir, name + ".json")
+        if os.path.exists(sidecar):
+            with open(sidecar) as f:
+                meta = json.load(f)
+            rad_srate = int(round(meta["srate"]))
+            for path in meta["paths"]:
+                sources.append((f"radiation/{path}", os.path.join(radiation_dir, f"{name}_{path}.bin"), rad_srate))
+
+        for kind, bin_path, rate in sources:
             if os.path.exists(bin_path):
                 out_dir = os.path.join(wav_dir, kind, scene)
                 os.makedirs(out_dir, exist_ok=True)
-                duration = render(bin_path, os.path.join(out_dir, f"{srate}.wav"), srate)
-                rendered.append(f"{kind} ({duration:.1f}s)")
-    print(f"{scene}: {' + '.join(rendered) if rendered else 'no output found'} @ {srate} Hz")
+                duration = render(bin_path, os.path.join(out_dir, f"{rate}.wav"), rate)
+                rendered.append(f"{kind} {duration:.1f}s @ {rate} Hz")
+    print(f"{scene}: {' | '.join(rendered) if rendered else 'no output found'}")

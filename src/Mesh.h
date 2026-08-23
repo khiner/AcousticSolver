@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,20 @@ template<typename DerivedV, typename DerivedF> bool ReadObj(const std::string &f
         for (int c = 0; c < 3; ++c) f(r, c) = fs[r * 3 + c];
     }
     return true;
+}
+
+// Barycentric weights of `p` within triangle (a, b, c), as a row vector. Both solvers use
+// this on an AabbTree closest point, to blend per-vertex data at a point on a face.
+// A degenerate triangle falls back to the first vertex rather than dividing by zero.
+template<typename Dp, typename Da, typename Db, typename Dc>
+Eigen::RowVector3<typename Dp::Scalar> BarycentricWeights(const Eigen::MatrixBase<Dp> &p, const Eigen::MatrixBase<Da> &a, const Eigen::MatrixBase<Db> &b, const Eigen::MatrixBase<Dc> &c) {
+    using T = typename Dp::Scalar;
+    const Eigen::RowVector3<T> v0 = b - a, v1 = c - a, v2 = p - a;
+    const T d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1), d20 = v2.dot(v0), d21 = v2.dot(v1);
+    const T denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) < T(1e-30)) return {T(1), T(0), T(0)};
+    const T w1 = (d11 * d20 - d01 * d21) / denom, w2 = (d00 * d21 - d01 * d20) / denom;
+    return {T(1) - (w1 + w2), w1, w2};
 }
 
 // Mean curvature (the average of the two principal curvatures) at every vertex, from a

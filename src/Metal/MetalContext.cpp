@@ -22,6 +22,17 @@
 #include <stdexcept>
 
 namespace {
+// GPU busy time of a completed command buffer. A buffer that never reached the GPU reports
+// GPUStartTime() as 0 while GPUEndTime() stays an absolute timestamp, so the naive
+// difference is time since boot rather than a duration — one such buffer put 39,413
+// seconds into a kernel's running total and ACOUSTIC_RAD_KERNEL_TIMES printed it as
+// 13,257 ms/step beside neighbours reading 0.01. Dropping the sample is right: it is one
+// dispatch of thousands, and an instrument that reported zero throughout would be obvious.
+double GpuSeconds(MTL::CommandBuffer *cb) {
+    const double start = cb->GPUStartTime(), end = cb->GPUEndTime();
+    return start > 0. && end > start ? end - start : 0.;
+}
+
 std::string ReadFile(const std::string &path) {
     std::ifstream const in{path, std::ios::binary};
     if (!in.good()) throw std::runtime_error(std::format("Failed to read MSL source: {}", path));
@@ -170,13 +181,13 @@ void MetalContext::Sync() {
         for (int i = 0; i < 80000 && last->status() < MTL::CommandBufferStatusCompleted; ++i) {}
         if (last->status() < MTL::CommandBufferStatusCompleted) last->waitUntilCompleted();
     }
-    for (const auto &[cb, deferred] : waited) LastBatchSeconds = std::max(LastBatchSeconds, cb->GPUEndTime() - cb->GPUStartTime());
+    for (const auto &[cb, deferred] : waited) LastBatchSeconds = std::max(LastBatchSeconds, GpuSeconds(cb));
     if (profile::Enabled()) {
         auto &exec = profile::Entries()["gpu/exec"];
         auto &exec_fdtd = profile::Entries()["gpu/exec_fdtd"];
         auto &exec_prologue = profile::Entries()["gpu/exec_prologue"];
         for (const auto &[cb, deferred] : waited) {
-            const double seconds = cb->GPUEndTime() - cb->GPUStartTime();
+            const double seconds = GpuSeconds(cb);
             exec.Seconds += seconds;
             auto &split = deferred ? exec_fdtd : exec_prologue;
             split.Seconds += seconds;
@@ -192,11 +203,16 @@ void MetalContext::Sync() {
         auto &idle_prologue = profile::Entries()["gpu/idle_prologue"];
         for (const auto &[cb, deferred] : waited) {
             auto &split = deferred ? idle_fdtd : idle_prologue;
-            if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) {
-                idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
-                split.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+            // Same guard: a buffer with no valid start time neither closes an idle gap
+            // nor opens one, and letting its end time through would silently suppress
+            // every gap after it.
+            if (GpuSeconds(cb) > 0.) {
+                if (PrevGpuEndTime > 0. && cb->GPUStartTime() > PrevGpuEndTime) {
+                    idle.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+                    split.Seconds += cb->GPUStartTime() - PrevGpuEndTime;
+                }
+                PrevGpuEndTime = cb->GPUEndTime();
             }
-            PrevGpuEndTime = cb->GPUEndTime();
             idle.Count += 1;
             split.Count += 1;
         }

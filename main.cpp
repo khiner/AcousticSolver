@@ -5,6 +5,7 @@
 
 #include "Profile.h"
 #include "RadiationScene.h"
+#include "RoomScene.h"
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -74,21 +75,25 @@ void Run(const std::string &config_file) {
 }
 } // namespace
 
-// Usage: ./AcousticSolver [--radiation [--seconds T]] [path to config file]
-// --radiation renders the scene with the SonicRadiation solver (src/Radiation) instead of
-// the WaveBlender FDTD stack, and --seconds renders only the first T seconds of it.
-// See RadiationScene.h for the scenes it covers.
+// Usage: ./AcousticSolver [--radiation | --room] [--seconds T] [path to config file]
+// --radiation renders the scene with the SonicRadiation solver (src/Radiation) and --room
+// with the room-acoustics solver (src/Room), instead of the WaveBlender FDTD stack.
+// --seconds renders only the first T seconds of it. See RadiationScene.h and RoomScene.h
+// for the scenes each covers.
 int main(int argc, char *argv[]) {
-    bool radiation = false;
+    bool radiation = false, room = false;
     double seconds = 0.;
-    std::string config_file = "../Scenes/CupPhone/config.json";
+    std::string config_file;
     for (int a = 1; a < argc; ++a) {
         const std::string arg = argv[a];
         if (arg == "--radiation") radiation = true;
+        else if (arg == "--room") room = true;
         else if (arg == "--seconds" && a + 1 < argc) seconds = std::stod(argv[++a]);
         else config_file = arg;
     }
-    if (radiation) RunRadiationScene(config_file, seconds);
+    if (config_file.empty()) config_file = room ? "../Scenes/RoomShoebox/config.json" : "../Scenes/CupPhone/config.json";
+    if (room) RunRoomScene(config_file, seconds);
+    else if (radiation) RunRadiationScene(config_file, seconds);
     else Run(config_file);
     return 0;
 }

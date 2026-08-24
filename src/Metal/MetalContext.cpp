@@ -73,16 +73,21 @@ MetalContext::MetalContext() : Device(MTL::CreateSystemDefaultDevice()) {
 }
 
 namespace {
-// Specializes `name` out of `library` on one function constant. Both kernel libraries
-// specialize on a single constant, so the index and the value's type are all that differ
-// between the two entry points below.
-MTL::ComputePipelineState *MakePipeline(MTL::Device *device, MTL::Library *library, const char *name, const void *value, MTL::DataType type, int fc_index) {
+// Specializes `name` out of `library` on one function constant, or on none when `value` is
+// null. The two specializing libraries differ only in the constant's index and type.
+MTL::ComputePipelineState *MakePipeline(MTL::Device *device, MTL::Library *library, const char *name, const void *value = nullptr, MTL::DataType type = MTL::DataTypeNone, int fc_index = 0) {
     const profile::Scope scope{"startup/pipeline_create"};
-    auto *constants = MTL::FunctionConstantValues::alloc()->init();
-    constants->setConstantValue(value, type, NS::UInteger(fc_index));
-    NS::Error *fn_error{nullptr};
-    auto *fn = library->newFunction(NS::String::string(name, NS::UTF8StringEncoding), constants, &fn_error);
-    constants->release();
+    auto *fn_name = NS::String::string(name, NS::UTF8StringEncoding);
+    MTL::Function *fn{nullptr};
+    if (value) {
+        auto *constants = MTL::FunctionConstantValues::alloc()->init();
+        constants->setConstantValue(value, type, NS::UInteger(fc_index));
+        NS::Error *fn_error{nullptr};
+        fn = library->newFunction(fn_name, constants, &fn_error);
+        constants->release();
+    } else {
+        fn = library->newFunction(fn_name);
+    }
     if (!fn) throw std::runtime_error(std::format("Kernel not found: {}", name));
 
     NS::Error *error{nullptr};
@@ -104,6 +109,16 @@ MTL::ComputePipelineState *MetalContext::RadiationPipeline(const char *name, int
         RadiationLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationParams.h") + ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationKernels.metal"));
     }
     return Pipelines[key] = MakePipeline(Device, RadiationLib, name, &floor_probe, MTL::DataTypeInt, RadFloorProbeFcIndex);
+}
+
+MTL::ComputePipelineState *MetalContext::RoomPipeline(const char *name) {
+    const std::string key = std::string{"room/"} + name;
+    if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    if (!RoomLib) {
+        const profile::Scope scope{"startup/msl_compile_room"};
+        RoomLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_ROOM_MSL_DIR} + "/RoomParams.h") + ReadFile(std::string{ACOUSTIC_ROOM_MSL_DIR} + "/RoomKernels.metal"));
+    }
+    return Pipelines[key] = MakePipeline(Device, RoomLib, name);
 }
 
 MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool apply_faces) {

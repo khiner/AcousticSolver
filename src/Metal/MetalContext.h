@@ -99,6 +99,10 @@ struct MetalContext {
     // is compiled on first use so WaveBlender runs never pay for it.
     MTL::ComputePipelineState *RadiationPipeline(const char *name, int floor_probe = 0);
 
+    // The pipeline for a kernel of the room solver's library (src/Room), compiled on first
+    // use like the radiation one. These kernels specialize on nothing.
+    MTL::ComputePipelineState *RoomPipeline(const char *name);
+
     // The active serial compute encoder, creating a command buffer/encoder if needed.
     // For hot encode loops that bypass Dispatch() and bind buffers persistently.
     MTL::ComputeCommandEncoder *ActiveEncoder();
@@ -107,6 +111,7 @@ struct MetalContext {
     MTL::CommandQueue *Queue{nullptr};
     MTL::Library *Library{nullptr};
     MTL::Library *RadiationLib{nullptr}; // lazily compiled, see RadiationPipeline
+    MTL::Library *RoomLib{nullptr}; // lazily compiled, see RoomPipeline
 
 private:
     MetalContext();

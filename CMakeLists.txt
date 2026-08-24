@@ -34,13 +34,19 @@ set(RADIATION_SOURCES
     src/Radiation/RadiationGpu.cpp
     src/Radiation/RadiationScene.cpp)
 
+# The room-acoustics solver [Bilbao, Hamilton, Botts and Savioja 2016; PFFDTD-equivalent]:
+# the scene loader and the Metal stepper. Shared by the scene runner and its harness.
+set(ROOM_SOURCES
+    src/Room/RoomGpu.cpp
+    src/Room/RoomScene.cpp)
+
 # Kernels are compiled at runtime from these sources (KernelParams.h + Kernels.metal, and
-# the radiation solver's RadiationParams.h + RadiationKernels.metal). macOS caches the
-# compilation, so warm-start compiles are ~1 ms (see startup/msl_compile under
-# ACOUSTIC_PROFILE).
+# each other solver's Params header + kernels). macOS caches the compilation, so warm-start
+# compiles are ~1 ms (see startup/msl_compile under ACOUSTIC_PROFILE).
 set(MSL_DEFINITIONS
     ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/FDTD"
-    ACOUSTIC_RADIATION_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Radiation")
+    ACOUSTIC_RADIATION_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Radiation"
+    ACOUSTIC_ROOM_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Room")
 
 # What the scene runner and the validation harness both need. The include paths, the
 # runtime-MSL directories and the frameworks ride along as usage requirements, so the two
@@ -51,8 +57,9 @@ add_library(AcousticCore STATIC
     src/Oscillator.cpp
     src/Metal/MetalContext.cpp
     ${RADIATION_SOURCES}
+    ${ROOM_SOURCES}
 )
-target_include_directories(AcousticCore PUBLIC src src/FDTD src/Metal src/Radiation)
+target_include_directories(AcousticCore PUBLIC src src/FDTD src/Metal src/Radiation src/Room)
 target_include_directories(AcousticCore SYSTEM PUBLIC src/external ${metalcpp_SOURCE_DIR})
 target_compile_definitions(AcousticCore PUBLIC ${MSL_DEFINITIONS})
 target_link_libraries(AcousticCore PUBLIC "-framework Metal" "-framework Foundation" "-framework Accelerate")
@@ -71,3 +78,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE AcousticCore)
 # the test ladder).
 add_executable(RadiationTest src/Radiation/RadiationTest.cpp)
 target_link_libraries(RadiationTest PRIVATE AcousticCore)
+
+# The room solver's validation harness (see src/Room/RoomTest.cpp for the test ladder).
+add_executable(RoomTest src/Room/RoomTest.cpp)
+target_link_libraries(RoomTest PRIVATE AcousticCore)

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Interleaved A/B battery for the room-acoustics solver: one command, two builds, rounds
+alternating between them, every number either build printed reported side by side.
+
+    script/RoomBench RoomChurch RoomChurchFcc
+    script/RoomBench --rounds 4 --base 2280885 RoomShoebox
+    script/RoomBench --env ACOUSTIC_ROOM_KERNEL_TIMES=1 RoomChurch
+
+Scenes name directories under Scenes/. Both sides run from the repo's real build/, so scene
+paths resolve the same way for each and the renders land where the byte comparison at the end
+reads them.
+
+Why a worktree rather than two configurations of one tree: the Metal kernels are read at
+runtime from ACOUSTIC_ROOM_MSL_DIR, which is the *source* directory baked in at compile time,
+so two binaries built from one tree would share one set of kernels. The worktree goes under
+build/ and is configured against build/_deps, so the base build reuses the dependencies that
+are already fetched instead of cloning them again.
+
+Reach for this only when the change's purpose is speed — correctness is script/ValidateRoom's
+business, which renders each scene once. What this measures, and why in this form:
+
+- **GPU busy, not wall clock.** `ACOUSTIC_PROFILE=1` reports gpu/exec, the summed execution
+  time of the command buffers the run drained, which is the number a kernel change moves. This
+  machine's wall clock carries thermal drift worth 5-10% and whatever else is on the GPU.
+- **Rounds alternate sides** so a drift affects both legs equally, and each side's spread is
+  printed beside its median: a ratio is worth what the spread under it says it is.
+- **Load average is sampled once, before the first round.** A check between rounds measures
+  this battery's own parallel build and warns on itself.
+- **Bytes are the correctness gate.** A render that is wrong looks entirely normal, so both
+  sides' receiver outputs are compared at the end. Byte identity is the gate for a change that
+  reorders work; across one that reorders arithmetic the SNR is, and the recompile scale on
+  this solver is 95-100 dB.
+"""
+
+import argparse
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import re
+import time
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+build_dir = os.path.join(root, "build")
+bench_dir = os.path.join(build_dir, "bench-room")
+
+# Every number either binary prints, so a change is measured against whatever it did not touch
+# as well as whatever it did. A label appearing on neither side is simply absent.
+METRICS = [
+    ("gpu exec s", r"^gpu/exec\s+([\d.]+)s"),
+    ("gpu wait s", r"^gpu/wait\s+([\d.]+)s"),
+    ("steps s", r"^room/steps\s+([\d.]+)s"),
+    ("init s", r"^room/init\s+([\d.]+)s"),
+    ("kernels ms/step", r"steps, ([\d.]+) ms/step total"),
+    ("kernel ms/step", r"^  (\S+)\s+([\d.]+) ms/step"),
+]
+
+
+def parse(text):
+    """{label: value} for every metric line the binary printed, per-kernel times one label
+    each, since which kernel moved is the whole point of asking."""
+    out = {}
+    for line in text.splitlines():
+        for label, pattern in METRICS:
+            match = re.search(pattern, line)
+            if not match:
+                continue
+            if len(match.groups()) == 2:
+                out[f"{label} {match.group(1)}"] = float(match.group(2))
+            else:
+                out.setdefault(label, float(match.group(1)))
+    return out
+
+
+def run(cmd_dir, scene, env, side, round_index):
+    binary = os.path.join(cmd_dir, "AcousticSolver")
+    config = os.path.join(root, "Scenes", scene, "config.json")
+    started = time.time()
+    result = subprocess.run([binary, "--room", config], cwd=build_dir, capture_output=True, text=True, env=env)
+    log = os.path.join(bench_dir, f"{scene}.{side}.{round_index}.log")
+    with open(log, "w") as f:
+        f.write(result.stdout + result.stderr)
+    if result.returncode:
+        sys.exit(f"{side} round {round_index} on {scene} failed (exit {result.returncode}) — see {log}")
+    # Snapshot what this run wrote: both sides write into the same build/room/, and renders
+    # from other sessions sit there too — comparing those would report the two sides as
+    # identical on bytes neither of them touched.
+    stash = os.path.join(bench_dir, "out-" + side)
+    os.makedirs(stash, exist_ok=True)
+    for name in os.listdir(os.path.join(build_dir, "room")):
+        path = os.path.join(build_dir, "room", name)
+        if name.endswith(".bin") and os.path.getmtime(path) >= started:
+            shutil.copyfile(path, os.path.join(stash, name))
+    return parse(result.stdout + result.stderr), time.time() - started
+
+
+def prepare_base(ref):
+    """A worktree of `ref` under build/, built against the dependencies build/_deps holds."""
+    tree = os.path.join(bench_dir, "base-tree")
+    head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    want = subprocess.run(["git", "-C", root, "rev-parse", ref], capture_output=True, text=True).stdout.strip()
+    if head != want:
+        subprocess.run(["git", "-C", root, "worktree", "remove", "--force", tree], capture_output=True)
+        shutil.rmtree(tree, ignore_errors=True)
+        subprocess.run(["git", "-C", root, "worktree", "add", "--detach", tree, want], check=True)
+    tree_build = os.path.join(tree, "build")
+    if not os.path.exists(os.path.join(tree_build, "build.ninja")):
+        subprocess.run(
+            ["cmake", "-G", "Ninja", "-S", tree, "-B", tree_build, "-DCMAKE_BUILD_TYPE=Release",
+             f"-DFETCHCONTENT_BASE_DIR={os.path.join(build_dir, '_deps')}"],
+            check=True, env=dict(os.environ, CC="clang", CXX="clang++"),
+        )
+    subprocess.run(["cmake", "--build", tree_build, "--target", "AcousticSolver"], check=True)
+    return tree_build, want
+
+
+parser = argparse.ArgumentParser(add_help=True)
+parser.add_argument("scenes", nargs="+", help="scene directories under Scenes/")
+parser.add_argument("--rounds", type=int, default=3, help="rounds per side (default 3)")
+parser.add_argument("--base", default="HEAD", help="the commit to measure against (default HEAD)")
+parser.add_argument("--env", action="append", default=[], help="NAME=VALUE for both sides, repeatable")
+args = parser.parse_args()
+
+# Sampled once, before anything runs: the one-minute average taken between rounds carries the
+# previous round and this script's own build, and warns on itself.
+load = os.getloadavg()[0]
+print(f"load average {load:.2f} before starting" + ("  <- something else is running" if load > 2.0 else ""))
+
+os.makedirs(bench_dir, exist_ok=True)
+subprocess.run([os.path.join(root, "script", "Build")], check=True, stdout=subprocess.DEVNULL)
+base_build, base_sha = prepare_base(args.base)
+print(f"base {base_sha[:7]} in {os.path.relpath(base_build, root)}, working tree in build/")
+
+env = dict(os.environ, ACOUSTIC_PROFILE="1")
+for pair in args.env:
+    name, _, value = pair.partition("=")
+    env[name] = value
+
+for scene in args.scenes:
+    print(f"\n== {scene}, {args.rounds} rounds a side ==")
+    samples = {"base": [], "tree": []}
+    for r in range(args.rounds):
+        for side, cmd_dir in (("base", base_build), ("tree", build_dir)):
+            got, seconds = run(cmd_dir, scene, env, side, r)
+            samples[side].append(got)
+            print(f"  {side} round {r}: {seconds:.1f}s wall")
+    print("| metric | base | tree | tree/base | base spread | tree spread |")
+    print("|---|---|---|---|---|---|")
+    fmt = lambda v: "-" if v is None else f"{v:.4g}"
+    for label in dict.fromkeys(k for side in samples.values() for got in side for k in got):
+        middle, spread = {}, {}
+        for side in ("base", "tree"):
+            got = [s[label] for s in samples[side] if label in s]
+            middle[side] = statistics.median(got) if got else None
+            spread[side] = max(got) - min(got) if got else None
+        ratio = middle["tree"] / middle["base"] if middle["base"] else None
+        print(f"| {label} | {fmt(middle['base'])} | {fmt(middle['tree'])} |"
+              f" {'-' if ratio is None else f'{ratio:.3f}'} | {fmt(spread['base'])} | {fmt(spread['tree'])} |")
+
+# The correctness half. Which comparison to believe is the change's to say: bytes for a
+# reordering, SNR across one that reorders arithmetic (95-100 dB is this solver's recompile
+# scale). Receiver rows are float64, one row a receiver.
+base_out, tree_out = os.path.join(bench_dir, "out-base"), os.path.join(bench_dir, "out-tree")
+if os.path.isdir(base_out) and os.path.isdir(tree_out):
+    import numpy as np
+
+    print()
+    for name in sorted(f for f in os.listdir(tree_out) if f.endswith(".bin")):
+        a = np.fromfile(os.path.join(base_out, name), dtype=np.float64)
+        b = np.fromfile(os.path.join(tree_out, name), dtype=np.float64)
+        if a.shape != b.shape:
+            print(f"{name}: LENGTH MISMATCH {a.shape[0]} vs {b.shape[0]}")
+            continue
+        err = np.linalg.norm(a - b)
+        verdict = "identical" if err == 0 else f"SNR {10 * np.log10(np.dot(a, a) / (err * err)):.1f} dB"
+        print(f"{name}: {verdict}")

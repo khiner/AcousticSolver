@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""The room-acoustics regression gate: the analytic ladder, then the five scene renders
+against both the CUDA goldens and committed reference bytes.
+
+    script/ValidateRoom                  # ladder, render, score
+    script/ValidateRoom RoomChurch       # just this scene
+    script/ValidateRoom --score          # score what is already in build/room/
+    script/ValidateRoom --exact          # bytes that differ at all are a failure
+    script/ValidateRoom --update         # adopt the rendered outputs as the new references
+
+`RoomTest --gate` runs every rung — eigenmodes, energy, impedance tube, energy balance,
+soak, and both shoeboxes against their CUDA goldens — at the settings its thresholds were
+recorded at, so it needs nothing from here. What the renders add is the scenes with
+frequency-dependent walls, which the shoeboxes do not have, at their full node counts.
+
+Five scenes because the 13-point FCC scheme is a scene flag: RoomShoeboxFcc and
+RoomChurchFcc are the same two rooms at the same bandwidths on that grid instead.
+
+Each render is scored twice. Against `gen/room/<Scene>/cuda_fp32.bin` it is a physics
+statement: both sides are single precision, so the floor is sized from the gap PFFDTD's own
+engines show against their fp64 truth, not from byte identity — no fp32 solver can beat its
+own precision floor. Against `gen/room/<Scene>/metal_fp32.bin`, this machine's own committed
+output, it is a change detector: the renders are bit-reproducible run to run, so anything
+that moves says the arithmetic moved, and `--exact` is the sharp form of that.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+build_dir = os.path.join(root, "build")
+output_dir = os.path.join(build_dir, "room")
+reference_dir = os.path.join(root, "gen", "room")
+scenes_dir = os.path.join(root, "Scenes")
+
+# Worst-receiver floors in dB against the fp32 CUDA golden, one per scene: the precision
+# floor PFFDTD's own fp32 engines sit at against their fp64 truth, less five dB of margin.
+GOLDEN_FLOORS = {
+    "RoomShoebox": 35.0,
+    "RoomChurch": 44.0,
+    "RoomConcertHall": 48.0,
+    "RoomShoeboxFcc": 34.0,
+    "RoomChurchFcc": 44.0,
+}
+REFERENCE_FLOOR = 90.0  # dB against our own committed bytes, which a render should match exactly
+
+parser = argparse.ArgumentParser(add_help=True)
+parser.add_argument("scenes", nargs="*")
+parser.add_argument("--score", action="store_true", help="score existing renders without re-running")
+parser.add_argument("--exact", action="store_true", help="require byte-identical output")
+parser.add_argument("--update", action="store_true", help="copy the rendered outputs over the references")
+parser.add_argument("--floor", type=float, default=REFERENCE_FLOOR, help=f"SNR floor in dB against our own bytes (default {REFERENCE_FLOOR})")
+args = parser.parse_args()
+scenes = args.scenes or list(GOLDEN_FLOORS)
+
+failures = 0
+
+
+def scene_output(config):
+    """The output stem the solver writes under build/room/, from the scene's own config."""
+    if not os.path.isfile(config):
+        return None
+    with open(config) as f:
+        return json.load(f)["receivers"]["output"]
+
+
+def decibels(truth, got):
+    """Overall and worst-receiver dB, scored as script/RunRoomReference --score scores."""
+    per_receiver = [
+        20 * np.log10(np.linalg.norm(t) / np.linalg.norm(t - o)) if np.any(t != o) else float("inf")
+        for t, o in zip(truth, got)
+    ]
+    error = np.linalg.norm(truth - got)
+    overall = float("inf") if error == 0 else 20 * np.log10(np.linalg.norm(truth) / error)
+    return overall, min(per_receiver)
+
+
+if not args.score:
+    print("=== ladder ===", flush=True)
+    if subprocess.run(["./RoomTest", "--gate"], cwd=build_dir).returncode:
+        failures += 1
+
+for scene in scenes:
+    print(f"=== {scene} ===", flush=True)
+    config = os.path.join(scenes_dir, scene, "config.json")
+    stem = scene_output(config)
+    if stem is None:
+        print(f"  NO SCENE — build it with script/ConvertRoomScene {scene}")
+        failures += 1
+        continue
+
+    if not args.score:
+        t0 = time.time()
+        run = subprocess.run(
+            ["./AcousticSolver", "--room", os.path.relpath(config, build_dir)],
+            cwd=build_dir, capture_output=True, text=True,
+        )
+        os.makedirs(os.path.join(build_dir, "logs"), exist_ok=True)
+        with open(os.path.join(build_dir, "logs", scene + ".room.log"), "w") as f:
+            f.write(run.stdout + run.stderr)
+        if run.returncode:
+            print(f"  SOLVER FAILED (exit {run.returncode}) in {time.time() - t0:.1f}s")
+            print("  " + "\n  ".join((run.stdout + run.stderr).splitlines()[-5:]))
+            failures += 1
+            continue
+        print(f"  rendered in {time.time() - t0:.1f}s")
+
+    got_path = os.path.join(output_dir, stem + ".bin")
+    meta_path = os.path.join(output_dir, stem + ".json")
+    if not os.path.exists(got_path) or not os.path.exists(meta_path):
+        print("  NO OUTPUT — render this scene first (drop --score)")
+        failures += 1
+        continue
+    with open(meta_path) as f:
+        meta = json.load(f)
+    got = np.fromfile(got_path).reshape(meta["receivers"], meta["samples"])
+
+    want_path = os.path.join(reference_dir, scene, "metal_fp32.bin")
+    if args.update:
+        os.makedirs(os.path.dirname(want_path), exist_ok=True)
+        shutil.copyfile(got_path, want_path)
+        print(f"  metal_fp32.bin: reference updated ({os.path.getsize(got_path)} bytes)")
+        continue
+
+    golden_path = os.path.join(reference_dir, scene, "cuda_fp32.bin")
+    if not os.path.exists(golden_path):
+        print("  NO GOLDEN — record one with script/GenerateRoomGoldens")
+        failures += 1
+    else:
+        golden = np.fromfile(golden_path).reshape(got.shape)
+        overall, worst = decibels(golden, got)
+        floor = GOLDEN_FLOORS[scene]
+        ok = worst >= floor
+        failures += not ok
+        print(f"  cuda_fp32: {'OK' if ok else 'FAIL'}  {overall:.1f} dB overall, {worst:.1f} dB worst receiver"
+              f"  (floor {floor:.0f})  {meta['receivers']} x {meta['samples']} at {meta['srate']:.1f} Hz")
+
+    if not os.path.exists(want_path):
+        print("  metal_fp32.bin: NO REFERENCE — record one with --update")
+        failures += 1
+        continue
+    want = np.fromfile(want_path)
+    if want.size != got.size:
+        print(f"  metal_fp32.bin: LENGTH MISMATCH {got.size} vs {want.size}")
+        failures += 1
+        continue
+    want = want.reshape(got.shape)
+    identical = bool((got == want).all())
+    overall, worst = decibels(want, got)
+    ok = identical if args.exact else overall >= args.floor
+    failures += not ok
+    print(f"  metal_fp32: {'OK' if ok else 'FAIL'}  "
+          f"{'identical' if identical else f'{overall:.1f} dB overall, {worst:.1f} dB worst receiver'}")
+
+if not args.update:
+    print(f"\n{'FAIL' if failures else 'PASS'} ({failures} failures)")
+sys.exit(1 if failures else 0)

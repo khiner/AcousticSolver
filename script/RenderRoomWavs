@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Render listenable WAVs from the room solver's raw receiver output.
+
+Usage (from anywhere):
+    script/RenderRoomWavs             # every scene with output in build/room/
+    script/RenderRoomWavs RoomChurch  # just this one
+
+The solver writes what the reference engines write: the differentiated pressure the source
+injected, one float64 row per receiver at the grid's own step rate, in build/room/<stem>.bin
+with the rate in <stem>.json. That is the right thing to compare sample for sample and the
+wrong thing to listen to. This applies the chain PFFDTD's own post-processing applies
+(python/fdtd/process_outputs.py), and writes gen/wav/room/<Scene>/R001.wav onwards:
+
+1. Integrate and low-cut in one filter. The source is differentiated, so the impulse
+   response is the integral of what came out. An analog 4th-order Butterworth high-pass at
+   10 Hz has four zeros at the origin, and dropping one of them leaves the integrator. The
+   bilinear transform then maps that design to a stable digital filter. Integrating on its
+   own would let the grid's DC offset run away.
+2. Resample to 48 kHz, polyphase with a Kaiser-windowed FIR. The reference reaches for
+   resampy here, which is the same windowed-sinc construction and one more dependency.
+3. Air absorption, by Hamilton's approximate Green's function for Stokes' equation (DAFx
+   2021): a Gaussian kernel whose width grows as the square root of propagation time,
+   scattered over the signal one input sample at a time. It is the only step that needs to
+   know the air — the temperature and humidity come from the scene's own config, which is
+   what the absorption coefficients were derived from when the scene was voxelized.
+
+Receivers are normalised together, so their relative levels survive, and written as float32
+because a room impulse response covers more range than 16 bits. The writer is the reference's
+own, which unlike libsndfile leaves out the PEAK chunk and its timestamp, so re-rendering an
+unchanged scene rewrites the same bytes.
+
+Pure CPU — no GPU needed. Requires numpy and scipy.
+"""
+
+import json
+import os
+import sys
+from fractions import Fraction
+
+import numpy as np
+from scipy.io import wavfile
+from scipy.signal import bilinear_zpk, butter, resample_poly, sosfilt, zpk2sos
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+scenes_dir = os.path.join(root, "Scenes")
+output_dir = os.path.join(root, "build", "room")
+wav_dir = os.path.join(root, "gen", "wav", "room")
+
+RATE = 48000.0  # output rate
+LOWCUT_HZ, LOWCUT_ORDER = 10.0, 4  # PFFDTD's own post-processing defaults
+NDB = 120.0  # where the air-absorption kernel is truncated
+
+
+def air_absorption(temperature_c, humidity_percent):
+    """The viscothermal coefficient the Stokes filter is built on, after ISO 9613-1.
+
+    Only the oxygen relaxation term matters here: the DAFx 2021 method folds the whole
+    absorption into one modified viscothermal coefficient (get_air_absorption's `gamma_p`),
+    which is what sets the Gaussian kernel's width.
+    """
+    tk = temperature_c + 273.15
+    tr = tk / 293.15
+    # Characteristic vibrational temperature and molar concentration of oxygen (A.8).
+    alm_o = 2 * np.pi / 35 * (10 * np.log10(np.exp(2))) * 0.209 * (2239.1 / tk) ** 2 * np.exp(-2239.1 / tk)
+    # Molar concentration of water vapour (B.1-B.3), at one standard atmosphere.
+    h = humidity_percent * 10 ** (-6.8346 * (273.16 / tk) ** 1.261 + 4.6151)
+    fr_o = 24 + 4.04e4 * h * (0.02 + h) / (0.391 + h)  # oxygen relaxation frequency (3)
+    c = 343.2 * np.sqrt(tr)
+    eta_o = alm_o * (c / np.pi**2 / fr_o) * np.log(10) / 20
+    return eta_o / c
+
+
+def integrate_and_lowcut(x, rate):
+    """One filter for both: a Butterworth high-pass with one of its zeros at DC removed."""
+    z, p, k = butter(LOWCUT_ORDER, LOWCUT_HZ * 2 * np.pi, btype="high", analog=True, output="zpk")
+    zd, pd, kd = bilinear_zpk(z[1:], p, k, rate)
+    return sosfilt(zpk2sos(zd, pd, kd), x)
+
+
+def resample(x, rate):
+    """Polyphase resample to RATE. The grid's rate is irrational, so the ratio is the
+    nearest one a denominator of 4096 can name — 6.5e-9 out, which is nothing at all."""
+    if rate == RATE:
+        return x
+    ratio = Fraction(RATE / rate).limit_denominator(4096)
+    if abs(float(ratio) - RATE / rate) > 1e-6 * RATE / rate:
+        raise RuntimeError(f"no close rational for {RATE} / {rate}")
+    return resample_poly(x, ratio.numerator, ratio.denominator, axis=-1)
+
+
+def stokes_filter(x, rate, temperature_c, humidity_percent):
+    """Hamilton's approximate Stokes Green's function, applied as a time-varying kernel.
+
+    Propagation time is read off the sample index — a straight line at the speed of sound —
+    so sample n is spread over a Gaussian of variance 2*g*n*Ts, truncated where it falls
+    NDB below its peak. Scattering rather than gathering is what keeps it one pass.
+    """
+    g = air_absorption(temperature_c, humidity_percent)
+    ts = 1 / rate
+    n_in = x.shape[-1]
+    span = 0.1 * np.log(10) * NDB * g * ts
+    y = np.zeros((x.shape[0], n_in + int(np.ceil(rate * np.sqrt(span * (n_in - 1) * ts * rate)))))
+    # Before the kernel is a sample wide there is nothing to spread, so those samples pass.
+    n_start = int(np.ceil(ts**2 / (2 * np.pi * g) * rate))
+    y[:, :n_start] = x[:, :n_start]
+    for n in range(n_start, n_in):
+        half = int(np.ceil(np.sqrt(span * n) / ts))
+        nv = np.arange(n - half, n + half + 1)
+        kernel = np.exp(-((n - nv) * ts) ** 2 / (n * 2 * ts * g)) * (ts / np.sqrt(n * 2 * ts * g * np.pi))
+        y[:, nv] += x[:, n][:, None] * kernel[None, :]
+    return y
+
+
+def decay(x, rate):
+    """T20 by Schroeder backward integration, and how much energy the record ends holding.
+
+    T20 rather than T30 because these are short records — a second of a room that rings for
+    two — and the last 15 dB of a Schroeder curve is mostly the truncation. The tail share
+    is the check on that: energy still in the final tenth of the record means the decay is
+    cut off rather than finished, and a room with rigid walls never decays at all.
+    """
+    energy = np.cumsum(x[::-1] ** 2)[::-1]
+    curve = 10 * np.log10(np.maximum(energy / energy[0], 1e-300))
+    start, end = np.argmax(curve <= -5.0), np.argmax(curve <= -25.0)
+    tail = energy[len(energy) - len(energy) // 10] / energy[0]
+    return (3 * (end - start) / rate if end > start else None), tail
+
+
+def main():
+    if not os.path.isdir(output_dir):
+        sys.exit(f"no room output in {output_dir} — render a scene with AcousticSolver --room first")
+    scenes = sys.argv[1:] or sorted(
+        s for s in os.listdir(scenes_dir) if s.startswith("Room") and os.path.isfile(os.path.join(scenes_dir, s, "config.json"))
+    )
+
+    for scene in scenes:
+        with open(os.path.join(scenes_dir, scene, "config.json")) as f:
+            config = json.load(f)
+        stem = config["receivers"]["output"]
+        raw_path = os.path.join(output_dir, stem + ".bin")
+        meta_path = os.path.join(output_dir, stem + ".json")
+        if not os.path.isfile(raw_path) or not os.path.isfile(meta_path):
+            print(f"{scene}: no output found")
+            continue
+        with open(meta_path) as f:
+            meta = json.load(f)
+        rate = meta["srate"]
+        x = np.fromfile(raw_path).reshape(meta["receivers"], meta["samples"])
+
+        x = integrate_and_lowcut(x, rate)
+        x = resample(x, rate)
+        x = stokes_filter(x, RATE, config["air"]["Tc"], config["air"]["rh"])
+        if not np.all(np.isfinite(x)):
+            sys.exit(f"{scene}: the filter chain produced non-finite samples")
+
+        peak = np.abs(x).max()
+        scene_dir = os.path.join(wav_dir, scene)
+        os.makedirs(scene_dir, exist_ok=True)
+        for r, row in enumerate(x):
+            wavfile.write(os.path.join(scene_dir, f"R{r + 1:03d}.wav"), int(RATE), np.float32(row / peak))
+
+        measured = [decay(row, RATE) for row in x]
+        times = [t for t, _ in measured if t is not None]
+        span = f"T20 {min(times):.2f}-{max(times):.2f}s" if times else "no 20 dB decay"
+        print(f"{scene}: {x.shape[0]} receivers x {x.shape[1] / RATE:.2f}s at {RATE / 1000:.0f} kHz, "
+              f"peak {peak:.3g}, {span}, {100 * max(t for _, t in measured):.1f}% of the energy in the last tenth"
+              f" -> {os.path.relpath(scene_dir, root)}")
+
+
+if __name__ == "__main__":
+    main()

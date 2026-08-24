@@ -1,0 +1,19 @@
+{
+  "cpu_fp64": {
+    "receivers": 16,
+    "samples": 9103,
+    "seconds": 208.4
+  },
+  "cpu_fp32": {
+    "receivers": 16,
+    "samples": 9103,
+    "seconds": 173.9
+  },
+  "srate": 9102.36910884545,
+  "pffdtd": "aa319f6",
+  "cuda_fp32": {
+    "receivers": 16,
+    "samples": 9103,
+    "host": "root@213.173.102.132"
+  }
+}

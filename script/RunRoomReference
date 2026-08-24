@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Run PFFDTD's CPU engine over the room scenes and record its receiver signals.
+
+    script/RunRoomReference                     # double then single, every scene
+    script/RunRoomReference RoomShoebox         # just this one
+    script/RunRoomReference --precision double  # truth only
+    script/RunRoomReference --rebuild           # recompile the engine first
+    script/RunRoomReference --score             # dB between what is already in gen/room/
+
+Double precision is the truth reference: PFFDTD conserves energy to machine precision
+there, so what it writes is the discrete problem's exact answer up to rounding. Single
+precision is the same engine with the same DC-mode safeguards the CUDA build uses, so the
+gap between the two is the precision floor our own fp32 solver has to be judged against.
+
+Outputs land in gen/room/<Scene>/ as cpu_fp64.bin and cpu_fp32.bin: float64, one row per
+receiver, Nt samples each, C order. These are the raw grid signals — the eight trilinear
+corners already recombined, but no integrator, low-cut or resampling, since a filter chain
+common to both sides only hides differences. reference.json beside them carries the shape,
+the rate and the wall clock, and the .log files carry what each run reported.
+
+Requires an OpenMP-capable compiler and HDF5 development files. On macOS that is
+`brew install hdf5 libomp`, on Debian/Ubuntu `apt install libhdf5-dev`.
+"""
+
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pffdtd_env import (
+    ENGINE_DIR,
+    GEN_DIR,
+    PFFDTD_DIR,
+    SIM_DIR,
+    collect_receivers,
+    ensure_venv,
+    filter_log,
+    record_reference,
+    require_checkout,
+)
+
+PRECISIONS = {"double": ("cpu_fp64", 2), "single": ("cpu_fp32", 1)}
+
+
+def brew_prefix(package):
+    try:
+        return subprocess.run(["brew", "--prefix", package], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        sys.exit(f"could not locate {package} — install it with: brew install {package}")
+
+
+def compile_engine(precision, rebuild):
+    """Compile PFFDTD's single-translation-unit CPU engine into build/pffdtd-engine/.
+
+    Its Makefile writes the binaries into the checkout and hardcodes Linux HDF5 paths, so
+    the compile line is spelled out here instead. The flags are the Makefile's own.
+    """
+    src_dir = os.path.join(PFFDTD_DIR, "c_cuda")
+    binary = os.path.join(ENGINE_DIR, f"fdtd_main_cpu_{precision}.x")
+    if os.path.isfile(binary) and not rebuild:
+        return binary
+    os.makedirs(ENGINE_DIR, exist_ok=True)
+
+    flags = ["-I" + src_dir, "-O3", "-std=c99", "-w"]
+    define = ["-DPRECISION=%d" % PRECISIONS[precision][1], "-DUSING_CUDA=false"]
+    if sys.platform == "darwin":
+        hdf5, libomp = brew_prefix("hdf5"), brew_prefix("libomp")
+        cc = "clang"
+        flags += [f"-I{hdf5}/include", f"-I{libomp}/include", "-Xpreprocessor", "-fopenmp"]
+        link = [f"-L{hdf5}/lib", "-lhdf5", f"-L{libomp}/lib", "-lomp", "-lm"]
+    else:
+        cc = os.environ.get("CC", "gcc")
+        hdf5_inc = os.environ.get("HDF5_INC", "/usr/include/hdf5/serial")
+        hdf5_lib = os.environ.get("HDF5_LIB", "/usr/lib/x86_64-linux-gnu/hdf5/serial")
+        flags += [f"-I{hdf5_inc}", "-fopenmp"]
+        link = [f"-L{hdf5_lib}", "-lhdf5", "-lgomp", "-lm"]
+
+    command = [cc, *flags, *define, os.path.join(src_dir, "fdtd_main.c"), "-o", binary, *link]
+    print(f"==> Compiling {os.path.basename(binary)}")
+    subprocess.run(command, check=True)
+    return binary
+
+
+def run(binary, sim_dir, log_path):
+    """Run the engine in sim_dir, where it finds its .h5 files and writes sim_outs.h5.
+
+    Its stdout goes straight to a file rather than through a pipe: it redraws a six-line
+    progress block every timestep, so a long run pushes hundreds of megabytes of escape
+    codes and a slow reader would hold up the solve. `filter_log` throws that away after.
+    """
+    raw_path = log_path + ".raw"
+    start = time.time()
+    with open(raw_path, "w") as raw:
+        code = subprocess.run(binary, cwd=sim_dir, stdout=raw, stderr=subprocess.STDOUT).returncode
+    seconds = time.time() - start
+    kept = filter_log(raw_path, log_path)
+    os.remove(raw_path)
+    if code != 0:
+        sys.exit("".join(kept[-20:]))
+    for line in kept:
+        if line.startswith(("Combined (total)", "Air update", "Boundary loop")):
+            print("    " + line.rstrip())
+    return seconds
+
+
+def score(names):
+    """Report every reference in gen/room/<Scene>/ against the fp64 truth, in dB."""
+    import numpy as np
+
+    for name in names:
+        out_dir = os.path.join(GEN_DIR, name)
+        meta_path = os.path.join(out_dir, "reference.json")
+        if not os.path.isfile(meta_path):
+            print(f"{name}: nothing recorded")
+            continue
+        meta = json.load(open(meta_path))
+
+        def load(stem):
+            path = os.path.join(out_dir, stem + ".bin")
+            if stem not in meta or not os.path.isfile(path):
+                return None
+            return np.fromfile(path).reshape(meta[stem]["receivers"], meta[stem]["samples"])
+
+        truth = load("cpu_fp64")
+        if truth is None:
+            print(f"{name}: no fp64 truth")
+            continue
+        for stem in ("cpu_fp32", "cuda_fp32"):
+            other = load(stem)
+            if other is None:
+                continue
+            per_receiver = [
+                20 * np.log10(np.linalg.norm(t) / np.linalg.norm(t - o)) for t, o in zip(truth, other)
+            ]
+            total = 20 * np.log10(np.linalg.norm(truth) / np.linalg.norm(truth - other))
+            worst = min(per_receiver)
+            print(f"{name} {stem} vs cpu_fp64: {total:.2f} dB overall, {worst:.2f} dB worst receiver")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("scenes", nargs="*", help="scenes to run (default: every built scene)")
+    parser.add_argument("--precision", choices=[*PRECISIONS, "both"], default="both")
+    parser.add_argument("--rebuild", action="store_true", help="recompile the engine")
+    parser.add_argument("--score", action="store_true", help="compare what is already in gen/room/ and exit")
+    args = parser.parse_args()
+
+    ensure_venv(__file__)
+
+    names = args.scenes or sorted(os.path.basename(p) for p in glob.glob(os.path.join(SIM_DIR, "Room*")))
+    if not names:
+        sys.exit(f"no voxelized scenes under {SIM_DIR} — run script/ConvertRoomScene first")
+    if args.score:
+        score(names)
+        return
+
+    require_checkout()
+    precisions = list(PRECISIONS) if args.precision == "both" else [args.precision]
+    # The engine depends only on the precision, so build each once rather than per scene.
+    binaries = {p: compile_engine(p, args.rebuild) for p in precisions}
+
+    for name in names:
+        sim_dir = os.path.join(SIM_DIR, name)
+        if not os.path.isfile(os.path.join(sim_dir, "vox_out.h5")):
+            sys.exit(f"{name}: no voxelizer output in {sim_dir} — run script/ConvertRoomScene {name}")
+        out_dir = os.path.join(GEN_DIR, name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        for precision in precisions:
+            stem = PRECISIONS[precision][0]
+            print(f"==> {name} {precision}")
+            seconds = run(binaries[precision], sim_dir, os.path.join(out_dir, stem + ".log"))
+            outs = os.path.join(sim_dir, "sim_outs.h5")
+            shape = collect_receivers(sim_dir, outs, os.path.join(out_dir, stem + ".bin"))
+            os.remove(outs)
+            record_reference(out_dir, sim_dir, stem, {"receivers": shape[0], "samples": shape[1], "seconds": round(seconds, 1)})
+            print(f"    {shape[0]} x {shape[1]} float64 in {seconds:.1f}s -> {out_dir}/{stem}.bin")
+
+
+if __name__ == "__main__":
+    main()

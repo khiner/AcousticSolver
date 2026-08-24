@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Generate the CUDA reference receiver signals for the room scenes on a remote NVIDIA host.
+
+    script/GenerateRoomGoldens <user@host> <ssh_port> [identity_file]
+
+Example, using a RunPod "SSH over exposed TCP" endpoint:
+
+    script/GenerateRoomGoldens root@213.173.108.152 13450 ~/.ssh/id_rsa
+
+Same contract as script/generate_golden_outputs.sh, which does this for the WaveBlender
+references. Requires a CUDA toolkit at /usr/local/cuda on the remote host (any RunPod CUDA
+or PyTorch template) and root apt access. The whole run is minutes, not hours: the scenes
+are at validation resolution and their inputs total under a hundred megabytes.
+
+This uploads the voxelizer output that script/ConvertRoomScene already produced, rather
+than running the setup remotely, so the CUDA engine and our solver read the same discrete
+problem down to the last boundary node. Build the scenes first.
+
+Single precision is the point. PFFDTD's fp32 path carries DC-mode safeguards that its fp64
+path does not need, and it is what a GPU room solver actually runs, so the distance between
+these outputs and the local fp64 truth in gen/room/<Scene>/cpu_fp64.bin is the precision
+floor every later gate is sized against.
+
+Overridable by environment:
+    PFFDTD_DIR   the reference clone            (default: <repo>/../pffdtd)
+    GPU_ARCH     nvcc -arch value               (default: native)
+    SCENES       space-separated scene subset   (default: every built scene)
+"""
+
+import glob
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pffdtd_env import (
+    GEN_DIR,
+    PFFDTD_DIR,
+    SIM_DIR,
+    collect_receivers,
+    ensure_venv,
+    filter_log,
+    record_reference,
+    require_checkout,
+)
+
+REMOTE_ROOT = "~/pffdtd-room"
+GPU_ARCH = os.environ.get("GPU_ARCH", "native")
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("usage: GenerateRoomGoldens <user@host> <ssh_port> [identity_file]")
+    host, port = sys.argv[1], sys.argv[2]
+    key = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/.ssh/id_rsa")
+
+    ensure_venv(__file__)
+    require_checkout()
+
+    # One set of options for both transports. Only the long-lived ssh sessions that run the
+    # engine need the keepalive, so it rides on those alone.
+    opts = ["-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port]
+    ssh_opts = [*opts, "-o", "ServerAliveInterval=30"]
+    rsync_rsh = " ".join(["ssh", *opts])
+
+    def run(command):
+        subprocess.run(["ssh", *ssh_opts, host, command], check=True)
+
+    def push(source, destination):
+        subprocess.run(["rsync", "-az", "-e", rsync_rsh, source, f"{host}:{destination}"], check=True)
+
+    def pull(source, destination):
+        subprocess.run(["rsync", "-az", "-e", rsync_rsh, f"{host}:{source}", destination], check=True)
+
+    scenes = os.environ.get("SCENES", "").split() or sorted(
+        os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(SIM_DIR, "*", "vox_out.h5"))
+    )
+    if not scenes:
+        sys.exit(f"no voxelized scenes under {SIM_DIR} — run script/ConvertRoomScene first")
+    print(f"==> Scenes: {' '.join(scenes)}")
+
+    print(f"==> Installing dependencies on {host}")
+    run("export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null"
+        " && apt-get install -y -qq libhdf5-dev rsync >/dev/null")
+
+    print(f"==> Uploading the engine source ({PFFDTD_DIR}/c_cuda)")
+    run(f"mkdir -p {REMOTE_ROOT}")
+    push(os.path.join(PFFDTD_DIR, "c_cuda") + "/", f"{REMOTE_ROOT}/c_cuda/")
+
+    print("==> Uploading scene inputs")
+    for scene in scenes:
+        run(f"mkdir -p {REMOTE_ROOT}/{scene}")
+        for name in ("sim_consts.h5", "vox_out.h5", "comms_out.h5", "sim_mats.h5"):
+            push(os.path.join(SIM_DIR, scene, name), f"{REMOTE_ROOT}/{scene}/")
+
+    # The reference Makefile writes into its own tree and pins -arch=sm_35, which current
+    # nvcc no longer accepts. Same flags otherwise.
+    print("==> Building the CUDA engine, single precision")
+    run(f"export PATH=/usr/local/cuda/bin:$PATH && cd {REMOTE_ROOT}/c_cuda"
+        f" && nvcc -I. -I/usr/include/hdf5/serial -O3 -arch={GPU_ARCH} -x cu -w"
+        " -DPRECISION=1 -DUSING_CUDA=true fdtd_main.c -o ../fdtd_main_gpu_single.x"
+        " -Xcompiler -fopenmp -lgomp -lm -L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5")
+
+    # One GPU: the multi-GPU path splits along x and exchanges halos, which is the same
+    # arithmetic, but a single device keeps the golden trivially reproducible.
+    for scene in scenes:
+        print(f"==> Running {scene}")
+        run(f"cd {REMOTE_ROOT}/{scene}"
+            " && { CUDA_VISIBLE_DEVICES=0 ../fdtd_main_gpu_single.x >run.log 2>&1"
+            " || { tail -40 run.log; exit 1; }; }"
+            " && grep -aE '^(Air update|Boundary loop|Combined)' run.log")
+
+    print(f"==> Fetching outputs to {GEN_DIR}")
+    for scene in scenes:
+        out_dir = os.path.join(GEN_DIR, scene)
+        os.makedirs(out_dir, exist_ok=True)
+        outs = os.path.join(out_dir, "cuda_sim_outs.h5")
+        raw_log = os.path.join(out_dir, "cuda_fp32.log.raw")
+        pull(f"{REMOTE_ROOT}/{scene}/sim_outs.h5", outs)
+        pull(f"{REMOTE_ROOT}/{scene}/run.log", raw_log)
+        filter_log(raw_log, os.path.join(out_dir, "cuda_fp32.log"))
+        os.remove(raw_log)
+
+        sim_dir = os.path.join(SIM_DIR, scene)
+        shape = collect_receivers(sim_dir, outs, os.path.join(out_dir, "cuda_fp32.bin"))
+        os.remove(outs)
+
+        record_reference(out_dir, sim_dir, "cuda_fp32", {"receivers": shape[0], "samples": shape[1], "host": host})
+        print(f"    {scene}: {shape[0]} x {shape[1]} float64 -> {out_dir}/cuda_fp32.bin")
+
+    print("==> Done. Compare against the fp64 truth with: script/RunRoomReference --score")
+
+
+if __name__ == "__main__":
+    main()

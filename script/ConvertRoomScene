@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Build the room-acoustics scenes: PFFDTD voxelizer output converted into Scenes/Room<Name>/.
+
+    script/ConvertRoomScene              # every scene (skips ones already built)
+    script/ConvertRoomScene RoomShoebox  # just these
+    script/ConvertRoomScene --list       # what the scenes are, and their sizes
+    script/ConvertRoomScene --force      # re-voxelize and re-convert
+    script/ConvertRoomScene --convert    # re-convert from existing voxelizer output
+
+Scenes/ is gitignored, so this has to regenerate everything from a fresh checkout, the way
+script/FetchScenes does. There is nothing to download: the scenes are built here from the
+PFFDTD reference's own model exports plus a shoebox this script writes out.
+
+Three stages, each skipped when its output is already on disk:
+
+  1. A Python virtualenv at build/venv-pffdtd with the reference's setup dependencies.
+     PFFDTD predates NumPy 2 and Python 3.12, so pffdtd_env patches the interpreter around
+     what it needs rather than editing the sibling checkout, which stays a plain checkout.
+  2. The reference's own `sim_setup` — signals, source and receiver placement, voxelization,
+     staircase surface-area correction — into build/pffdtd/<Scene>/ as its four .h5 files.
+     This is the compute-heavy stage. The same folder is what the CPU and CUDA reference
+     engines read, so our scene and the goldens are the same discrete problem.
+  3. Conversion of those .h5 files into flat binaries plus a config.json in our schema.
+
+The reference clone defaults to ../pffdtd (override with PFFDTD_DIR), matching the
+../WaveBlender convention.
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pffdtd_env import PFFDTD_DIR, SCENES_DIR, SIM_DIR, apply_compat, ensure_venv, require_checkout
+
+# Air at 20 degrees C, the reference's own formula. Grid spacing is c/(fmax*PPW).
+TC = 20.0
+RH = 50.0
+C = 343.2
+
+# What a room shares with its FCC variant, which is what makes the pair one room on two
+# grids. Positions are fractions of each side: the source sits away from every symmetry
+# plane so no mode is unexcited, and every receiver is at a different distance from every
+# wall.
+SHOEBOX_SOURCE = (0.13, 0.17, 0.19)
+SHOEBOX_RECEIVERS = [
+    (0.71, 0.31, 0.43),
+    (0.37, 0.79, 0.23),
+    (0.53, 0.47, 0.83),
+    (0.87, 0.61, 0.67),
+    (0.29, 0.23, 0.31),
+]
+CTK_MATERIALS = {
+    "AcousticPanel": "ctk_acoustic_panel.h5",
+    "Altar": "ctk_altar.h5",
+    "Carpet": "ctk_carpet.h5",
+    "Ceiling": "ctk_ceiling.h5",
+    "Glass": "ctk_window.h5",
+    "PlushChair": "ctk_chair.h5",
+    "Tile": "ctk_tile.h5",
+    "Walls": "ctk_walls.h5",
+}
+
+# Five scenes, all at validation rather than production resolution: big enough that the
+# physics is the physics, small enough to run in double precision on a laptop CPU as the
+# truth reference.
+#
+#   RoomShoebox      rigid box, dimensions an exact number of cells so the staircase is
+#                    exact and the Morse & Ingard eigenfrequencies apply with no fitting.
+#                    92:71:59 cells is pairwise coprime, so no mode is degenerate.
+#   RoomChurch       CTK Church, the reference's small model, at half the bandwidth its
+#                    example script uses. Eight frequency-dependent materials.
+#   RoomConcertHall  Musikverein, the reference's large model. The stress case: 57M nodes,
+#                    16 receivers.
+#   RoomShoeboxFcc   the shoebox again on the 13-point FCC grid, same room to within a
+#                    cell and the same 1 kHz bandwidth. 67:52:43 cells, pairwise coprime.
+#   RoomChurchFcc    the church again on the FCC grid at its own 700 Hz. Same model, same
+#                    source, same receivers: the pair is the scheme comparison.
+#
+# PPW is points per wavelength on the underlying Cartesian grid, so it is not comparable
+# between the schemes as a number — 10.5 Cartesian and 7.7 FCC are the pair that put both
+# schemes at 1.0% worst-direction phase-velocity error at fmax, which is what makes the two
+# variants of a room the same bandwidth at the same accuracy.
+SCENES = {
+    "RoomShoebox": {
+        "shoebox_cells": (92, 71, 59),
+        "fmax": 1000.0,
+        "PPW": 10.5,
+        "duration": 2.0,
+        "source": SHOEBOX_SOURCE,
+        "receivers": SHOEBOX_RECEIVERS,
+    },
+    "RoomChurch": {
+        "model": "CTK_Church",
+        "source_num": 1,
+        "fmax": 700.0,
+        "PPW": 10.5,
+        "duration": 1.0,
+        "materials": CTK_MATERIALS,
+    },
+    "RoomConcertHall": {
+        "model": "Musikverein_ConcertHall",
+        "source_num": 3,
+        "fmax": 500.0,
+        "PPW": 10.5,
+        "duration": 1.0,
+        "materials": {
+            "Chairs": "mv_chairs.h5",
+            "Floor": "mv_floor.h5",
+            "Plasterboard": "mv_plasterboard.h5",
+            "Window": "mv_window.h5",
+            "Wood": "mv_wood.h5",
+        },
+    },
+    "RoomShoeboxFcc": {
+        "fcc": True,
+        "shoebox_cells": (67, 52, 43),
+        "fmax": 1000.0,
+        "PPW": 7.7,
+        "duration": 2.0,
+        "source": SHOEBOX_SOURCE,
+        "receivers": SHOEBOX_RECEIVERS,
+    },
+    "RoomChurchFcc": {
+        "fcc": True,
+        "model": "CTK_Church",
+        "source_num": 1,
+        "fmax": 700.0,
+        "PPW": 7.7,
+        "duration": 1.0,
+        "materials": CTK_MATERIALS,
+    },
+}
+
+
+def grid_spacing(scene):
+    return C / (scene["fmax"] * scene["PPW"])
+
+
+def model_json_path(scene, sim_dir):
+    """The shoebox is written into its own scene folder, the rest come with the reference."""
+    if "shoebox_cells" in scene:
+        return os.path.join(sim_dir, "model_export.json")
+    return os.path.join(PFFDTD_DIR, "data", "models", scene["model"], "model_export.json")
+
+
+def write_shoebox_model(scene, path):
+    """A rigid box in the model-export format the reference's Sketchup plugin writes.
+
+    Sides are 0 and the material is _RIGID, which is how that format spells an unlabelled
+    surface. Normals point out of the room so the reference's divergence-theorem volume
+    comes out positive.
+    """
+    h = grid_spacing(scene)
+    Lx, Ly, Lz = (n * h for n in scene["shoebox_cells"])
+    pts = [[x * Lx, y * Ly, z * Lz] for x in (0, 1) for y in (0, 1) for z in (0, 1)]
+
+    def corner(x, y, z):
+        return x * 4 + y * 2 + z
+
+    tris = []
+    for axis in range(3):
+        for far in (0, 1):
+            quad = []
+            for a, b in ((0, 0), (0, 1), (1, 1), (1, 0)):
+                ijk = [0, 0, 0]
+                ijk[axis] = far
+                ijk[(axis + 1) % 3] = a
+                ijk[(axis + 2) % 3] = b
+                quad.append(corner(*ijk))
+            if far == 0:
+                quad.reverse()
+            tris.append([quad[0], quad[1], quad[2]])
+            tris.append([quad[0], quad[2], quad[3]])
+
+    def place(fracs):
+        return [f * L for f, L in zip(fracs, (Lx, Ly, Lz))]
+
+    model = {
+        "mats_hash": {
+            "_RIGID": {
+                "tris": tris,
+                "pts": pts,
+                "sides": [0] * len(tris),
+                "color": [255, 255, 255],
+            }
+        },
+        "sources": [{"xyz": place(scene["source"]), "name": ""}],
+        "receivers": [{"xyz": place(r), "name": ""} for r in scene["receivers"]],
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(model, f)
+    return model
+
+
+def run_sim_setup(scene, out_dir):
+    """Voxelize into out_dir. Everything here runs in the reference's own code."""
+    apply_compat()
+    # The voxelizer stages per-voxel triangle lists through a relative mmap_dat/ folder, so
+    # run from the scene's own directory rather than leaving that in the sibling checkout.
+    os.chdir(out_dir)
+    from sim_setup import sim_setup
+
+    model_json = model_json_path(scene, out_dir)
+    if "shoebox_cells" in scene:
+        write_shoebox_model(scene, model_json)
+    materials = scene.get("materials", {})
+
+    sim_setup(
+        model_json_file=model_json,
+        mat_folder=os.path.join(PFFDTD_DIR, "data", "materials"),
+        mat_files_dict=materials,
+        source_num=scene.get("source_num", 1),
+        insig_type="impulse",
+        diff_source=True,  # the fp32 engines refuse an undifferentiated source
+        duration=scene["duration"],
+        Tc=TC,
+        rh=RH,
+        fcc_flag=scene.get("fcc", False),
+        PPW=scene["PPW"],
+        fmax=scene["fmax"],
+        save_folder=out_dir,
+        save_folder_gpu=out_dir,  # one dataset, read by our converter and by both engines
+        compress=0,
+    )
+
+
+def convert(name, scene, sim_dir, scene_dir):
+    """PFFDTD's four .h5 files -> flat binaries plus a config.json in our schema."""
+    import h5py
+    import numpy as np
+
+    os.makedirs(scene_dir, exist_ok=True)
+
+    def emit(filename, array, dtype):
+        array = np.ascontiguousarray(array, dtype=dtype)
+        array.tofile(os.path.join(scene_dir, filename))
+        return array
+
+    with h5py.File(os.path.join(sim_dir, "sim_consts.h5"), "r") as f:
+        consts = {k: f[k][()] for k in ("c", "h", "Ts", "SR", "l", "l2", "Tc", "rh", "fcc_flag")}
+    # 0 is the 7-point Cartesian scheme and 2 is the 13-point FCC one on the folded grid,
+    # which is what sim_setup leaves behind for a GPU dataset. 1 is the FCC subgrid sitting
+    # in a full Cartesian array with half its points idle, which nothing here reads.
+    fcc = int(consts["fcc_flag"])
+    assert fcc in (0, 2), f"unexpected fcc_flag {fcc}"
+    neighbours = 12 if fcc else 6
+
+    with h5py.File(os.path.join(sim_dir, "vox_out.h5"), "r") as f:
+        Nx, Ny, Nz, Nb = (int(f[k][()]) for k in ("Nx", "Ny", "Nz", "Nb"))
+        bn_ixyz = emit("bn_ixyz.bin", f["bn_ixyz"][...], np.int64)
+        adj_bn = emit("adj_bn.bin", f["adj_bn"][...], np.uint8)
+        mat_bn = emit("mat_bn.bin", f["mat_bn"][...], np.int8)
+        emit("saf_bn.bin", f["saf_bn"][...], np.float64)
+        origin = [float(f[k][0]) for k in ("xv", "yv", "zv")]
+    assert bn_ixyz.size == Nb and adj_bn.shape == (Nb, neighbours) and mat_bn.size == Nb
+
+    with h5py.File(os.path.join(sim_dir, "comms_out.h5"), "r") as f:
+        Nt, Ns, Nr = (int(f[k][()]) for k in ("Nt", "Ns", "Nr"))
+        diff = bool(f["diff"][()])
+        emit("in_ixyz.bin", f["in_ixyz"][...], np.int64)
+        emit("in_sigs.bin", f["in_sigs"][...], np.float64)
+        out_alpha = f["out_alpha"][...]
+        # out_reorder is the identity as sim_comms writes it, but apply it rather than
+        # assume it: it is what maps engine output rows back to receiver order.
+        out_reorder = f["out_reorder"][...]
+        out_ixyz = f["out_ixyz"][...][out_reorder]
+        emit("out_ixyz.bin", out_ixyz, np.int64)
+        emit("out_alpha.bin", out_alpha, np.float64)
+    assert out_alpha.shape[1] == 8 and out_alpha.size == Nr
+
+    with h5py.File(os.path.join(sim_dir, "sim_mats.h5"), "r") as f:
+        Nmat = int(f["Nmat"][()])
+        Mb = f["Mb"][...] if Nmat else np.zeros((0,), np.int8)
+        defs = [f[f"mat_{i:02d}_DEF"][...] for i in range(Nmat)]
+    emit("mat_def.bin", np.concatenate(defs) if defs else np.zeros((0, 3)), np.float64)
+
+    # Materials keep the room_geo ordering, which is the material names sorted, so a
+    # material index in mat_bn names a row here.
+    names = sorted(scene.get("materials", {}))
+    assert len(names) == Nmat
+
+    with open(model_json_path(scene, sim_dir)) as f:
+        model = json.load(f)
+
+    # The FCC grid stored here is folded in y: every node of it is an FCC node, and the
+    # unfolded y extent it stands for is twice its own less two. See RoomScene.h.
+    grid = {"Nx": Nx, "Ny": Ny, "Nz": Nz, "h": float(consts["h"]), "origin": origin}
+    if fcc:
+        grid["Nyf"] = 2 * (Ny - 1)
+    config = {
+        "scheme": "fcc" if fcc else "cart",
+        "grid": grid,
+        "air": {"c": float(consts["c"]), "Tc": float(consts["Tc"]), "rh": float(consts["rh"])},
+        "step": {
+            "Ts": float(consts["Ts"]),
+            "srate": float(consts["SR"]),
+            "l": float(consts["l"]),
+            "l2": float(consts["l2"]),
+            "count": Nt,
+        },
+        "bandwidth": {"fmax": scene["fmax"], "PPW": scene["PPW"]},
+        "boundary": {
+            "count": Nb,
+            "lossy": int(np.count_nonzero(mat_bn >= 0)),
+            "neighbours": neighbours,
+            "indices": "bn_ixyz.bin",
+            "adjacency": "adj_bn.bin",
+            "material": "mat_bn.bin",
+            "area": "saf_bn.bin",
+        },
+        "materials": [{"name": n, "branches": int(b)} for n, b in zip(names, Mb)],
+        "material_def": "mat_def.bin",
+        "source": {
+            "signal": "impulse",
+            "differentiated": diff,
+            "corners": Ns,
+            "position": model["sources"][scene.get("source_num", 1) - 1]["xyz"],
+            "indices": "in_ixyz.bin",
+            "signals": "in_sigs.bin",
+        },
+        "receivers": {
+            "count": Nr // 8,
+            "corners": 8,
+            "indices": "out_ixyz.bin",
+            "weights": "out_alpha.bin",
+            "positions": [r["xyz"] for r in model["receivers"]],
+            "output": f"{name}_out",
+        },
+    }
+    with open(os.path.join(scene_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    return config
+
+
+def describe(name, scene):
+    h = grid_spacing(scene)
+    # The Courant number, backed off by 0.999 to keep the grid-Nyquist mode out, is the
+    # reference's own choice and fixes the step rate once h is fixed. FCC's 13-point stencil
+    # is stable all the way to 1, where the 7-point Cartesian one stops at 1/sqrt(3).
+    Ts = h / C * (0.999 if scene.get("fcc") else 0.999 / 3**0.5)
+    line = f"{name}: {'FCC' if scene.get('fcc') else 'cart'}, fmax {scene['fmax']:g} Hz, PPW {scene['PPW']:g}, h {h * 1e3:.2f} mm"
+    line += f", {1 / Ts:.0f} Hz, {math.ceil(scene['duration'] / Ts)} steps"
+    if "shoebox_cells" in scene:
+        L = [n * h for n in scene["shoebox_cells"]]
+        line += f", box {L[0]:.3f} x {L[1]:.3f} x {L[2]:.3f} m"
+    else:
+        line += f", model {scene['model']}"
+    return line
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("scenes", nargs="*", default=[], help="scenes to build (default: all)")
+    parser.add_argument("--list", action="store_true", help="print the scene table and exit")
+    parser.add_argument("--force", action="store_true", help="re-voxelize even if output exists")
+    parser.add_argument("--convert", action="store_true", help="skip voxelization, re-convert only")
+    args = parser.parse_args()
+
+    names = args.scenes or list(SCENES)
+    for name in names:
+        if name not in SCENES:
+            sys.exit(f"unknown scene: {name} (have {', '.join(SCENES)})")
+
+    if args.list:
+        for name in names:
+            print(describe(name, SCENES[name]))
+        return
+
+    ensure_venv(__file__)
+    require_checkout()
+
+    for name in names:
+        scene = SCENES[name]
+        sim_dir = os.path.join(SIM_DIR, name)
+        scene_dir = os.path.join(SCENES_DIR, name)
+        voxelized = os.path.isfile(os.path.join(sim_dir, "vox_out.h5"))
+        if not voxelized or (args.force and not args.convert):
+            print(f"==> {name}: {describe(name, scene)}")
+            os.makedirs(sim_dir, exist_ok=True)
+            here = os.getcwd()
+            run_sim_setup(scene, sim_dir)
+            os.chdir(here)
+        else:
+            print(f"==> {name}: voxelizer output present, converting")
+        config = convert(name, scene, sim_dir, scene_dir)
+        grid = config["grid"]
+        print(
+            f"    {scene_dir}: {grid['Nx']}x{grid['Ny']}x{grid['Nz']}"
+            f" = {grid['Nx'] * grid['Ny'] * grid['Nz'] / 1e6:.1f}M nodes,"
+            f" {config['boundary']['count']} boundary ({config['boundary']['lossy']} lossy),"
+            f" {config['step']['count']} steps"
+        )
+
+
+if __name__ == "__main__":
+    main()

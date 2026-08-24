@@ -1,5 +1,6 @@
 # AcousticSolver
-Exploring acoustic radiation transfer GPU solvers
+Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), and room impulse responses with impedance walls (Bilbao/Hamilton FDTD).
+Each is validated against its reference implementation or an analytic ladder — see [VALIDATION.md](VALIDATION.md).
 
 ## WaveBlender
 
@@ -88,3 +89,27 @@ Departures from the paper, all forced by measurement (see [VALIDATION.md](VALIDA
 
 - The paper's literal near-set radii leave the boundary–grid feedback loop with gain slightly above one. The defaults here are R1=2 (rather than 1) plus a one-zero filter on the interpolated far-field feedback, which nulls the grid-Nyquist mode the loop amplifies.
 - Element counts, and therefore every table built over them, scale near-quadratically with mesh density, so scene meshes are retargeted to the grid by incremental isotropic remeshing before anything else happens.
+
+## Room acoustics
+
+`src/Room/` renders room impulse responses with the finite-volume FDTD boundary treatment of [Bilbao, Hamilton, Botts & Savioja 2016](https://www.pure.ed.ac.uk/ws/files/22154168/fv_genimp_final_r3.pdf).
+Scenes choose either a 7-point Cartesian grid or a 13-point face-centred-cubic grid and may use rigid or parallel-LRC material boundaries.
+
+The explicit solver consumes converted [PFFDTD](https://github.com/bsxfun/pffdtd) voxelizer output so the Metal and reference engines step the same discrete problem.
+`script/ConvertRoomScene` writes the scene configuration and binary boundary, material, source, and receiver data under `Scenes/`.
+The repository includes Cartesian and FCC shoebox and church scenes and a Cartesian concert hall.
+
+```
+build/AcousticSolver --room ../Scenes/RoomChurch/config.json
+build/AcousticSolver --room --seconds 0.2 ../Scenes/RoomChurch/config.json
+script/ValidateRoom
+script/ConvertRoomScene RoomChurch
+script/RunRoomReference RoomChurch
+script/RenderRoomWavs
+```
+
+`script/ValidateRoom` runs the analytic, energy, stability, CUDA-golden, and Metal-determinism gates for the explicit schemes.
+[VALIDATION.md](VALIDATION.md) records the methods, thresholds, and detailed results.
+
+Raw differentiated-pressure receiver rows are written to `build/room/<output>.bin`, with the sample rate in the adjacent JSON file.
+`script/RenderRoomWavs` applies the reference post-processing and writes normalized 48 kHz WAVs under `gen/wav/room/`.

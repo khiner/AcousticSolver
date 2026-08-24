@@ -14,6 +14,7 @@ upstream-identical. Files under `src/` not listed here are original to this proj
 | `WaveBlender.{h,cpp}`, `Shaders.h`, `Shaders/*.cpp`, `FDTD/*` | [WaveBlender](https://github.com/kangruix/WaveBlender) |
 | `FluidSound.{h,cpp}`, `Oscillator.{h,cpp}`, `BubbleUtils.{h,cpp}`, `Integrators.{h,cpp}` | [FluidSound](https://github.com/kangruix/FluidSound) |
 | `ModalSound.{h,cpp}`, `ModeData.h` | ModalSound, based on [openpbso](https://github.com/jhwang7628/openpbso) |
+| `Room/*` | [PFFDTD](https://github.com/bsxfun/pffdtd) |
 
 ### WaveBlender and FluidSound
 
@@ -48,6 +49,34 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### PFFDTD
+
+The room-acoustics solver's step sequence, its update coefficients and its frequency-dependent
+impedance boundary arithmetic are transcribed from PFFDTD's C engine (`c_cuda/cpu_engine.h`,
+`c_cuda/fdtd_data.h`), and its scenes are converted from that project's own voxelizer output.
+
+MIT License
+
+Copyright 2021 Brian Hamilton
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## Libraries vendored under `src/ThirdParty/`
 

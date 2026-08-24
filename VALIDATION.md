@@ -619,3 +619,283 @@ Narrowing it back closes most of that: a staged record counts its window fields 
 Twelve bytes again, and worth a further 1.367 / 1.343 to 1.319 / 1.285 ms/step with the output bit-identical.
 
 Every other known lever trades accuracy: coarser meshes, harder lag trimming, or the method's actual claim — equal perceptual quality at coarser grids than the FDTD path, which halves the step count and cuts table entries by roughly the fourth power of the cell size.
+
+# Room-acoustics solver
+
+`src/Room/` implements the finite-volume room-acoustics scheme of [Bilbao, Hamilton, Botts & Savioja 2016](https://www.pure.ed.ac.uk/ws/files/22154168/fv_genimp_final_r3.pdf).
+Unlike the other two solvers it has a public reference implementation — [PFFDTD](https://github.com/bsxfun/pffdtd), by one of the authors — so it is validated from both sides: an analytic ladder for the physics, and receiver signals compared sample for sample against the reference's own engines on the identical discrete problem.
+Identical is meant literally: scenes are that implementation's voxelizer output, converted rather than re-derived, so there is no discretization difference to explain away.
+
+The interior comes in two stencils, chosen per scene: the 7-point Cartesian one and the 13-point one on the face-centred-cubic sublattice.
+Both are validated the same way and against their own references, and the two are compared at equal output bandwidth at the end of this section.
+
+A step is three dispatches on the Cartesian grid and four on the FCC one — two and three where a room's walls are all rigid — where the reference engine's per-step body is ten passes over whole grids, or eleven on the FCC grid.
+What the passes did is not skipped, it is folded: the halo mirrors are read rather than written (a step that would leave the grid is a step back onto the opposite neighbour, composed one axis at a time — which is exactly what the three mirror passes left behind), the absorbing shell needs the level the interior update overwrote and that is the value the update already has in a register, which node is on the shell and how hard it absorbs come out of the node's position, and on the Cartesian grid the rigid boundary is the interior update with a node's missing neighbours dropped, so one byte of adjacency a node replaces a second streaming of both levels.
+The FCC grid keeps its boundary pass separate, because there twelve adjacency bits do not fit in a byte and its levels are small enough to be cheap to read twice — the measurement is under **What the step costs**.
+Every fold is exact: all five scenes render byte-identical across the change.
+
+```
+build/RoomTest                         # the default ladder: modes, energy, tube, balance, golden
+build/RoomTest --fcc                   # the same rungs on the 13-point FCC grid
+build/RoomTest --gate                  # every rung checked, nonzero exit on a miss (~19s)
+build/RoomTest --modes --count 24      # more eigenmodes
+build/RoomTest --tube --length 4000    # a longer impedance tube
+build/RoomTest --soak --steps 1000000  # a longer soak
+build/RoomTest --roofline --scene ../Scenes/RoomChurch/config.json   # bandwidth against a plain stream
+build/RoomTest --implicit              # the Smits & Bilbao 2025 implicit scheme, measured against both
+build/RoomTest --golden --scene ../Scenes/RoomChurch/config.json --gen ../gen/room/RoomChurch
+script/ValidateRoom                    # the regression gate: the ladder, then all five scenes (~55s)
+script/RunRoomReference --score        # what the reference engines score against their own fp64 truth
+```
+
+## The ladder
+
+| rung | measure | threshold | value |
+|---|---|---|---|
+| eigenmodes | worst error vs Morse & Ingard over 16 modes | 0.035% | 0.0329% |
+| dispersion | worst error vs the 7-point relation's own prediction | 3e-5 | 1.70e-5 |
+| energy | sealed rigid box, drift over 100k steps | 2e-6 | 5.74e-7 |
+| impedance tube | worst \|R measured − R analytic\|, 100–1800 Hz | 2e-4 | 8.3e-5 |
+| impedance tube | window-edge leakage against the peak | 0.06 | 4.4e-2 |
+| energy balance | room + branch storage + dissipation, 20k steps | 1e-5 | 4.3e-6 |
+| energy balance | share of the energy the wall took | ≥ 90% | 100.000% |
+| soak | settled max\|u\| ratio over 500k driven steps | 1.0001 | 1.0000012 |
+| golden | shoebox worst receiver vs the fp32 CUDA reference | 35 dB | 42.4 dB |
+| eigenmodes, FCC | worst error vs Morse & Ingard over 16 modes | 2.1% | 2.02% |
+| dispersion + wall, FCC | worst error vs the FCC relation carrying its staircase term | 6e-4 | 4.64e-4 |
+| energy, FCC | sealed FCC box, drift over 100k steps | 2e-6 | 1.19e-6 |
+| golden, FCC | FCC shoebox worst receiver vs the fp32 CUDA reference | 34 dB | 48.8 dB |
+
+RoomShoebox is what makes the first two rungs possible: a whole number of cells on every side, pairwise coprime, with the walls half a cell outside the outermost nodes, so the box modes are exact discrete eigenvectors and the analytic frequencies apply with no fitting.
+Its room is also exactly sealed — the voxelizer flags both sides of every wall, the exterior decouples, and the absorbing shell never fires — which the mode rung asserts on every run.
+RoomShoeboxFcc is the same box on the other grid, sealed the same way, and the closure check reads it in unfolded coordinates so it is the room being checked and not the folded array.
+
+**An FCC box's modes are not exact discrete eigenvectors, and the two per cent in the table is that and not dispersion.**
+A wall drops the neighbours pointing through it and puts their weight back on the node's own diagonal, which says each missing neighbour equals the node itself.
+On the Cartesian stencil that *is* the half-cell mirror — the missing neighbour's reflection is the node.
+An FCC face diagonal reflects onto a point that is not on the sublattice at all, so the substitution is right only where the mode is flat along that wall.
+What is left over is diagonal and first-order perturbation theory gives it in closed form: a node on a wall normal to *a* is missing four diagonals whose true values sum to 2(cos β\_b h + cos β\_c h) times its own where the scheme puts 4 Sl2/A2, and each wall carries two faces of cos²(β\_a h/2) over N\_a cells of the mode's energy, halved again when the mode varies along *a*.
+That prediction lands within 4.6e-4 of what the box measures across all sixteen modes, which is what keeps the FCC mode rung as sharp an instrument as the Cartesian one instead of a two per cent shrug.
+It is also the reason the two schemes are not equally accurate at a room's surfaces even where their interiors are matched — see the comparison below.
+
+The FCC energy rung's box is seeded on the even sublattice alone.
+All twelve face diagonals preserve the parity of the index sum, so the two sublattices the folded array interleaves never exchange an edge, and the odd one stays at zero for the whole run while the even one is a genuine FCC room.
+Its padding keeps the fold seam outside the box, so nothing about the folded storage enters the conserved quantity.
+
+**The dispersion rung is against the coefficients in force, not the ideal ones.**
+The 7-point relation predicted from an exact λ² is wrong by +5.4e-5 at the low modes, three times the error being measured, because `RoomUpdateCoefficients` rounds λ² and the single-precision diagonal shift moves it again.
+The test calls the same function the stepper does and predicts from what comes back.
+That shift is worth naming on its own: it contributes +3.1e-4 relative at mode (1,0,0), about ten times the actual dispersion error, so any comparison of low-frequency modes that does not account for it is mostly measuring the shift.
+
+The impedance tube reads reflection as the ratio of a run with a two-branch test wall to the same duct left rigid, so the source spectrum, the transit dispersion and the window all divide out.
+Its analytic side is the discrete wall's own admittance: branch impedances recovered from the float quads, evaluated at the trapezoid rule's frequency variable *s* = i(2/Ts)tan(ωTs/2), with β from the scheme's dispersion relation including the shift.
+Getting that wrong is loud — a stray factor of λ in κ reads as 0.24 rather than 8.3e-5.
+
+Energy is two rungs because a lossy wall breaks the first one.
+Sealed and rigid, the discrete energy is conserved and the rung is how far it moves.
+With one lossy wall it is no longer conserved, but room energy plus what the branches store plus everything the wall has dissipated is, and that is the balance rung.
+It reads the dissipation off the state as the step's own change in the branch variable, so it needs no extra kernel and the solver carries no extra per-step traffic for it.
+All of the drift accrues in the first 2k steps, while the field is large, and is then flat.
+
+## Against PFFDTD
+
+Overall / worst-receiver dB, per scene, against all three reference sets.
+`cpu_fp64` is the discrete problem's exact answer up to rounding, and the last column is where the reference's *own* single-precision engine sits against it — the floor no fp32 solver gets past:
+
+| scene | vs cpu_fp32 | vs cuda_fp32 (gate) | vs cpu_fp64 | cpu_fp32's own floor |
+|---|---|---|---|---|
+| RoomShoebox | 315.53 / 314.34 | 43.60 / 42.41 (35) | 41.82 / 40.73 | 41.82 / 40.73 |
+| RoomChurch | 96.13 / 90.80 | 53.34 / 52.19 (44) | 49.99 / 48.91 | 49.99 / 48.90 |
+| RoomConcertHall | 100.00 / 97.39 | 60.17 / 55.85 (48) | 56.12 / 53.12 | 56.11 / 53.12 |
+| RoomShoeboxFcc | 315.14 / 314.40 | 49.48 / 48.80 (34) | 39.37 / 38.76 | 39.37 / 38.76 |
+| RoomChurchFcc | 104.23 / 102.92 | 60.27 / 59.28 (44) | 49.96 / 48.60 | 49.96 / 48.59 |
+
+**All five scenes land exactly on PFFDTD's own fp32 floor** — the fp64 column and the floor column agree to the digits printed.
+The gates are that floor less five dB, and they hold with 7 to 15 dB of margin.
+Every scene scores higher against the CUDA reference than against the fp64 truth, and that is the scheme rather than luck: single precision is not only rounding here, it carries a diagonal shift of 1.19e-7 that fp64 sets to zero, so all three fp32 engines solve the same slightly different problem and agree with each other before they agree with the truth.
+
+## Bit identity, and where it stops
+
+On both shoeboxes the Metal stepper is **bit-identical to the reference's own CPU fp32 engine**: 315 dB on each, max difference 1.14e-13 on a peak of 485 Cartesian and 1.46e-11 on a peak of 3.11e4 FCC, which is the fp64 summation order in the eight-corner receiver mix and not the stepper at all.
+That holds under both stencils, which is what says the 13-point interior, its folded storage, its wider adjacency mask and its absorbing shell are all transcribed rather than approximated.
+
+Off that scene it is structurally unreachable, and the reason is the platforms rather than the port.
+Two effects, both measured rather than assumed:
+
+- **The Apple GPU flushes fp32 subnormals and the CPU engine does not.** Scaling the source by an exact power of two — an operation that changes nothing a normal float does — moves our own answer by 95 dB.
+- **Clang contracts the reference's boundary loop to FMAs.** Rebuilding the reference with `-ffp-contract=off` moves *its own* answer by 92 dB.
+
+Either perturbation alone saturates two builds at ~90 dB after the church's 12,744 steps, which is what makes ~90–100 dB the identity-equivalent score here — the FCC church, at 104 dB over its shorter run, is the same statement.
+The church agreement matrix says the rest: ours against cpu_fp32 **96.1 dB**, cpu_fp32 against its own no-FMA build 91.9, against its own flush-to-zero build 93.8, and against cuda_fp32 **53.3**.
+We sit closer to the reference than the reference sits to itself under a compiler flag, and 43 dB closer than its two shipped engines sit to each other.
+Sample by sample, receiver 0 of the church is bit-identical for 129 steps and then departs by one fp32 ulp.
+Bytes are therefore not a cross-engine gate on any scene with lossy walls, and chasing them across that boundary is chasing the two effects above.
+
+## The regression gate
+
+`script/ValidateRoom` is the whole check and takes about 55 seconds cold, dominated by the concert hall.
+It runs `RoomTest --gate` — every rung above at the settings its threshold was recorded at — and then renders all five scenes and scores each twice.
+
+```
+script/ValidateRoom             # ladder, render, score
+script/ValidateRoom RoomChurch  # one scene
+script/ValidateRoom --score     # score what is already in build/room/
+script/ValidateRoom --exact     # bytes that differ at all are a failure
+script/ValidateRoom --update    # adopt the rendered outputs as the new references
+```
+
+The two scores answer different questions and both are reported every run.
+Against `gen/room/<Scene>/cuda_fp32.bin` it is the physics statement, floored at 35 / 44 / 48 / 34 / 44 dB on the worst receiver.
+Against `gen/room/<Scene>/metal_fp32.bin`, this machine's own committed output, it is a change detector: the renders are bit-reproducible run to run, so anything that moves says the arithmetic moved, and `--exact` is the sharp form of it.
+The ladder alone is not enough because neither shoebox has a lossy wall, so the churches and the hall are the only reproducible coverage the frequency-dependent boundary has at scale — 150k to 1.45M lossy nodes against the ladder's 224.
+
+Per-scene render facts, on an M5 Max, wall clock including scene load:
+
+| scene | nodes | steps | GPU busy | ms/step | ps/node-step | render | receivers |
+|---|---|---|---|---|---|---|---|
+| RoomShoebox | 0.53M | 36,410 | 0.57s | 0.0157 | 29.6 | 0.6s | 5 |
+| RoomChurch | 21.08M | 12,744 | 12.95s | 1.016 | 48.2 | 12.9s | 6 |
+| RoomConcertHall | 57.28M | 9,103 | 25.30s | 2.779 | 48.5 | 25.2s | 16 |
+| RoomShoeboxFcc | 0.13M | 15,416 | 0.118s | 0.0077 | 60.7 | 0.2s | 5 |
+| RoomChurchFcc | 4.41M | 5,396 | 1.115s | 0.2066 | 46.9 | 1.2s | 6 |
+
+Every scene is GPU-bound with no host gap: the church spends 12.95 s of GPU busy inside a 12.9 s render that also loads the scene, and the FCC church 1.115 s inside 1.2 s.
+Encoding is not on the critical path either — a whole run's dispatches encode in 8 to 21 ms, against seconds of execution.
+
+## What the step costs, and what it could
+
+A step of this scheme is a stream, not a calculation.
+The interior update reads the previous level once a node and reads and writes the level it is computing, which is twelve bytes a node-step, and everything else it does — six or twelve neighbour reads, the adjacency test, the shell — either hits cache or costs no memory at all.
+So the question a room solver's performance reduces to is what fraction of the memory system a pass reaches, and `RoomTest --roofline` answers it directly: it times the interior kernel against `RoomStream`, which moves those same twelve bytes a node-step with none of the work, over the same buffers, back to back.
+
+| scene | a pass moves | two-level stream | interior update | update / stream |
+|---|---|---|---|---|
+| RoomChurch | 247 MB | 404 GB/s | 373 GB/s | 92% |
+| RoomConcertHall | 675 MB | 409 GB/s | 376 GB/s | 92% |
+| RoomChurchFcc | 51 MB | 658 GB/s | 593 GB/s | 90% |
+
+**The ceiling is a property of the footprint, not of the machine.**
+A stream over the church's 247 MB reaches 404 GB/s and over the hall's 675 MB reaches 409, while the FCC church's 51 MB reaches 658 — the smaller grid is partly served by cache, and a full-bandwidth room will sit at the 400 GB/s end whatever the scheme.
+That is the number a step should be judged against, and it is roughly half of what the same machine gives a few-megabyte working set.
+
+The two shoeboxes are not on that table because at 6 MB and 1 MB a pass is latency-bound rather than bandwidth-bound: the stream itself measures 706 and 120 GB/s, the second of which is below what the real step achieves, because 200 back-to-back dispatches over 0.13M nodes are measuring dispatch cost and not the memory system.
+Their step cost is dispatch count, which is why they gained most when the step went from ten dispatches to two.
+
+Counting the bytes a step cannot avoid — the two levels, the byte of adjacency a node carries on the Cartesian grid or the bit it carries on the FCC one, and the impedance branches' own state at a lossy node — the church moves 372 MB a step and the hall 1031 MB, which against their measured times is **366 and 371 GB/s, or 91% of each grid's stream ceiling**.
+The FCC church moves 85 MB a step at 410 GB/s, 62% of its ceiling, and the difference is its separate boundary pass reading both levels a second time at the boundary nodes.
+
+`ACOUSTIC_ROOM_KERNEL_TIMES=1` puts each dispatch in its own command buffer and times it, which is how a step is split between kernels.
+On the Cartesian church the serialized total comes to 1.024 ms/step against 1.016 uninstrumented, so the attribution is the real one; on the FCC church it comes to 0.784 against 0.207, because a command buffer's own fixed cost dominates a dispatch that short — those shares are directional only.
+
+| kernel | RoomChurch | RoomChurchFcc |
+|---|---|---|
+| interior update, with the rigid boundary on the Cartesian grid | 68.0% | 59.1% |
+| frequency-dependent boundary | 31.7% | 28.5% |
+| rigid boundary, a pass of its own on the FCC grid | — | 10.9% |
+| receivers and source | 0.4% | 1.5% |
+
+## Cartesian against FCC, at equal output bandwidth
+
+The same room twice, at the same fmax, each scheme at its own points per wavelength: 10.5 Cartesian and 7.7 FCC, which is the pairing that puts both at **1.0% worst-direction phase-velocity error at fmax** — 1.0045% and 0.9929% from their own dispersion relations.
+GPU busy from `ACOUSTIC_PROFILE=1`, taken from an interleaved run on a quiet M5 Max:
+
+| | RoomShoebox | RoomShoeboxFcc | RoomChurch | RoomChurchFcc |
+|---|---|---|---|---|
+| stencil | 7-pt cart | 13-pt FCC | 7-pt cart | 13-pt FCC |
+| fmax | 1 kHz | 1 kHz | 700 Hz | 700 Hz |
+| grid spacing | 32.69 mm | 44.57 mm | 46.69 mm | 63.67 mm |
+| Courant number | 0.999/√3 | 0.999 | 0.999/√3 | 0.999 |
+| nodes | 0.529M | 0.126M | 21.08M | 4.41M |
+| step rate | 18.20 kHz | 7.71 kHz | 12.74 kHz | 5.40 kHz |
+| steps | 36,410 | 15,416 | 12,744 | 5,396 |
+| node-steps | 19.3 G | 1.95 G | 268.6 G | 23.8 G |
+| µs/step, GPU | 15.7 | 7.7 | 1016 | 207 |
+| ps/node-step | 29.6 | 60.7 | 48.2 | 46.9 |
+| two-level state | 4.2 MB | 1.0 MB | 169 MB | 35 MB |
+| render, wall | 0.6s | 0.2s | 12.9s | 1.2s |
+| worst receiver vs its own fp64 truth | 40.73 dB | 38.76 dB | 48.91 dB | 48.60 dB |
+
+**FCC wins, by an order of magnitude in wall clock, and the whole margin is fewer node-steps rather than a cheaper node-step.**
+On the church it is 11.6× less GPU time and 10.8× less wall clock.
+The arithmetic behind it: at equal fmax the FCC spacing is 10.5/7.7 = 1.36× coarser, so once the fold is counted it holds 2(10.5/7.7)³ = 5.1× fewer nodes per unit volume — 4.8× measured, the difference being the fixed three-and-a-half-cell halo, which is a larger share of a smaller grid — and the Courant number and the spacing together drop the step rate by √3(10.5/7.7) = 2.36×.
+That is 11.3× fewer node-steps, and the remaining 3% is the FCC step being slightly cheaper per node-step than the Cartesian one.
+Cost per node-step is 48.2 ps Cartesian against 46.9 ps FCC — the same number, though the FCC stencil reads twelve neighbours where the Cartesian one reads six.
+That is the roofline saying what it always says here: both kernels stream two pressure levels and the extra neighbour reads are cache hits, so bytes moved and not arithmetic sets the cost.
+Those two near-equal totals are not made of the same parts, though, and the roofline table above says how: the FCC interior pass runs at 593 GB/s against the Cartesian one's 373, so per node-step it is a third cheaper — and the FCC grid gives that back at its boundaries, which are a larger share of a coarser room (6.3% of its nodes are boundary nodes against 4.5%, and 3.4% lossy against 2.4%) and which it updates in a pass of their own.
+Peak state falls by the same 4.8×, which matters more than the time does for the full-bandwidth rooms that do not fit at all on the Cartesian grid.
+
+Two things the margin is not:
+
+- **Not the small end.** The FCC shoebox gets 4.8× of GPU time and 3.0× of wall clock, because at 0.13M nodes a step is latency and dispatch count rather than memory traffic — 7.7 µs over an eighth of a million nodes against 15.7 µs for four times the nodes. The ratio approaches the arithmetic one as the room grows.
+- **Not equal accuracy at the walls.** The pairing equalises *interior* dispersion, and nothing else. At equal fmax the FCC grid's spacing is 1.36× coarser in absolute terms, so a room's surfaces are staircased more coarsely, and the FCC rigid wall is not the exact half-cell mirror that the Cartesian one is on an axis-aligned box: the FCC shoebox's modes sit 0.9–2.0% low where the Cartesian shoebox's sit within 0.033%, all of it the wall. Through the WAV chain the two church discretisations still agree on the room — T20 1.88–2.24 s Cartesian against 1.51–2.35 s FCC over the six receivers — but the FCC one leaves 3.3% of its energy in the last tenth of the record against 0.2%.
+
+So: FCC for bandwidth, and it is not close; the Cartesian grid keeps the sharper boundary at a given fmax, and on an axis-aligned box keeps an exactly analytic one.
+
+## Implicit schemes
+
+`RoomTest --implicit` measures the optimised implicit scheme of [Smits & Bilbao 2025](https://doi.org/10.1121/10.0036229) against the two explicit schemes the solver ships.
+It is an instrument, not a stepper: nothing in `src/Room` runs the implicit scheme on a scene, and the reason is at the end of this section.
+
+The scheme is 27-point and compact.
+Both of its Laplacians are weighted sums of the same three sub-stencils — the 7-point face one, the 13-point edge one and the 9-point corner one — one weighting standing on the left of the time difference and the other on the right, so the update solves `(1 + Lim) u^(n+1) = (2 + 2 Lim + λ² Lex) u^n − (1 + Lim) u^(n−1)`.
+The weights are free parameters, and the paper optimises them to hold phase error inside a threshold over as wide a band as possible rather than to raise the order of accuracy.
+The `Lim` operator's diagonal dominance is what makes the solve cheap: the system is solved by a **fixed number of Jacobi sweeps**, not by ADI or tridiagonal factorisation, so there is no data dependency along a line anywhere and every pass is a plain stream.
+A step is one pass to build the iteration's constant vector and seven sweeps — 3(P + 1) = 24 streams against an explicit step's 3 — over four grids of state against an explicit scheme's two.
+
+Two things `--implicit` checks before it times anything.
+On a periodic box a plane wave is an exact discrete eigenvector, so seeding both levels with one makes the next level read back 2 cos(ωT) − 1 at every node, and one step measures the scheme's dispersion relation exactly.
+Measured that way, the realisation — seven Jacobi sweeps, single precision — sits within **5.0e-5 in phase velocity** of the relation its own float coefficients give, and 2000 steps at the worst-direction mode reach a peak of 1.802991 against the exact 1.802989 with a worst deviation of 2.4e-4, which is single-precision accumulation and not the truncated solve.
+Sweeping the mode index out in frequency then gives the oversampling ratio the scheme needs, and for the 1%-threshold parameter set that is **ξ = 1.60, or 2.68 points per wavelength** — the paper's Table II value.
+
+One correction the instrument makes to the paper: it recomputes the Courant limit from the scheme's own parameters (Eq. 16) rather than reading Table II's `λ_max` column, which is rounded to three places.
+The 0.5% row's tabulated 0.850 is above its own limit of 0.8494, and at 0.850 a free-space mode grows by four orders of magnitude in 2000 steps.
+
+Against the church, at the 1% worst-direction phase error all three schemes are pinned to:
+
+| | Cartesian | FCC | implicit, 1% |
+|---|---|---|---|
+| points per wavelength | 10.5 | 7.7 | 2.68 |
+| Courant number | 0.999/√3 | 0.999 | 0.840 |
+| grid spacing | 46.7 mm | 63.3 mm | 183 mm |
+| nodes | 21.08M | 4.41M | 0.361M |
+| step rate | 12.74 kHz | 5.40 kHz | 2.23 kHz |
+| steps for one second | 12,744 | 5,396 | 2,233 |
+| node-steps | 268.6 G | 23.8 G | 0.81 G |
+| streams a node-step | 3 | 3 | 24 |
+| ps/node-step | 48.2 | 46.9 | 297 |
+| GPU busy, one second of impulse response | 12.95s | 1.12s | 0.24s |
+| state | 169 MB | 35 MB | 5.8 MB |
+
+**The implicit scheme wins the interior, by 4.7× of GPU time and 6.1× of state against FCC.**
+The implicit column is the interior alone — the other two include their boundary passes — and it is a projection from a measured step: `--implicit` times the church's own 21.0 × 13.7 × 7.4 m room at the scheme's 183 mm spacing, 116 × 76 × 41 nodes, at 0.1074 ms a step, and the FCC church is 1.12s of `gpu/exec` measured interleaved with it.
+The paper's own benchmark on an RTX 4090 puts the same comparison at 4.0× with boundaries included on both sides, and its measured boundary overhead for this scheme is 27%, which would leave 3.7× here.
+
+The whole margin is node-steps again, and more of it than FCC's was: 29× fewer than FCC, given back 6.3× by a step that costs 24 streams instead of 3.
+In bytes the implicit step moves 77.5 GB against the FCC step's 459 GB, a ratio of 5.9× where the time ratio is 4.7×, and the difference is footprint: at 4.3 MB a pass the implicit church's passes reach 323 GB/s where the FCC church's reach 409.
+The scheme does stream properly at scale — over a 384³ box, 680 MB a pass, a step runs at 334 GB/s, which is 81% of that footprint's 413 GB/s two-level stream, in the same band as the explicit church's 91%.
+The one pass that falls short is the right-hand side, at 63% of the stream: it reads two grids with 27-point neighbourhoods rather than one, and two independent gather patterns do not cache as well as one.
+
+**It is not integrated, and the obstacle is the walls rather than the arithmetic.**
+
+- **The scheme's boundary condition is frequency-independent.** The paper's admittance γ is a real scalar, and its concluding remarks name frequency-dependent boundaries as future work. Every wall in every scene here is a set of LRC branches — eleven of them per material on the church — so the published scheme cannot render any scene in `Scenes/` but the two rigid shoeboxes. Combining the node-local branch solve with a Jacobi-iterated interior is unpublished work with no reference to check against.
+- **There is no golden at that grid step.** Every gate in `script/ValidateRoom` is an SNR against PFFDTD's own output on the *same* voxelized input. At 183 mm the discrete problem is a different one, so there is no CUDA golden, no fp64 truth, and no bit-identity argument — the validation apparatus of the whole solver does not transfer.
+- **2.68 points per wavelength is the geometry as well as the field.** The pairing above equalises interior dispersion and nothing else, the same caveat the Cartesian-against-FCC verdict carries, but three times as coarse. The paper compensates the absorption bias staircasing causes, and demonstrates it on a rotated rectangular room; nothing in it claims a complex room is the same room at 183 mm as at 47.
+
+## Rendering
+
+`script/RenderRoomWavs` turns a render into `gen/wav/room/<Scene>/R00n.wav` with the chain PFFDTD's own post-processing applies: the integrator folded into a 10 Hz fourth-order Butterworth low-cut (the analog high-pass with one of its four zeros at DC removed, then bilinear-transformed), a polyphase resample to 48 kHz, and Hamilton's DAFx 2021 approximate Stokes Green's-function air-absorption filter (see [LiteratureReview.md](LiteratureReview.md)) at the scene's own 20 °C and 50% relative humidity, truncated 120 dB down.
+Receivers are normalised together so their relative levels survive, and written as float32 because a room impulse response covers more range than 16 bits.
+
+What that leaves is one to two seconds of impulse response per scene, which is what the scenes were built for and is shorter than the rooms ring:
+
+| scene | T20 | energy in the last tenth of the record |
+|---|---|---|
+| RoomShoebox | 2.16–2.38s | 8.7% |
+| RoomChurch | 1.88–2.24s | 0.2% |
+| RoomConcertHall | 1.78–2.15s | 1.8% |
+| RoomShoeboxFcc | 2.95–3.67s | 4.3% |
+| RoomChurchFcc | 1.51–2.35s | 3.3% |
+
+T20 rather than T30 because the last 15 dB of a Schroeder curve over a record this short is mostly the truncation, and the tail share is the check on that.
+The two shoeboxes are the case the tail share is there to catch: their walls are all rigid, so they do not decay at all and their apparent T20 is the record ending — which is why the two schemes disagree about it and neither number means anything.
+The church and the hall are within a quarter second of each other, the church slightly the longer of the two, and the FCC church's six receivers span the Cartesian church's range.

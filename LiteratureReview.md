@@ -2,7 +2,7 @@
 
 Reference material behind this solver: the papers each part of the method comes from, the numerical-methods
 background, the Metal/Apple documentation used while building it, and where the scene data lives.
-Links verified 2026-08-15.
+Links verified 2026-08-15 (Bilbao room-acoustics section 2026-08-23).
 
 ## The paper being implemented
 
@@ -63,6 +63,103 @@ second-order FDTD for far-field transport, with no ghost cells, no rasterization
 problem. Implemented in `src/Radiation/`, with its monopole validation ladder in the `RadiationTest`
 target. No public reference implementation exists.
 
+## The Bilbao room-acoustics lineage
+
+**Goal: room impulse responses at full audio bandwidth** — a closed room on a regular grid, energy
+leaving only through frequency-dependent impedance walls, with energy-based stability proofs. From
+Stefan Bilbao's group (Edinburgh Acoustics and Audio Group: Brian Hamilton, Craig Webb, Jan Smits,
+and collaborators), and implemented in `src/Room/` on the 7-point Cartesian stencil, with its
+validation ladder in the `RoomTest` target. Unlike the two solvers above it has a
+public reference implementation. Neither other solver covers this ground: WaveBlender animates
+sources near objects and SonicRadiation radiates to the far field, and both dump energy into a PML —
+here the walls themselves are the physics.
+
+The core:
+
+- **Bilbao, Hamilton, Botts, Savioja. "Finite volume time domain room acoustics simulation under
+  general impedance boundary conditions." IEEE/ACM TASLP 24(1), 2016.** doi:10.1109/TASLP.2015.2500018 ·
+  OA: https://www.pure.ed.ac.uk/ws/files/22154168/fv_genimp_final_r3.pdf — the canonical scheme:
+  interior FDTD (7-point Cartesian or 13-point FCC) recast as finite volumes at the boundary, general
+  LRC (frequency-dependent) wall impedance per boundary node, energy-stable. The algorithmic core of
+  PFFDTD.
+- **Hamilton. "Finite Difference and Finite Volume Methods for Wave-based Modelling of Room
+  Acoustics." PhD thesis, U. Edinburgh, 2016.**
+  https://www.brianhamilton.co/thesis/hamilton2016phdthesis.pdf — the single most complete exposition:
+  grid/scheme families (Cartesian, FCC, CCP), dispersion, stability, and the FV boundary formulations.
+- **Bilbao. "Modeling of complex geometries and boundary conditions in FD/FV time domain room
+  acoustics simulation." TASLP 21(7), 2013.** doi:10.1109/TASL.2013.2256897 — origin of the
+  locally-conforming FV boundary-cell idea.
+- **Bilbao & Hamilton. "Passive volumetric time domain simulation for room acoustics applications."
+  JASA 145(4), 2019.** doi:10.1121/1.5095876 — the passivity framing (lossless interior + passive
+  wall-admittance feedback) the family's stability argument rests on.
+
+Reference implementation:
+
+- **PFFDTD** — https://github.com/bsxfun/pffdtd (Hamilton, MIT). Python voxelizer/setup + CPU
+  reference engine + C/CUDA multi-GPU engine implementing the 2016 boundary scheme on 7-point
+  Cartesian and 13-point FCC grids, with energy conservation checked to machine precision,
+  single-precision stability safeguards, and a staircase surface-area correction. No journal paper —
+  the software is the citation. Modernized fork (SYCL/C++, CMake, CI, actively maintained):
+  https://github.com/tobanteAudio/pffdtd. PFFDTD plays the role the kangruix/WaveBlender CUDA repo
+  played for the first solver — golden-output generator and behavioral reference — and its CPU engines
+  run locally, so no remote GPU host is needed.
+
+Modern upgrades:
+
+- **Smits & Bilbao. "Optimised implicit finite-difference schemes for the wave equation with
+  admittance boundary conditions." JASA 157(3), 2025.** doi:10.1121/10.0036229 · OA:
+  https://www.pure.ed.ac.uk/ws/files/498268079/Bilbao2025JASAOptimised.pdf — the group's most recent
+  solver paper: 27-point compact implicit schemes whose weights are optimised against a wideband
+  dispersion criterion rather than for order of accuracy, reaching full 20 kHz bandwidth on grids
+  far coarser than the explicit family allows. The implicit system is solved by a fixed number of
+  Jacobi sweeps, not by ADI or factorisation, so every pass is a plain stream. Its boundaries are
+  frequency-*in*dependent real admittances over staircased geometry, with the absorption bias
+  staircasing causes compensated by effective surface areas; frequency-dependent boundaries are
+  named as future work. Measured against both explicit schemes here under **Implicit schemes** in
+  [VALIDATION.md](VALIDATION.md).
+- **Smits. "Efficient FD room acoustics simulation incorporating extended-reacting elements." DAFx
+  2023.** — porous absorbers via auxiliary ODEs.
+- **Hamilton & Bilbao 2017** (high-order accuracy in space and time) — cited in the FDTD section
+  below for its dispersion analysis and validation protocol.
+
+Irregular geometry without staircasing — the immersed-boundary line, the treatment closest in spirit
+to WaveBlender's blended domains: **Bilbao 2022** (cited below) plus the impedance-barrier pair,
+**Bilbao 2023, "…acoustic barriers using the IBM: The one-dimensional case," JASA 153(4)**
+doi:10.1121/10.0017763 and **"The three-dimensional case," JASA 154(2)** doi:10.1121/10.0020635 —
+immersed surfaces with tunable impedance and transmittance. Applied downstream by **Wu, Mohapatra,
+Fels, Interspeech 2024** (vocal-tract FDTD with immersed boundaries).
+
+Air absorption:
+
+- **Hamilton & Bilbao. "Time-domain modelling of wave-based room acoustics including viscothermal and
+  relaxation effects in air." JASA-EL 1(9), 2021.** doi:10.1121/10.0006298 — losses inside the scheme.
+- **Hamilton 2021**, arXiv:2107.11871 (modal air-attenuation for simulated RIRs) and DAFx 2021
+  (approximate Stokes Green's-function filter) — the post-processing route PFFDTD takes instead.
+
+Sources and receivers:
+
+- **Bilbao & Hamilton. "Directional sources in wave-based acoustic simulation." TASLP 27(2), 2019.**
+  doi:10.1109/TASLP.2018.2881336, and **Bilbao, Ahrens, Hamilton, JASA 146(4), 2019** — measured
+  source directivity on the grid.
+- **Bilbao, Politis, Hamilton. IEEE SPL 26(4), 2019** — local time-domain spherical-harmonic
+  (ambisonic) receiver encoding in FDTD.
+
+GPU implementation record (the CUDA playbook to translate to Metal):
+
+- **Webb. "Parallel computation techniques for virtual acoustics and physical modelling synthesis."
+  PhD thesis, U. Edinburgh, 2014** and **Webb & Bilbao, DAFx 2012** (binaural audio-rate FDTD in CUDA).
+- **Hamilton & Webb, DAFx 2013** (FCC-grid FD/FV on GPU), **Hamilton, Bilbao, Webb, DAFx 2014**
+  (implicit schemes on GPU), **Hamilton, Webb, Gray, Bilbao, DAFx 2015** (large stencils),
+  **Hamilton, Webb, Fletcher, Bilbao, ISMRA 2016** (multi-GPU, viscothermal + impedance),
+  **Stoltzfus, Gray, Dubach, Bilbao, DAFx 2017** (performance portability).
+
+Survey: **Hamilton & Bilbao. "Wave-based room acoustics modelling: recent progress and future
+outlooks." IOA Auditorium Acoustics, 2018.**
+
+Not open-access anywhere: **Bilbao & Hamilton, JAES 65(1/2), 2017** (explicit/implicit FV with
+viscothermal losses and frequency-dependent boundaries), doi:10.17743/jaes.2016.0057 — content
+covered by the thesis, the 2019 passivity paper, and the 2021 JASA-EL letter.
+
 ## FDTD, PML, and immersed boundaries
 
 - **Yee 1966**, *IEEE TAP* 14(3), 302–307.
@@ -105,11 +202,10 @@ target. No public reference implementation exists.
 - **Chaigne & Lambourg 2001**, *JASA* 109(4) — damped impacted plates; the air-loading effect on plate decay
   times that one-way coupling misses.
 
-Other GPU FDTD acoustics implementations, for behavioral comparison:
-**PFFDTD** https://github.com/bsxfun/pffdtd (C/CUDA, energy conservation checked to machine precision),
+Other GPU FDTD acoustics implementations, for behavioral comparison (PFFDTD and the Webb/Hamilton
+CUDA work are in the Bilbao section above):
 **ParallelFDTD** https://github.com/juuli/ParallelFDTD (CUDA + voxelizer),
-**Savioja 2010** https://www.dafx.de/paper-archive/2010/DAFx10/Savioja_DAFx10_P43.pdf,
-**Webb & Bilbao 2011** (CUDA thread-blocking strategies for 3D FDTD).
+**Savioja 2010** https://www.dafx.de/paper-archive/2010/DAFx10/Savioja_DAFx10_P43.pdf.
 
 ## Metal and Apple silicon
 

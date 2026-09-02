@@ -451,34 +451,110 @@ static inline void RoomImplicitSumsWall(device const float *u, int ix, int iy, i
         u[xp + ym + zm] + u[xp + ym + zp] + u[xp + yp + zm] + u[xp + yp + zp];
 }
 
-// The walled passes run over the array's interior rather than the whole array, and read two
-// bytes a node for the terms its geometry gives it. See RoomImplicitTerm: for ordinary air
-// those terms are {0, 0, 1} and cost the pass nothing but the code, and for a node outside the
-// room they are {0, 0, 0}, whose Fd holds it at the zero the sums rely on — which is how a
-// room that is not the array is stepped without the passes knowing about it.
+// The three sums with the legs the surface cuts left out of them.
+//
+// A pass cannot drop a ghost by reading the zero across the wall, because a room's own surfaces
+// are thinner than a cell in places and then the node across one of them is a room node with a
+// live value. So the mask rides beside the code, one bit a leg, and the sum keeps what it says
+// to keep. A box does not need this — every leg it cuts points at a node held at zero — which
+// is why it was worth finding out what a room costs rather than assuming.
+//
+// The bit order is the raster order of the 26 offsets with the centre skipped, which is the
+// order the host builds the mask in — see ImplicitLegBit. Unrolled over the same nine
+// precomputed offsets as RoomImplicitSumsWall rather than looping over an offset table: a
+// table leg costs two integer multiplies of index arithmetic, and every inside node runs this
+// body, so those multiplies were most of what the mask cost where the grid is cache-resident.
+#define ROOM_KEPT(b) float((keep >> (b)) & 1u)
+static inline void RoomImplicitSumsMasked(device const float *u, int ix, int iy, int iz, uint keep,
+                                          constant RoomImplicitParams &p, thread float3 &s) {
+    const int nzny = p.Nz * p.Ny;
+    const int xm = (ix - 1) * nzny, x0 = ix * nzny, xp = (ix + 1) * nzny;
+    const int ym = (iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy + 1) * p.Nz;
+    const int zm = iz - 1, z0 = iz, zp = iz + 1;
+
+    s.x = ROOM_KEPT(4) * u[xm + y0 + z0] + ROOM_KEPT(21) * u[xp + y0 + z0] +
+        ROOM_KEPT(10) * u[x0 + ym + z0] + ROOM_KEPT(15) * u[x0 + yp + z0] +
+        ROOM_KEPT(12) * u[x0 + y0 + zm] + ROOM_KEPT(13) * u[x0 + y0 + zp];
+    s.y = ROOM_KEPT(1) * u[xm + ym + z0] + ROOM_KEPT(7) * u[xm + yp + z0] +
+        ROOM_KEPT(18) * u[xp + ym + z0] + ROOM_KEPT(24) * u[xp + yp + z0] +
+        ROOM_KEPT(3) * u[xm + y0 + zm] + ROOM_KEPT(5) * u[xm + y0 + zp] +
+        ROOM_KEPT(20) * u[xp + y0 + zm] + ROOM_KEPT(22) * u[xp + y0 + zp] +
+        ROOM_KEPT(9) * u[x0 + ym + zm] + ROOM_KEPT(11) * u[x0 + ym + zp] +
+        ROOM_KEPT(14) * u[x0 + yp + zm] + ROOM_KEPT(16) * u[x0 + yp + zp];
+    s.z = ROOM_KEPT(0) * u[xm + ym + zm] + ROOM_KEPT(2) * u[xm + ym + zp] +
+        ROOM_KEPT(6) * u[xm + yp + zm] + ROOM_KEPT(8) * u[xm + yp + zp] +
+        ROOM_KEPT(17) * u[xp + ym + zm] + ROOM_KEPT(19) * u[xp + ym + zp] +
+        ROOM_KEPT(23) * u[xp + yp + zm] + ROOM_KEPT(25) * u[xp + yp + zp];
+}
+#undef ROOM_KEPT
+
+// The walled passes run over the array's interior rather than the whole array, and reach the
+// wall's data — a uint of kept legs and a ushort into the term table — by rank through
+// RoomImplicitBlockEntry rather than carrying it grid-wide, because only 7-9% of a real
+// room's swept nodes are wall and six bytes a node on a twelve-byte pass was the geometry's
+// whole cost. What every node pays is three words a block of 32, which say which of its
+// classes the node is: outside the room, where it is held at the rest the sums rely on and
+// reads nothing else; ordinary air, whose mask is all ones and whose terms are the identity;
+// or wall, where the packed row carries what its geometry gives it.
+//
+// Air is a constant mask rather than a branch to a maskless body. Wall nodes sit on surfaces
+// that cross nearly every 32-node run at a small footprint, so a branched pass runs most SIMD
+// groups down both sum bodies — measured at nearly double the step where the grid is
+// cache-resident and traffic is not the cost — and carrying two unrolled 26-leg bodies costs
+// registers even where the vote is uniform. One body, with the mask a multiply a leg, is
+// cheaper than choosing between two.
 kernel void RoomImplicitRhsWall(device float *bp, device const float *un, device const float *up,
+                                device const RoomImplicitBlockEntry *blocks,
                                 device const ushort *code, device const RoomImplicitTerm *terms,
-                                constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+                                device const uint *keep, constant RoomImplicitParams &p,
+                                uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    const RoomImplicitBlockEntry blk = blocks[ii / RoomBnBlock];
+    const uint slot = uint(ii % RoomBnBlock);
+    if ((blk.Outside >> slot) & 1u) return; // held at rest, and no sweep reads its bp
+    uint k = 0x3FFFFFFu;
+    RoomImplicitTerm w{0.f, 0.f, 1.f};
+    if ((blk.Wall >> slot) & 1u) {
+        const uint row = blk.Rank + popcount(blk.Wall & ((1u << slot) - 1u));
+        k = keep[row];
+        w = terms[code[row]];
+    }
     float3 sn, sp;
-    RoomImplicitSumsWall(un, ix, iy, iz, p, sn);
-    RoomImplicitSumsWall(up, ix, iy, iz, p, sp);
-    const RoomImplicitTerm w = terms[code[ii]];
+    RoomImplicitSumsMasked(un, ix, iy, iz, k, p, sn);
+    RoomImplicitSumsMasked(up, ix, iy, iz, k, p, sp);
     bp[ii] = p.R1 * sn.x + p.R2 * sn.y + p.R3 * sn.z + (p.Rc + w.Cn) * un[ii] -
         (p.Q1 * sp.x + p.Q2 * sp.y + p.Q3 * sp.z + (1.f - w.Cp) * up[ii]);
 }
 
 kernel void RoomImplicitJacobiWall(device float *xn, device const float *x, device const float *bp,
+                                   device const RoomImplicitBlockEntry *blocks,
                                    device const ushort *code, device const RoomImplicitTerm *terms,
-                                   constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+                                   device const uint *keep, constant RoomImplicitParams &p,
+                                   uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    const RoomImplicitBlockEntry blk = blocks[ii / RoomBnBlock];
+    const uint slot = uint(ii % RoomBnBlock);
+    if ((blk.Outside >> slot) & 1u) {
+        // Written rather than skipped, so the outside holds its rest whatever the scratch
+        // buffer held — the soaks sample the whole array and the energy sums the room box,
+        // and neither can tell a stale float outside the room from growth inside it.
+        xn[ii] = 0.f;
+        return;
+    }
+    uint k = 0x3FFFFFFu;
+    float fd = 1.f;
+    if ((blk.Wall >> slot) & 1u) {
+        const uint row = blk.Rank + popcount(blk.Wall & ((1u << slot) - 1u));
+        k = keep[row];
+        fd = terms[code[row]].Fd;
+    }
     float3 s;
-    RoomImplicitSumsWall(x, ix, iy, iz, p, s);
-    xn[ii] = (bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z)) * terms[code[ii]].Fd;
+    RoomImplicitSumsMasked(x, ix, iy, iz, k, p, s);
+    xn[ii] = (bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z)) * fd;
 }
 
 // The same two passes without the byte, which is the ceiling the walled step is read against:

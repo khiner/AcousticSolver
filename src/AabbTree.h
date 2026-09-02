@@ -47,6 +47,15 @@ template<typename Scalar> struct AabbTree {
         Root = Build(v, f, ranks, elements, root_box);
     }
 
+    // Returns the first triangle crossed by [a, b], or -1.
+    int Crossing(const RowVector3 &a, const RowVector3 &b, Scalar &t_out) const {
+        int i = -1;
+        t_out = std::numeric_limits<Scalar>::infinity();
+        if (Leaves.empty()) return -1;
+        VisitSegment(Root, a, b - a, t_out, i);
+        return i;
+    }
+
     // Index of the triangle closest to `p`, and the closest point on it.
     void ClosestPoint(const RowVector3 &p, int &i_out, RowVector3 &c_out) const {
         i_out = -1;
@@ -104,9 +113,8 @@ private:
         for (int d = 1; d < 3; ++d) {
             if (hi[d] - lo[d] > hi[axis] - lo[axis]) axis = d;
         }
-        std::vector<int> keys(elements.size());
-        for (size_t i = 0; i < elements.size(); ++i) keys[i] = ranks(elements[i], axis);
-        std::vector<int> nth = keys;
+        std::vector<int> nth(elements.size());
+        for (size_t i = 0; i < elements.size(); ++i) nth[i] = ranks(elements[i], axis);
         const size_t mid = (nth.size() - 1) / 2;
         std::nth_element(nth.begin(), nth.begin() + mid, nth.end());
         const int median = nth[mid];
@@ -115,7 +123,7 @@ private:
         std::vector<int> left, right;
         left.reserve((elements.size() + 1) / 2);
         right.reserve(elements.size() / 2);
-        for (size_t i = 0; i < elements.size(); ++i) (keys[i] <= median ? left : right).push_back(elements[i]);
+        for (const int e : elements) (ranks(e, axis) <= median ? left : right).push_back(e);
 
         const int node = int(Nodes.size());
         Nodes.emplace_back();
@@ -124,6 +132,70 @@ private:
         const int r = Build(v, f, ranks, right, r_box);
         Nodes[node] = {l_box, r_box, l, r};
         return node;
+    }
+
+    static bool SegmentBox(const Box &box, const RowVector3 &o, const RowVector3 &d, Scalar limit, Scalar &entry) {
+        Scalar lo = 0, hi = std::min(Scalar(1), limit);
+        for (int axis = 0; axis < 3; ++axis) {
+            if (d[axis] == Scalar(0)) {
+                if (o[axis] < box.Min[axis] || o[axis] > box.Max[axis]) return false;
+                continue;
+            }
+            Scalar a = (box.Min[axis] - o[axis]) / d[axis];
+            Scalar b = (box.Max[axis] - o[axis]) / d[axis];
+            if (a > b) std::swap(a, b);
+            lo = std::max(lo, a);
+            hi = std::min(hi, b);
+            if (lo > hi) return false;
+        }
+        entry = lo;
+        return true;
+    }
+
+    // Avoid <Eigen/Geometry> in this Core-only header.
+    static RowVector3 Cross(const RowVector3 &u, const RowVector3 &v) {
+        return {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+    }
+
+    static bool SegmentTriangle(const RowVector3 &o, const RowVector3 &d, const RowVector3 &a, const RowVector3 &b, const RowVector3 &c, Scalar &t) {
+        const RowVector3 e1 = b - a, e2 = c - a, p = Cross(d, e2);
+        const Scalar det = e1.dot(p);
+        if (std::abs(det) <= std::numeric_limits<Scalar>::min()) return false;
+        const Scalar inv = Scalar(1) / det;
+        const RowVector3 s = o - a;
+        const Scalar u = s.dot(p) * inv;
+        if (u < Scalar(0) || u > Scalar(1)) return false;
+        const RowVector3 q = Cross(s, e1);
+        const Scalar v = d.dot(q) * inv;
+        if (v < Scalar(0) || u + v > Scalar(1)) return false;
+        t = e2.dot(q) * inv;
+        return t >= Scalar(0) && t <= Scalar(1);
+    }
+
+    void VisitSegment(int ref, const RowVector3 &o, const RowVector3 &d, Scalar &t, int &i) const {
+        if (ref < 0) {
+            const Leaf &leaf = Leaves[~ref];
+            Scalar hit;
+            if (SegmentTriangle(o, d, leaf.A, leaf.B, leaf.C, hit) && hit < t) {
+                t = hit;
+                i = leaf.Triangle;
+            }
+            return;
+        }
+        const Node &node = Nodes[ref];
+        Scalar left, right;
+        const bool visit_left = SegmentBox(node.LBox, o, d, t, left);
+        const bool visit_right = SegmentBox(node.RBox, o, d, t, right);
+        if (visit_left && visit_right) {
+            if (left <= right) {
+                VisitSegment(node.LRef, o, d, t, i);
+                if (right < t) VisitSegment(node.RRef, o, d, t, i);
+            } else {
+                VisitSegment(node.RRef, o, d, t, i);
+                if (left < t) VisitSegment(node.LRef, o, d, t, i);
+            }
+        } else if (visit_left) VisitSegment(node.LRef, o, d, t, i);
+        else if (visit_right) VisitSegment(node.RRef, o, d, t, i);
     }
 
     void Visit(int ref, const RowVector3 &p, Scalar &sqr_d, int &i, RowVector3 &c) const {

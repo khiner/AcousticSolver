@@ -978,25 +978,29 @@ Over the 16 lowest modes of a 40 × 33 × 28 room, against Morse & Ingard:
 The fitted offset is the measurement: the wall sits about half a cell out, as the finite-volume reading says, and the ~0.44 h beyond the node is the 27-point stencil's own boundary layer rather than an order-of-accuracy defect.
 What is left after the fit is anisotropic — axial modes read high and oblique ones low — and shrinks with the grid rather than with the mode, so at a production room's node counts it is a part in ten thousand.
 
-**The wall costs 0.9% of a step at the church's footprint and 12.3% at DRAM scale.**
-Measured against the same room stepped by the same passes without the code, alternated and taken at their best because the GPU's clock drifts over a rung by more than the difference:
+**The wall costs 38% of a step at the church's footprint and 4.8% at DRAM scale.**
+Measured against the same room stepped by the same passes without the geometry, alternated and taken at their best because the GPU's clock drifts over a rung by more than the difference:
 
 | | 114 × 74 × 39 | 382 × 382 × 382 |
 |---|---|---|
 | room nodes | 0.329M | 55.74M |
 | wall nodes | 30,636 (9.31%) | 870,968 (1.56%) |
-| Jacobi sweep, no wall | 0.0105 ms | 2.137 ms |
-| Jacobi sweep, walled | 0.0106 ms | 2.553 ms |
-| a step, no wall | 0.0900 ms | 17.78 ms |
-| a step, walled | 0.0908 ms | 19.97 ms |
-| the wall | +0.9% | +12.3% |
+| Jacobi sweep, no wall | 0.0105 ms | 2.153 ms |
+| Jacobi sweep, walled | 0.0150 ms | 2.279 ms |
+| a step, no wall | 0.0895 ms | 17.78 ms |
+| a step, walled | 0.1236 ms | 18.64 ms |
+| the wall | +38.1% | +4.8% |
+| blocks and rows | 0.3 MB | 26.5 MB |
 
-**The code is what the wall costs, and two bytes is 16.7% more traffic on a twelve-byte pass.**
-The sweep's own ratio is +19.4%, and at the church's footprint every pass is cache-resident and it is nearly free.
-The width is not set by the rigid case, which needs three terms and would fit a byte at a measured +8.4% on the sweep and **+7.0%** on the step — it is set by curved absorbing walls, for the reason under the geometry survey below.
-**Both are well inside the paper's own 27% figure for its boundary overhead**, and the two-byte code leaves the 4.7× interior margin against FCC at about **4.2×** at DRAM scale and essentially intact at the church's.
-It is also the reason the cost barely depends on the room: the code is read unconditionally at every node, so a wall of any shape costs the same as a box's.
-Applying the same terms in scattered passes over a boundary-node list instead — the obvious alternative, two extra dispatches a sweep — measured +21% at the church's footprint and within noise of the code at 382³, and it cannot mask the outside of a room that is not a box at all; it is not in the tree.
+**What rides grid-wide is three words a block of 32 nodes — 3.1% more traffic on a twelve-byte pass — and the wall's own six bytes are read only where the wall is.**
+A wall node carries a `uint` of kept legs and a two-byte code into the term table, packed in wall order and reached by rank through `RoomImplicitBlockEntry`: the block's wall-occupancy word, its outside word, and a running count of the wall rows ahead of it, the same construction the FCC boundary already uses.
+The term table's width is not set by the rigid case, which needs three terms and would fit a byte — it is set by curved absorbing walls, for the reason under the geometry survey below.
+On this box every node still runs the masked sums — the wall is the shell, so every 32-node run has wall in it — and the +38% at the cache-resident footprint is that body's arithmetic, not traffic; a real room, most of whose nodes sit in runs the wall never crosses, reads far lower (see "What a real room breaks" below), and the array box is the worst case for it.
+**Both footprints are inside the paper's own 27% figure where it matters**, and the block rank leaves the 4.7× interior margin against FCC at about **4.5×** at DRAM scale.
+Two shapes of the same lookup measured worse and are not in the tree.
+Applying the terms in scattered passes over a boundary-node list — two extra dispatches a sweep — measured +21% at the church's footprint, and it cannot mask the outside of a room that is not a box.
+And branching per lane to a maskless body for air, with or without a `simd_any` group vote, measured +55% to +90% at the church's footprint: wall nodes sit on surfaces that cross nearly every 32-node run there, so most SIMD groups pay both unrolled 26-leg bodies, and carrying two bodies costs registers even where the vote is uniform.
+The masked body itself is unrolled over the same nine precomputed offsets as the maskless one with the mask a multiply per leg — the offset-table loop it replaced cost two integer multiplies of index arithmetic per leg, which was most of the mask's arithmetic.
 
 ### An absorbing wall, and geometry that is not the array
 
@@ -1113,9 +1117,110 @@ Modes 2 to 4 land within 4%; mode 1 is 10% low, and about half of that is the sa
 The rest is the estimator: it reads the slope of log E, which assumes the modes the seed's own error also excites decay at the same rate as the one seeded — true of a real γ and false of this wall.
 That is why the window is ten decibels of early decay rather than the whole run, the same reason a room's T10 is.
 
-**The outside does not move the margin.**
-Half a sphere's bounding box is outside the room, and those nodes are masked by the same byte but not skipped — every pass carries them.
-The explicit path carries the identical bounding box, though, so this does not touch the 4.4× against FCC; it costs absolute time and memory on both sides equally.
+### Voxelising a mesh
+
+What the boundary asks of geometry is two things a node: which of its 26 legs cross the surface, and the true outward normal of the surface it is nearest.
+`AabbTree` answers the first with a segment query and the second with the closest-point query it already had, so a voxeliser for this scheme is those two over a grid.
+That is what the reference voxeliser does with its own ray march, and the two differences are the whole of why it cannot be reused: it marches **six** legs where a 27-point stencil needs twenty-six, and it finds the nearest triangle a boundary node belongs to and then does not export it.
+
+**Against geometry that is known in closed form, it is exact.**
+A box yawed 22.9° inside a 48³ grid, as twelve triangles, against the same box as an inside test and a normal:
+
+| | 0° | 22.9° |
+|---|---|---|
+| legs tested | 2,875,392 | 2,875,392 |
+| legs disagreeing with the exact segment test | 1 | **0** |
+| wall nodes | 17,442 | 19,900 |
+| kept counts disagreeing | 1 | **0** |
+| normals disagreeing | 48 | **0** |
+| worst β difference | 1.07e-2 | **2.2e-16** |
+
+The yawed case is the real check and it is clean to machine precision.
+**The axis-aligned case's disagreements are ties, not errors**: when a box's faces are grid-aligned, a node on an edge is equidistant from two of them and the nearest triangle is a coin flip — which is the same ambiguity as the 90° edge normal above, now visible as 48 nodes in 17,442.
+A yawed box has no ties because nothing about it is symmetric with the grid.
+
+**On the rooms the solver actually ships**, at the 1% scheme's own 183 mm:
+
+| | CTK_Church | Musikverein_ConcertHall |
+|---|---|---|
+| grid | 118 × 78 × 44 | 283 × 112 × 87 |
+| nodes | 0.405M | 2.758M |
+| triangles / materials | 1,234 / 8 | 32,398 / 5 |
+| voxelised in | 0.1 s | 5.2 s |
+| the fill reaches | 60.9% of the box | 72.4% |
+| wall nodes, 26 directions | 35,314 | 197,861 |
+| … in the 6-direction set | 83.2% | 87.3% |
+| β mean | 0.831 | 0.852 |
+| β negative | 24 | 1,053 |
+| … as absorption lost to going rigid | 0.0000% | 0.0003% |
+| distinct terms | 510 | 489 |
+| … with β to 8 bits | 414 | 441 |
+
+**β does go negative on a real room, and it does not matter.**
+The brief for it was exact: it can only happen where a node sees wall in *opposite* directions and the normal it is assigned points at one of them, which is a gap of a cell or two — no analytic shape has one and a room at 183 mm does.
+Those nodes go rigid, because an ambiguous normal is not a licence to add energy, and that costs **0.0003% of the wall's absorption** at worst.
+
+**A byte would not carry a real room and a ushort carries it a hundred times over.**
+489 to 510 distinct terms exactly, 414 to 441 with β quantised — past the 255 a byte indexes and nowhere near the 65,535 a ushort does.
+So the packing the terms invite is not needed: the direct table index is the right design at production scale, and there is no headroom problem to solve.
+
+**A model's winding says nothing about which side the room is on.**
+Triangles are marked one- and two-sided and nothing orients them, so every wall node turns its own normal to agree with the legs actually cut — on the church and the hall, tens of thousands of them do. That orientation is part of voxelising, not a detail.
+
+**The fill has to run over the same 26 legs the stencil does.**
+Over six legs the church's fill is 60.9% of its box and the hall's runs away to 99.9%; over twenty-six they are 60.9% and 72.4%, and the hall's wall-node count falls from 335,919 to 197,861 with it.
+Two nodes joined by a leg the surface does not cut are acoustically joined, so a six-legged fill leaves nodes it cannot reach diagonally adjacent to nodes it can — which is a Dirichlet condition at those legs rather than this boundary.
+Every number in the table above is the twenty-six-legged one.
+
+### What a real room breaks, and what it costs to fix
+
+**A code a node was not enough to carry one, and the church said so in a hundred steps** — energy drift 2.5e+40 of E₀, at every Courant number.
+
+The reason is the one thing that design rested on.
+A pass drops a ghost by **reading the zero the node across the wall is held at**, and that needs every cut leg to point out of the room.
+A box, a sphere, a yawed box and a column all satisfy it. A real room does not: a surface thinner than a cell cuts a leg whose far node is *also* in the room, and there is no zero there to read.
+**41,988 such legs in the church and 515,328 in the Musikverein.**
+
+**What that costs is not symmetry — it is the null space.**
+The operator stays symmetric: both ends of a cut leg keep the same off-diagonal.
+What it loses is that every row sums to zero, because the sum keeps a neighbour the diagonal has already dropped — and a Laplacian with positive row sums is no longer negative semidefinite, which is what the whole energy argument stands on.
+So the check that catches this is not a symmetry test but **the constant field**: a constant pressure has no gradient, so both Laplacians must annihilate it.
+That costs one matvec, reads **0.00e+00** on every shape, read **2.24** on the church, and is now the first thing every geometry rung prints.
+The host-reference check could never have caught it — `ImplicitReferenceStep` shares the ghost rule with the kernels, so both agreed to 1.2e-7 and both were wrong.
+
+**The fix is the mask in the kernels**, the way the explicit path already carries its six bits a node and the FCC path its twelve: a `uint` of keep-bits beside the code, and `RoomImplicitSumsMasked` keeps what it says to keep.
+Both ride in wall order behind `RoomImplicitBlockEntry`'s rank — only 9% of the church's swept nodes and 7% of the hall's are wall, so grid-wide they were six bytes a node paying for the 90% that need nothing, and block-ranked they are three words a block of 32.
+With that both rooms step:
+
+| | CTK_Church | Musikverein |
+|---|---|---|
+| nodes / of them room | 0.405M / 246,476 | 2.758M / 1,995,723 |
+| wall nodes | 35,314 | 197,861 |
+| cut legs joining two room nodes | 41,988 | 515,328 |
+| constant field through both Laplacians | 0.00e+00 | 0.00e+00 |
+| one step against the host in double | 1.2e-7 | 1.2e-7 |
+| energy drift, 4,000 steps | 8.8e-7 | 1.1e-6 |
+| largest holding λ | 0.8400, **100%** | 0.8400, **100%** |
+| a step against the same passes without the geometry | **+14.9%** | **+11.7%** |
+| ps a node-step | 284.5 | 222.4 |
+
+**Both hold at the full free-space Courant number** — a staircased room costs nothing there, as a box did not.
+
+**And the geometry costs about an eighth of a step, which puts the margin back.**
+The grid-wide mask read between a third and double a step — +34.1% on the church and +95.6% on the hall — and took the 4.7× interior margin against FCC down to between 3.5× and 2.4× by footprint.
+Block-ranked, the rooms read +14.9% and +11.7%, and the margin stands at about **4.1× to 4.2×** — the code-alone figure, and above the paper's own 4.0× with boundaries on both sides.
+The hall also steps *faster per box node than a periodic box of its size* (222 against 287 ps a node-step), because the outside word ends 27.6% of its nodes after one broadcast block read where the bare passes run full sums.
+
+One trap this turned up, worth stating because it cost a diagnosis: **remove the seed's mean over the room, not over the box**. The constant vector is a physical null mode of both Laplacians and the one thing the energy does not bound, so a nonzero constant component drifts linearly in n and reads as a couple of dB per thousand steps of instability that is not there.
+
+**The one thing a mesh and a closed form do not share is where a node stops being inside.**
+A mesh cuts a leg where the surface is; the shapes above keep a node only when it is half a cell in from the surface, which is where the full cell puts its wall.
+Those differ over a half-cell band — about 4,700 nodes of the yawed box's 488,000 — and that band is why the yawed room's modes have to fit a room offset rather than being read at the shape's own extents.
+A mesh voxeliser inherits the reference's convention, so that offset is what has to be reconciled when the two are compared, not the wall condition.
+
+**The outside costs a broadcast word, not a step.**
+Half a sphere's bounding box is outside the room, and 27.6% of the hall's — and the block's outside word now ends those nodes after one read a block: the right-hand side writes nothing there and a sweep writes the one zero the rest of the grid relies on.
+It still costs memory — the buffers are the box's size either way — and the explicit path carries the identical bounding box at full cost, so what was once a wash is now a term in the implicit side's favour on any room that does not fill its box.
 
 **What is still open.**
 β can only go negative where a node sees wall in opposite directions and the normal it is assigned points at the smaller side — a gap of one or two cells. No analytic shape here has one, and a real mesh at 183 mm will; a one-cell slot gives β = 0 exactly, which is stable but absorbs nothing.
@@ -1124,7 +1229,7 @@ Edge nodes are 6% of the wall on the 40 × 33 × 28 room, which is the right siz
 
 **It is not integrated, and what is left is the voxeliser and the absence of a truth to check against.**
 
-- **No voxeliser emits what a 27-point wall needs.** The reference marks a node when one of its six axis legs crosses the surface, and does not export the nearest triangle it already found; the 27-point stencil needs 26 legs and the true normal at every node with a crossing. On a curved wall that is nearly twice as many nodes. Widening its ray march is contained — the stencil is already a parameter — but the leg length it tests against is a scalar and three lengths would have to travel with the directions.
+- **Nothing renders yet.** Both rooms step, hold at the full Courant number and conserve energy, but every rung seeds a field directly — there are no sources, no receiver corners and no impulse response. That, a `RoomScene` that carries 26-direction data, and the scene's own materials rather than a synthetic wall, are what stand between this and a room the solver can be asked for.
 - **There is no golden at that grid step.** Every gate in `script/ValidateRoom` is an SNR against PFFDTD's own output on the *same* voxelized input. At 183 mm the discrete problem is a different one, so there is no CUDA golden, no fp64 truth, and no bit-identity argument — the validation apparatus of the whole solver does not transfer.
 - **2.68 points per wavelength is the geometry as well as the field.** The pairing above equalises interior dispersion and nothing else, the same caveat the Cartesian-against-FCC verdict carries, but three times as coarse. The paper compensates the absorption bias staircasing causes, and demonstrates it on a rotated rectangular room; nothing in it claims a complex room is the same room at 183 mm as at 47.
 

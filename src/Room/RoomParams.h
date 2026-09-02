@@ -34,6 +34,19 @@ struct RoomBnBlockEntry {
     unsigned int Occupied, Rank;
 };
 
+// One block of the implicit scheme's boundary lookup, the same rank construction as
+// RoomBnBlockEntry with one word more. Only 7-9% of a real room's nodes are wall, but the
+// masked passes read six bytes a node grid-wide for what the wall alone needs — a uint of
+// kept legs and a ushort into the term table. Here those ride in wall order and a node
+// reaches its row by rank, and what stays grid-wide is three words a block of 32: which of
+// the block's nodes are wall, which are outside the room, and how many wall rows precede the
+// block. Outside is its own word rather than a term-table entry because it is what the other
+// two classes are told apart against: an outside node is held at rest and reads nothing, an
+// air node keeps all 26 legs and needs no mask at all. See RoomImplicitRhsWall.
+struct RoomImplicitBlockEntry {
+    unsigned int Wall, Outside, Rank;
+};
+
 // Branches a material's impedance may carry (the reference's MMb). Per-node LRC state is
 // allocated at this width whatever a scene uses.
 enum : int { RoomMaxBranches = 12 };
@@ -102,13 +115,14 @@ struct RoomImplicitParams {
 // x *= Fd = d0/d, which is all a sweep's diagonal needs because the sweep's whole expression
 // is one division by it.
 //
-// Every node's three numbers are a function of its three kept counts alone, and a room has far
-// fewer distinct counts than nodes, so what rides beside the grid is one byte a node indexing
-// a table of these — and the corrections then ride inside the uniform passes rather than in
-// scattered passes of their own, which for a sweep that runs P times a step is what keeps them
-// affordable. Code 0 is ordinary air, {0, 0, 1}. A node outside the room is {0, 0, 0}: its Fd
-// zeroes it every sweep, which is what keeps the halo's zeros — and, in a room that is not a
-// box, the whole outside — from reaching the sums.
+// Every node's three numbers are a function of its kept counts and its G alone, and a room
+// has far fewer distinct triples than nodes, so a wall node carries a ushort into a table of
+// these — packed in wall order and reached by rank through RoomImplicitBlockEntry, so the
+// corrections ride inside the uniform passes rather than in scattered passes of their own,
+// which for a sweep that runs P times a step is what keeps them affordable. Ordinary air is
+// {0, 0, 1} and a node outside the room is {0, 0, 0}, but neither reaches the table: both are
+// classes of the block words, and the passes special-case them — air takes the uniform step
+// and outside is held at the rest the halo's zeros rely on.
 struct RoomImplicitTerm {
     float Cn, Cp, Fd;
 };

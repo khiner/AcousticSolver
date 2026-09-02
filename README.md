@@ -97,7 +97,7 @@ Scenes choose either a 7-point Cartesian grid or a 13-point face-centred-cubic g
 
 The explicit solver consumes converted [PFFDTD](https://github.com/bsxfun/pffdtd) voxelizer output so the Metal and reference engines step the same discrete problem.
 `script/ConvertRoomScene` writes the scene configuration and binary boundary, material, source, and receiver data under `Scenes/`.
-The repository includes Cartesian and FCC shoebox and church scenes and a Cartesian concert hall.
+The repository includes Cartesian and FCC shoebox and church scenes, a Cartesian concert hall, and a production-resolution FCC shoebox.
 
 ```
 build/AcousticSolver --room ../Scenes/RoomChurch/config.json

@@ -929,18 +929,20 @@ That image makes the mode an exact discrete eigenvector the same way the periodi
 At 2.68 points per wavelength it resolves a room's modes as well as a 10.5-point grid does.
 
 **The wall is unstable, and not for want of a smaller Courant number.**
-Seeded with noise so every eigenvalue is excited, and judged on whether the envelope of max|u| in the last tenth of a run matches the first tenth:
+Seeded with noise so every eigenvalue is excited, and read as a growth *rate* — `log(max|u|)` fitted against step index — rather than as a verdict on one soak length, because the instability takes tens of thousands of steps to become visible and a pass/fail on "did the envelope move" mostly measures how long the run was:
 
-| λ | of the free-space limit | envelope | |
+| λ | of the free-space limit | growth, dB per 1000 steps | |
 |---|---|---|---|
-| 0.8400 | 100% | 18.4 → 101.4 | grows |
-| 0.7980 | 95% | 4.80 → 16.7 | grows |
-| 0.7560 | 90% | 3.59 → 7.11 | grows |
-| 0.7140 | 85% | 4.11 → 3.83 | holds |
-| 0.6720 | 80% | 3.24 → 2.96 | holds |
-| 0.5880 | 70% | 2.89 → 5.89 | grows |
-| 0.5040 | 60% | 2.19 → 2.46 | grows |
-| 0.4200 | 50% | 2.53 → 3.27 | grows |
+| 0.8400 | 100% | +0.3211 | grows |
+| 0.7980 | 95% | +0.2308 | grows |
+| 0.7560 | 90% | +0.0071 | holds |
+| 0.7140 | 85% | −0.0211 | holds |
+| 0.6720 | 80% | +0.0068 | holds |
+| 0.5880 | 70% | +0.1403 | grows |
+| 0.5040 | 60% | +0.0253 | grows |
+| 0.4200 | 50% | +0.0476 | grows |
+
+Those rates are the scale a render is judged at: over the full-bandwidth scene's 77,078 steps, +0.01 dB per thousand is +0.8 dB and +0.32 is +25.
 
 **A Courant condition is monotone and this is not**, so lowering λ is not the fix — half the free-space limit still grows.
 A single mode hides it for a long time: at the published λ the mode (0,1,1) reads 1.0026 against an exact 1.0020 after 5,000 steps and 1.038 after 20,000, then 10⁶ by 80,000, because what grows is an eigenvalue the seed barely projects onto until round-off finds it.
@@ -958,6 +960,92 @@ Integrating this scheme therefore starts one step earlier than the frequency-dep
 - **The scheme's boundary condition is frequency-independent.** The paper's admittance γ is a real scalar, and its concluding remarks name frequency-dependent boundaries as future work. Every wall in every scene here is a set of LRC branches — eleven of them per material on the church — so the published scheme cannot render any scene in `Scenes/` but the two rigid shoeboxes. Combining the node-local branch solve with a Jacobi-iterated interior is unpublished work with no reference to check against.
 - **There is no golden at that grid step.** Every gate in `script/ValidateRoom` is an SNR against PFFDTD's own output on the *same* voxelized input. At 183 mm the discrete problem is a different one, so there is no CUDA golden, no fp64 truth, and no bit-identity argument — the validation apparatus of the whole solver does not transfer.
 - **2.68 points per wavelength is the geometry as well as the field.** The pairing above equalises interior dispersion and nothing else, the same caveat the Cartesian-against-FCC verdict carries, but three times as coarse. The paper compensates the absorption bias staircasing causes, and demonstrates it on a rotated rectangular room; nothing in it claims a complex room is the same room at 183 mm as at 47.
+
+## A room at full bandwidth
+
+Every scene above is validation-scale — 500 Hz to 1 kHz, small enough to hold a double-precision truth on a laptop CPU.
+`RoomShoeboxFccFull` is the one production-resolution scene, and it is what the lineage this solver comes from exists to produce: a room impulse response with content to 20 kHz.
+
+It is `RoomShoeboxFcc`'s own room at exactly twenty times its bandwidth.
+Twenty times the cells against a twentieth of the spacing is the same box to the millimetre, so the pair is one room at 1 kHz and at 20 kHz and everything that differs between them is bandwidth rather than geometry.
+Its walls carry a material where the validation shoeboxes are rigid, because a rigid box never decays and this is the scene meant to be listened to.
+
+| | RoomShoeboxFcc | RoomShoeboxFccFull |
+|---|---|---|
+| fmax | 1 kHz | 20 kHz |
+| grid spacing | 44.57 mm | 2.229 mm |
+| grid | 76 × 32 × 52 | 1348 × 526 × 868 |
+| nodes | 0.126M | 615.45M |
+| two-level state | 1.0 MB | 4.92 GB |
+| boundary nodes | 17,206 rigid | 6,880,804 lossy |
+| step rate | 7.71 kHz | 154.15 kHz |
+| steps | 15,416 | 77,078 |
+| walls | rigid | plasterboard |
+
+**It costs what the air grid said it would.**
+The interior update runs at 94% of its own two-level stream and the frequency-dependent boundary at 101% of its own, for **34.4 ps a node-step** — against the 34 ps the bare air grid measures at this size, and the FCC church's 46.9.
+That is the surface-against-volume argument arriving: 6.88M boundary nodes of 615M is 1.1% where the church is 6.3%, so the boundary pass is 16% of a step here against the church's 28.5%.
+Nothing about the solver needed changing to run it — it loaded, allocated and stepped at the predicted rate first try, and 615M nodes is well inside the 2.1G the 32-bit node indexing allows.
+
+**It decays like a room, measured in the bands where the record carries signal.**
+Octave-band T20 falls from **1.08 s at 250 Hz to 0.48 s at 16 kHz**, which is air absorption taking the top of the band down with it.
+Broadband T20 is *not* a quantity to read on this scene, for a reason worth stating carefully below.
+
+**And it is genuinely full-bandwidth**, which the pair makes visible.
+Against each record's own peak, at octave centres:
+
+| | 1 kHz | 4 kHz | 8 kHz | 16 kHz | 20 kHz |
+|---|---|---|---|---|---|
+| RoomShoeboxFcc | −25.7 dB | −27.1 dB | −129.9 dB | −155.6 dB | — |
+| RoomShoeboxFccFull | −33.4 dB | −29.5 dB | −32.4 dB | −45.5 dB | −51.0 dB |
+
+The validation scene falls off a cliff above its own fmax because that is where its grid stops carrying anything.
+The full-bandwidth one rolls off smoothly from 4 kHz, which is air absorption and the wall, and still has content at 20 kHz.
+
+**It agrees with the reference engine above its own noise floor, and nowhere below it.**
+The scene was sized so a CUDA golden stays reachable — 4.92 GB of state against a rented 4090's 24 GB — and `gen/room/RoomShoeboxFccFull/cuda_fp32.bin` is that run.
+There is no fp64 truth here and there will not be, since a CPU engine at 615M nodes is not a laptop job, so **the per-sample SNR every other scene is scored by has no floor to be judged against**.
+It reads 33.4 dB overall; that number means nothing on its own here and the sections below are what carry the result.
+
+Where the record carries signal the two engines agree closely, in level and in decay alike.
+The band that holds in is not chosen by eye: it is where the difference between the two engines falls below the signal, which is measured independently of any decay.
+Every octave is listed, the two that fail included, because that ratio predicts which ones do.
+
+| octave | 63 Hz | 125 Hz | 250 Hz | 500 Hz | 1 kHz | 2 kHz | 4 kHz | 8 kHz | 16 kHz |
+|---|---|---|---|---|---|---|---|---|---|
+| engine difference vs signal | **+4.7 dB** | **+1.7 dB** | −5.2 dB | −12.0 dB | −18.3 dB | −24.7 dB | −30.6 dB | −36.4 dB | −42.9 dB |
+| band T20, reference | 1.217 s | 1.203 s | 1.080 s | 0.955 s | 0.834 s | 0.878 s | 0.976 s | 0.855 s | 0.476 s |
+| band T20, ours | 1.296 s | 1.280 s | 1.081 s | 0.974 s | 0.838 s | 0.879 s | 0.976 s | 0.855 s | 0.476 s |
+| band T20 difference | **+0.079** | **+0.077** | +0.001 | +0.019 | +0.004 | +0.001 | +0.000 | −0.000 | +0.000 |
+
+**The two bands that disagree are exactly the two where the difference exceeds the signal**, and the transition between 125 Hz and 250 Hz is where that ratio crosses zero.
+Band levels agree on the same schedule: +0.08 dB at 500 Hz and 0.002 dB or better above 2 kHz.
+
+Peaks agree to four figures (0.036276 against 0.036279), and the raw receiver energy agrees to **0.006 dB in every 32 ms block across the whole record**.
+
+**Below about 250 Hz neither engine is computing signal, and that is a property of the configuration rather than of either implementation.**
+The source is differentiated — PFFDTD's fp32 engines refuse an undifferentiated one — which tilts the raw spectrum up by f, so the raw record at 60–125 Hz sits **128–135 dB below its own peak**, at or under the noise floor 77,078 steps of single precision accumulate.
+The difference between the two engines there is *larger than the signal itself*, and it falls away monotonically as the signal climbs out of the floor: **−5 dB at 250 Hz, −12 at 500, −18 at 1 kHz, −31 at 4 kHz, −43 at 16 kHz**.
+The post-processing integrator then tilts the spectrum back by 1/f, which puts that noise into the low end of the derived impulse response and therefore into any broadband decay measure — which is why **broadband T20, centre time and clarity are not validated quantities on this scene** and the octave bands above are.
+Nothing here is avoidable at this configuration: fp64 is out of reach at 615M nodes, and an undifferentiated source is not on offer.
+
+This solver is consistently the *louder* of the two down there — +2.4 dB of level and +0.078 s of band T20 at 63 and 125 Hz, the same sign on all five receivers — and a same-sign difference is deterministic rather than stochastic, so it is worth saying where it most likely comes from.
+**The full-bandwidth scene can only be compared against `cuda_fp32`, and that is the reference engine which stands furthest from the others.**
+On the FCC church, where all four sets exist, this solver scores **104.2 dB against `cpu_fp32`** — the identity-equivalent floor — and 49.96 dB against the fp64 truth, which is `cpu_fp32`'s own 49.96 to the decimal.
+Its distance from `cuda_fp32` is 60.27 dB, and `cpu_fp32`'s distance from `cuda_fp32` is **60.27 dB as well**.
+This solver sits on top of the reference's CPU engine, and both sit the same distance from its CUDA engine.
+So a systematic departure from `cuda_fp32` at 615M nodes is most likely `cuda_fp32`'s, and the reference's own CPU engine would show it too — which cannot be checked here, because a CPU engine at that size is not a laptop job.
+
+**The WAVs inherit this.** `gen/wav/room/RoomShoeboxFccFull/` carries 125 Hz at 51 dB below its peak, which is an audible level for content that is not reproducible — the two engines differ there by more than the signal itself.
+Read and listen to those records from about 250 Hz up; their low end is a number, not a room.
+
+The scheme's own evidence at this spacing stays the analytic ladder, which is grid-independent and unchanged.
+The scene is deliberately **not** in `script/ValidateRoom`: the gate's scenes are `GOLDEN_FLOORS`, and an hour-long render is not a gate.
+
+**On speed, the reference wins this comparison, and it is not a comparison of the two implementations.**
+Its CUDA engine renders the scene in **946 s** on the 4090 — 724.6 s of air update at 65,465 Mvox/s and 219.6 s of boundary at 2,415 — where this solver's measured passes on the same scene come to 25.0 ms a step, or 1,927 s, at 29,321 and 1,725 Mvox/s.
+The 4090 carries roughly two and a half times this machine's memory bandwidth and the scheme is a stream, so a wall-clock ratio of about two says more about the two cards than the two codebases.
+What *is* comparable is what each does per step, and it is in the other direction: **three dispatches here against the reference's eleven passes over whole grids**, and an interior update that holds 94% of its own machine's two-level stream.
 
 ## Rendering
 

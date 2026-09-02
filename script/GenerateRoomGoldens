@@ -28,6 +28,7 @@ Overridable by environment:
 """
 
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pffdtd_env import (
     GEN_DIR,
     PFFDTD_DIR,
+    SCENES_DIR,
     SIM_DIR,
     collect_receivers,
     ensure_venv,
@@ -72,9 +74,21 @@ def main():
     def pull(source, destination):
         subprocess.run(["rsync", "-az", "-e", rsync_rsh, f"{host}:{source}", destination], check=True)
 
-    scenes = os.environ.get("SCENES", "").split() or sorted(
-        os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(SIM_DIR, "*", "vox_out.h5"))
-    )
+    scenes = os.environ.get("SCENES", "").split()
+    if not scenes:
+        # Production scenes require SCENES because remote generation is costly.
+        found = sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(SIM_DIR, "*", "vox_out.h5")))
+        held = []
+        for name in found:
+            config_path = os.path.join(SCENES_DIR, name, "config.json")
+            nodes = 0
+            if os.path.isfile(config_path):
+                with open(config_path) as f:
+                    grid = json.load(f)["grid"]
+                nodes = grid["Nx"] * grid["Ny"] * grid["Nz"]
+            (held if nodes > 200_000_000 else scenes).append(name)
+        if held:
+            print(f"==> Held back as production-scale: {' '.join(held)}  (name them in SCENES to include)")
     if not scenes:
         sys.exit(f"no voxelized scenes under {SIM_DIR} — run script/ConvertRoomScene first")
     print(f"==> Scenes: {' '.join(scenes)}")

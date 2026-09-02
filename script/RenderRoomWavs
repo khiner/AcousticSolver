@@ -78,11 +78,10 @@ def integrate_and_lowcut(x, rate):
 
 
 def resample(x, rate):
-    """Polyphase resample to RATE. The grid's rate is irrational, so the ratio is the
-    nearest one a denominator of 4096 can name — 6.5e-9 out, which is nothing at all."""
+    """Polyphase resample to RATE with enough denominator range for the 20 kHz scene."""
     if rate == RATE:
         return x
-    ratio = Fraction(RATE / rate).limit_denominator(4096)
+    ratio = Fraction(RATE / rate).limit_denominator(16384)
     if abs(float(ratio) - RATE / rate) > 1e-6 * RATE / rate:
         raise RuntimeError(f"no close rational for {RATE} / {rate}")
     return resample_poly(x, ratio.numerator, ratio.denominator, axis=-1)

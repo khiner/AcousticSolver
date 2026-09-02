@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build the room-acoustics scenes: PFFDTD voxelizer output converted into Scenes/Room<Name>/.
 
-    script/ConvertRoomScene              # every scene (skips ones already built)
+    script/ConvertRoomScene              # the validation scenes (skips ones already built)
     script/ConvertRoomScene RoomShoebox  # just these
     script/ConvertRoomScene --list       # what the scenes are, and their sizes
+    script/ConvertRoomScene RoomShoeboxFccFull   # production-scale ones are built when named
     script/ConvertRoomScene --force      # re-voxelize and re-convert
     script/ConvertRoomScene --convert    # re-convert from existing voxelizer output
 
@@ -132,18 +133,20 @@ SCENES = {
         "duration": 1.0,
         "materials": CTK_MATERIALS,
     },
-    # The one production-resolution scene: RoomShoeboxFcc's own room, unchanged, at exactly
-    # twenty times its bandwidth. Twenty times the cells against a twentieth of the spacing is
-    # the same box to the millimetre, so the pair is one room at 1 kHz and at 20 kHz and every
-    # number that moves between them is bandwidth rather than geometry.
-    #
-    # Its walls carry a material where the validation shoeboxes are rigid, because a rigid box
-    # never decays and this is the scene meant to be listened to. Half a second is far longer
-    # than a 13 m3 room with plasterboard walls rings for.
-    #
-    # 616M nodes and 4.9 GB of two-level state: it fits this machine with room to spare, and it
-    # fits a rented 4090's 24 GB, which is what keeps a CUDA golden reachable at this size.
+    # Same church as RoomChurchFcc at the explicit path's 32-bit indexing limit.
+    "RoomChurchFcc5k": {
+        "production": True,
+        "fcc": True,
+        "model": "CTK_Church",
+        "source_num": 1,
+        "fmax": 5000.0,
+        "PPW": 7.7,
+        "duration": 1.0,
+        "materials": CTK_MATERIALS,
+    },
+    # RoomShoeboxFcc geometry at 20x bandwidth, with lossy walls for an audible decay.
     "RoomShoeboxFccFull": {
+        "production": True,
         "fcc": True,
         "shoebox_cells": (1340, 1040, 860),
         "fmax": 20000.0,
@@ -384,10 +387,16 @@ def main():
     parser.add_argument("--convert", action="store_true", help="skip voxelization, re-convert only")
     args = parser.parse_args()
 
-    names = args.scenes or list(SCENES)
+    names = args.scenes
     for name in names:
         if name not in SCENES:
             sys.exit(f"unknown scene: {name} (have {', '.join(SCENES)})")
+    if not names:
+        # Production scenes require an explicit name because they are expensive to voxelize.
+        names = [n for n, sc in SCENES.items() if not sc.get("production")]
+        held = [n for n in SCENES if n not in names]
+        if held:
+            print(f"held back as production-scale: {' '.join(held)}  (name them to build)")
 
     if args.list:
         for name in names:

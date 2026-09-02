@@ -54,7 +54,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <numbers>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1158,26 +1160,41 @@ void ImplicitBoxCourantRung(const ImplicitScheme &scheme, int nx, int ny, int nz
         box.Prev.Upload(seed.data(), seed.size() * sizeof(float));
         box.Cur.Upload(seed.data(), seed.size() * sizeof(float));
 
-        // The envelope, not a threshold: an energy-conserving scheme holds max|u| flat, so what
-        // says stable is the last tenth of the run reading like the first tenth. A peak alone
-        // cannot separate growth from the interference a noise seed makes on its own.
-        const auto envelope = [&](int from, int to) {
-            double m = 0.;
-            for (int i = from; i < to; ++i) {
-                box.Step();
-                if ((i + 1) % 250 && i + 1 != to) continue; // the readback synchronises, so sample it
-                const float *u = box.Cur.As<float>();
-                for (size_t j = 0; j < box.Nodes; j += 97) m = std::max(m, std::abs(double(u[j])));
+        // A growth *rate*, not a verdict on one soak length. An unstable wall here grows slowly
+        // enough that a short run reads clean — at the published Courant number mode (0,1,1) is
+        // still within 4% of exact after 20,000 steps and reaches 1e6 by 80,000 — so asking
+        // "did the envelope move" mostly measures how long the run was. Fitting log(envelope)
+        // against step index gives a number that means the same thing at any soak length, and
+        // that a short run reports as small and positive rather than as stable.
+        std::vector<double> logs, at;
+        double m = 0.;
+        for (int i = 0; i < soak; ++i) {
+            box.Step();
+            if ((i + 1) % 250) continue; // the readback synchronises, so sample it
+            const float *u = box.Cur.As<float>();
+            for (size_t j = 0; j < box.Nodes; j += 97) m = std::max(m, std::abs(double(u[j])));
+            if (!(m > 0.) || !std::isfinite(m)) break;
+            logs.push_back(std::log(m));
+            at.push_back(double(i + 1));
+            m = 0.;
+        }
+        double rate = std::numeric_limits<double>::infinity(); // a run that left the floats behind
+        if (logs.size() >= 4) {
+            const double count = double(logs.size());
+            const double sx = std::accumulate(at.begin(), at.end(), 0.), sy = std::accumulate(logs.begin(), logs.end(), 0.);
+            double sxx = 0., sxy = 0.;
+            for (size_t j = 0; j < logs.size(); ++j) {
+                sxx += at[j] * at[j];
+                sxy += at[j] * logs[j];
             }
-            return m;
-        };
-        const double early = envelope(0, soak / 10);
-        envelope(soak / 10, soak - soak / 10);
-        const double late = envelope(soak - soak / 10, soak);
-        const double growth = late / early;
-        const bool held = growth < 1.05 && std::isfinite(growth);
+            rate = (count * sxy - sx * sy) / (count * sxx - sx * sx);
+        }
+        // dB per thousand steps, which is the scale a room render is judged at: over the
+        // full-bandwidth scene's 77,078 steps +0.01 becomes +0.8 dB and +0.5 becomes 385.
+        const double db_per_k = 1000. * rate * 20. / std::numbers::ln10;
+        const bool held = db_per_k < 0.01;
         if (held && lambda > best) best = lambda;
-        std::printf("  lambda %.4f (%.0f%% of free space)  envelope %.4g -> %.4g, x%-10.4g  %s\n", lambda, 100. * scale, early, late, growth, held ? "holds" : "GROWS");
+        std::printf("  lambda %.4f (%.0f%% of free space)  growth %+8.4f dB per 1000 steps  %s\n", lambda, 100. * scale, db_per_k, held ? "holds" : "GROWS");
     }
     if (best > 0.) std::printf("  largest holding: lambda %.4f, %.0f%% of the free-space limit | %.1fs\n", best, 100. * best / free_limit, Now() - t0);
     else std::printf("  nothing held: the image is unstable at every Courant number tried | %.1fs\n", Now() - t0);
@@ -1329,7 +1346,7 @@ int main(int argc, char **argv) {
         // from the 2.68 points per wavelength measured above at 700 Hz. The second is large
         // enough to be served by DRAM rather than cache, where a full-bandwidth room sits.
         ImplicitModeRung(Implicit1Pct, 40, 33, 28, count == 16 ? 16 : count, steps ? steps : 20000);
-        ImplicitBoxCourantRung(Implicit1Pct, 40, 33, 28, steps ? steps : 20000);
+        ImplicitBoxCourantRung(Implicit1Pct, 40, 33, 28, steps ? steps : 40000);
         ImplicitCostRung(Implicit1Pct, 116, 76, 41, repeat == 4 ? 200 : repeat);
         ImplicitCostRung(Implicit1Pct, 384, 384, 384, repeat == 4 ? 20 : repeat);
     }

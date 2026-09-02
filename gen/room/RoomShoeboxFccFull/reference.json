@@ -1,0 +1,9 @@
+{
+  "srate": 154154.15415415418,
+  "pffdtd": "aa319f6",
+  "cuda_fp32": {
+    "receivers": 5,
+    "samples": 77078,
+    "host": "root@213.173.102.171"
+  }
+}

@@ -352,7 +352,7 @@ private:
                 k = NextTicket++;
                 EnsureGenerated(k + 2); // Peek at the successor for the chained derivation
                 interval = &Pending.at(k); // Map nodes are stable across later inserts/erases
-                if (auto it = Pending.find(k + 1); it != Pending.end()) next = &it->second;
+                if (const auto it = Pending.find(k + 1); it != Pending.end()) next = &it->second;
             }
             const auto busy_start = std::chrono::steady_clock::now();
             const int n = int(interval->Coupled.size());
@@ -443,7 +443,7 @@ private:
             Cv.notify_all();
             return false;
         }
-        auto node = Ready.extract(k);
+        auto node = Ready.extract(k); // NOLINT(misc-const-correctness): mapped values are moved out
         i1 = std::move(node.mapped().I1);
         i2 = std::move(node.mapped().I2);
         InFlightBytes -= 2 * sizeof(float) * it->second.Coupled.size() * it->second.Coupled.size();

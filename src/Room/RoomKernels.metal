@@ -10,9 +10,9 @@
 //
 //   RoomAir       u0 = A1*u1 - u0 + A2*sum(neighbours) over the interior box, restricted at a
 //                 boundary node to the neighbours its adjacency mask keeps, and followed at
-//                 the absorbing shell by the Engquist-Majda loss
-//   RoomRigidFcc  the boundary nodes, on the FCC grid only, where a twelve-bit mask is too
-//                 wide to ride beside every node
+//                 the absorbing shell by the Engquist-Majda loss. RoomAirFcc is the same on
+//                 the FCC stencil, where a twelve-bit mask is too wide to ride beside every
+//                 node and a block rank reaches the packed list instead
 //   RoomLossy     the boundary nodes that carry a material: the rigid value just written is
 //                 corrected by the wall's frequency-dependent impedance, and each node's LRC
 //                 branch state advances
@@ -30,8 +30,9 @@
 //     the interior update subtracts, so one kernel keeps it in a register and no array of it
 //     is needed. Which nodes are on the shell, and the Q that sets how hard they absorb, come
 //     out of the position (see RoomShellQ).
-//   - the rigid boundary pass, on the Cartesian grid only, behind a grid-wide adjacency array
-//     that is all ones off the boundary. See RoomAirFcc for why the FCC scheme keeps its own.
+//   - the rigid boundary pass, behind a grid-wide adjacency array that is all ones off the
+//     boundary on the Cartesian grid, and behind a block rank into the packed list on the FCC
+//     one, where twelve adjacency bits a node are too many to keep grid-wide. See RoomAirFcc.
 //
 // The FCC scheme steps the face-centred-cubic sublattice of the same Cartesian grid — the
 // nodes whose index sum is even — where the twelve nearest neighbours are the face diagonals
@@ -148,55 +149,86 @@ kernel void RoomAir(device float *u0, device const float *u1, device const uchar
 // of A1 = 2 - 12*Sl2 with A2 = l^2/4, summed in the reference's own order, which is the order
 // the goldens carry.
 //
-// The boundary pass stays separate here, where the Cartesian one is folded in, and that is a
-// measurement. Twelve neighbours do not fit in a byte, so a grid-wide FCC adjacency array
-// costs a whole extra byte a node where the Cartesian one costs seven eighths, and an FCC grid
-// holds a fifth of the nodes at the same bandwidth, so its levels stream at 695 GB/s against
-// the Cartesian church's 402 and a second reading of them is that much cheaper to repeat.
-// Fusing it measured 1.069x on the FCC church against 0.884x on the Cartesian one.
-kernel void RoomAirFcc(device float *u0, device const float *u1, device const uchar *bn_mask,
-                       constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
+// The rigid boundary is folded in here as it is on the Cartesian grid, but it cannot reach its
+// adjacency the same way: twelve neighbours do not fit in a byte, so a grid-wide FCC array
+// would cost two bytes a node against the Cartesian one's seven eighths of one, and on a grid
+// whose levels stream at 658 GB/s that is more traffic than a second pass over the boundary
+// nodes costs. Fusing it that way measured 1.069x, slower.
+//
+// What the fold needs instead is the packed list's row for a node, from the node's position
+// alone. RoomBnBlockEntry is that: one occupancy word and one running count a block of 32
+// nodes, so the row is the block's count plus the occupied nodes below this one in the block,
+// and the whole lookup is a quarter of a byte a node rather than two. A node off the boundary
+// pays one broadcast load a block for it and nothing else.
+kernel void RoomAirFcc(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks,
+                       device const ushort *adj_bn, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= g.Nx - 1 || iy >= g.Ny - 1 || iz >= g.Nz - 1) return;
     const int3 pos = int3(ix, iy, iz), n = int3(g.Nx, g.Ny, g.Nz);
     const int nzny = g.Nz * g.Ny;
     const int ii = ix * nzny + iy * g.Nz + iz;
     const int q = RoomShellQ(pos, n, true);
-    const bool boundary = ((bn_mask[ii >> 3] >> (ii & 7)) & 1) != 0;
-    if (boundary && q == 0) return; // RoomRigidFcc's node, and off the shell there is nothing to do
-
     const float previous = u0[ii];
-    float partial = previous;
-    if (!boundary) {
-        int step[RoomNumNeighbours], off[RoomFccNeighbours];
-        RoomAxisSteps(pos, n, g.Nz, nzny, true, step);
-        RoomFccOffsets(step, off);
-        partial = g.A1 * u1[ii] - previous;
-        for (int bit = 0; bit < RoomFccNeighbours; ++bit) partial += g.A2 * u1[ii + off[bit]];
-    }
-    u0[ii] = RoomAbsorb(partial, previous, g.L, q);
-}
 
-// The FCC boundary pass: the same stencil restricted to the neighbours the node's adjacency
-// mask keeps, with the diagonal scaled by that count. It reads the u0 RoomAirFcc left, which
-// at a shell node is already the absorbed one.
-kernel void RoomRigidFcc(device float *u0, device const float *u1, device const ushort *adj_bn,
-                         device const int *bn_ixyz, constant RoomGridParams &g, uint nb [[thread_position_in_grid]]) {
-    if (int(nb) >= g.Nb) return;
-    const int ii = bn_ixyz[nb];
-    const uint adj = adj_bn[nb];
-    const int nzny = g.Nz * g.Ny;
-    const int3 pos = int3(ii / nzny, (ii / g.Nz) % g.Ny, ii % g.Nz), n = int3(g.Nx, g.Ny, g.Nz);
+    const RoomBnBlockEntry block = bn_blocks[ii / RoomBnBlock];
+    const uint slot = uint(ii % RoomBnBlock);
+
     int step[RoomNumNeighbours], off[RoomFccNeighbours];
     RoomAxisSteps(pos, n, g.Nz, nzny, true, step);
     RoomFccOffsets(step, off);
-
+    if (((block.Occupied >> slot) & 1u) == 0) {
+        float partial = g.A1 * u1[ii] - previous;
+        for (int bit = 0; bit < RoomFccNeighbours; ++bit) partial += g.A2 * u1[ii + off[bit]];
+        u0[ii] = RoomAbsorb(partial, previous, g.L, q);
+        return;
+    }
+    // A boundary node's update is the interior one with the neighbours its mask drops removed
+    // from both the sum and the diagonal, over the level the shell has already absorbed.
+    const uint adj = adj_bn[block.Rank + popcount(block.Occupied & ((1u << slot) - 1u))];
     const float b1 = 2.f - g.Sl2 * float(popcount(adj));
-    float partial = b1 * u1[ii] - u0[ii];
+    float partial = b1 * u1[ii] - RoomAbsorb(previous, previous, g.L, q);
     for (int bit = 0; bit < RoomFccNeighbours; ++bit) {
         partial += g.A2 * float((adj >> bit) & 1) * u1[ii + off[bit]];
     }
     u0[ii] = partial;
+}
+
+// The frequency-dependent boundary's traffic with none of its work, and the reason it needs
+// its own ceiling rather than being read against RoomStream's: this pass is a gather and a
+// scatter over a scattered subset of nodes, across eight streams instead of two, so a dense
+// two-level stream is not a roof it could ever reach. What it moves a lossy node is the node's
+// own scalars, a read-modify-write of u0 at a grid index, and the LRC state of every branch
+// its material carries — which is 176 of those bytes at the eleven branches every scene here
+// uses. Same nodes, same buffers, same trip count, same threadgroup shape.
+//
+// Like RoomStream it destroys what it touches. See RoomGpu::LossyRoofline.
+kernel void RoomLossyStream(device float *u0, device float *u0b, device const float *u2b,
+                            device float *vh1, device float *gh1, device const int *bnl_ixyz,
+                            device const float *ssaf_bnl, device const char *mat_bnl,
+                            device const int *mat_mb, constant RoomGridParams &g,
+                            uint nb [[thread_position_in_grid]]) {
+    if (int(nb) >= g.Nbl) return;
+    const int k = int(mat_bnl[nb]);
+    const int ii = bnl_ixyz[nb];
+    float acc = ssaf_bnl[nb] + u2b[nb] + u0[ii];
+    const int mb = mat_mb[k];
+    // Two loops over the branches, loading into registers and storing back, because that is
+    // the shape the real pass has — one loop doing both would serialise each load against the
+    // store before it and measure a dependency the pass does not carry.
+    float vint[RoomMaxBranches], gint[RoomMaxBranches];
+    for (int m = 0; m < mb; ++m) {
+        const int nbm = m * g.Nbl + int(nb);
+        vint[m] = vh1[nbm];
+        gint[m] = gh1[nbm];
+        acc += vint[m] + gint[m];
+    }
+    for (int m = 0; m < mb; ++m) {
+        const int nbm = m * g.Nbl + int(nb);
+        vh1[nbm] = acc + vint[m];
+        gh1[nbm] = acc + gint[m];
+    }
+    u0[ii] = acc;
+    u0b[nb] = acc;
 }
 
 // The interior update's traffic with none of its work: one read of the previous level and a

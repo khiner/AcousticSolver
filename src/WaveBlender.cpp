@@ -37,9 +37,9 @@ WaveBlender::WaveBlender(const SimParams &params)
     // Wide-x threadgroup tiles win on large grids, square ones on small (partial rows).
     FdtdTg = Params.Nx >= 88 ? Dim3{FdtdTgXWide, FdtdTgYWide, FdtdTgZWide} : Dim3{FdtdTgXSmall, FdtdTgYSmall, FdtdTgZSmall};
     FdtdTiles = {
-        uint32_t(Params.Nx + FdtdTg.x - 1) / FdtdTg.x,
-        uint32_t(Params.Ny + FdtdTg.y - 1) / FdtdTg.y,
-        uint32_t(Params.Nz + FdtdTg.z - 1) / FdtdTg.z,
+        (Params.Nx + FdtdTg.x - 1) / FdtdTg.x,
+        (Params.Ny + FdtdTg.y - 1) / FdtdTg.y,
+        (Params.Nz + FdtdTg.z - 1) / FdtdTg.z,
     };
 
     for (auto *field : {&P, &Vx, &Vy, &Vz}) { // both ping-pong slots
@@ -918,7 +918,7 @@ void WaveBlender::SolveFreshCells() {
 
     std::vector<double> residuals(FreshSolves.size(), 0.);
     ParallelFor(FreshSolves.size(), 1, [&](size_t c) {
-        auto &solve = FreshSolves[c];
+        const auto &solve = FreshSolves[c];
         const auto &cells = solve.Cells;
         const int (&counts)[3] = solve.Counts;
         const std::vector<int>(&faces)[3] = solve.Faces;
@@ -989,9 +989,9 @@ void WaveBlender::RunFdtd() {
     const MTL::Size fdtd_threads{FdtdTg.x, FdtdTg.y, FdtdTg.z};
     const MTL::Size fdtd_blocks{FdtdTiles.x, FdtdTiles.y, FdtdTiles.z};
 
-    auto *pressure_pso = ctx.Pipeline("StepPressure");
-    auto *fused_pso = ctx.Pipeline("StepVelocityPressure", FoldApply);
-    auto *velocity_pso = ctx.Pipeline("StepVelocity");
+    const auto *pressure_pso = ctx.Pipeline("StepPressure");
+    const auto *fused_pso = ctx.Pipeline("StepVelocityPressure", FoldApply);
+    const auto *velocity_pso = ctx.Pipeline("StepVelocity");
     auto *shader_pso = NShaderPoints > 0 ? ctx.Pipeline("ApplyShader") : nullptr;
 
     ListenerOut.Flip(); // this batch's samples fill the spare slot (see WritePendingListeners)

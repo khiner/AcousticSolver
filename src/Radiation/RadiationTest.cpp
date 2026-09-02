@@ -745,7 +745,7 @@ void RunMoving(int res, double speed, int epoch_steps, double total_time, int r1
 
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char *const *argv) {
     bool self_test = false, v1 = false, v2 = false, full = false, check_sets = false, stability = false, quad3 = false,
          filter = true;
     int res = 30, subdiv = 2, r1 = 2, r2 = 3;

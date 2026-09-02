@@ -94,16 +94,15 @@ struct RoomGpu {
     const std::vector<KernelTimes> &Timings() const { return KernelTiming; }
     static void ReportTimings(const std::vector<KernelTimes> &);
 
-    // GPU seconds a dispatch of the interior update takes, beside the same for a plain
-    // two-level stream over the same box. Both move `Bytes` a node-step, so the update's share
-    // of the stream is what says whether the step is bandwidth-bound.
-    //
-    // Overwrites the state, so it is the last thing a run does.
+    // Destructive update-versus-stream roofline measurement.
     struct Bandwidth {
         double Update, Stream; // seconds a dispatch
         double Bytes; // per dispatch, the traffic neither can avoid
     };
     Bandwidth Roofline(int reps);
+
+    // Measures the scattered boundary pass against a matching eight-stream ceiling.
+    Bandwidth LossyRoofline(int reps);
 
 private:
     RoomGridParams GP{};
@@ -114,10 +113,8 @@ private:
     GpuBuffer U[2];
     int I0{0}, I1{1};
 
-    // The Cartesian scheme keeps the adjacency mask of every node in BnMask and updates its
-    // boundary nodes in the interior pass. The FCC scheme keeps one bit a node there and a
-    // packed list beside it. See RoomGpu::Init.
-    GpuBuffer BnMask, BnIxyz, AdjBn;
+    // Cartesian masks are grid-wide; FCC masks are packed and reached through block rank.
+    GpuBuffer BnMask, AdjBn;
     GpuBuffer InIxyz, InSigs;
     GpuBuffer OutIxyz, Out;
     GpuBuffer Params, EnergyOut;
@@ -128,9 +125,10 @@ private:
     GpuBuffer Ub[3], Vh1, Gh1;
     int I0b{0}, I1b{1}, I2b{2};
 
-    MTL::ComputePipelineState *PsoAir{}, *PsoRigid{}, *PsoLossy{}, *PsoIo{}, *PsoEnergy{};
+    MTL::ComputePipelineState *PsoAir{}, *PsoLossy{}, *PsoIo{}, *PsoEnergy{};
 
     Dim3 AirTiles{}, AirThreads{};
+    double LossyBytes{0.};
     bool TimeKernels{false};
     std::vector<KernelTimes> KernelTiming;
 
@@ -138,8 +136,6 @@ private:
     // charges its GPU time to `name`.
     void Timed(int slot, const char *name, MTL::ComputePipelineState *, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice>, const void *params = nullptr, size_t params_size = 0);
 
-    // GPU seconds a dispatch of `pso` over the interior box takes, after a discarded warm-up
-    // round of the same length: the GPU's clock ramp reads the first rounds of any
-    // microbenchmark several times too slow.
-    double TimeInteriorPass(MTL::ComputePipelineState *, std::initializer_list<GpuSlice>, int reps);
+    // Discards one warm-up round to avoid GPU clock-ramp bias.
+    double TimePass(MTL::ComputePipelineState *, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice>, int reps);
 };

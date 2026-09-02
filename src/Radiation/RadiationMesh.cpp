@@ -101,9 +101,9 @@ RadiationMesh RadiationMesh::Icosphere(const Vector3d &center, double radius, in
 
     for (int level = 0; level < subdiv; ++level) {
         std::map<std::pair<int, int>, int> midpoints;
-        auto midpoint = [&](int a, int b) {
+        const auto midpoint = [&](int a, int b) {
             const auto key = std::minmax(a, b);
-            if (auto it = midpoints.find(key); it != midpoints.end()) return it->second;
+            if (const auto it = midpoints.find(key); it != midpoints.end()) return it->second;
             mesh.Vertices.push_back((mesh.Vertices[a] + mesh.Vertices[b]).normalized());
             const int idx = int(mesh.Vertices.size()) - 1;
             midpoints.emplace(key, idx);
@@ -335,7 +335,7 @@ struct EditMesh {
     bool Flip(int u, int v) {
         int f0 = -1, f1 = -1;
         if (!SharedFaces(u, v, f0, f1)) return false;
-        auto rotated = [&](int f, int first, int second) { // face starts at `first` with `second` next
+        const auto rotated = [&](int f, int first, int second) { // face starts at `first` with `second` next
             for (int i = 0; i < 3; ++i) {
                 if (F[f][i] == first && F[f][(i + 1) % 3] == second) return Eigen::Vector3i{F[f][i], F[f][(i + 1) % 3], F[f][(i + 2) % 3]};
             }
@@ -459,7 +459,7 @@ void RadiationMesh::Remesh(double target, double max_edge) {
 
     // A sweep can take every long edge it finds: a split only re-triangulates the two faces
     // on its own edge and never lengthens another.
-    auto split_pass = [&](double ceiling) {
+    const auto split_pass = [&](double ceiling) {
         for (int pass = 0; pass < 24; ++pass) {
             std::vector<std::pair<int, int>> longs;
             for_each_edge([&](int u, int v) {
@@ -472,10 +472,10 @@ void RadiationMesh::Remesh(double target, double max_edge) {
 
     // Shortest edges first, so the survivors spread out evenly. Stamps invalidate queue
     // entries whose endpoints have since moved or been removed.
-    auto collapse_pass = [&] {
+    const auto collapse_pass = [&] {
         stamp.assign(em.V.size(), 0);
         std::priority_queue<Cand> queue;
-        auto push_edge = [&](int u, int v) {
+        const auto push_edge = [&](int u, int v) {
             const double len = (em.V[u] - em.V[v]).norm();
             if (len >= collapse_at) return;
             queue.push({len, u, v, stamp[u], stamp[v]});
@@ -504,7 +504,7 @@ void RadiationMesh::Remesh(double target, double max_edge) {
         }
     };
 
-    auto flip_pass = [&] {
+    const auto flip_pass = [&] {
         std::vector<std::pair<int, int>> edges;
         for_each_edge([&](int u, int v) {
             if (u < v) edges.emplace_back(u, v);
@@ -528,7 +528,7 @@ void RadiationMesh::Remesh(double target, double max_edge) {
 
     // Tangential relaxation, then back onto the input surface: moving along the tangent
     // plane evens out the element sizes without drifting off the geometry.
-    auto smooth_pass = [&] {
+    const auto smooth_pass = [&] {
         std::vector<Vector3d> moved(em.V.size());
         std::vector<int> ring;
         for (size_t v = 0; v < em.V.size(); ++v) {

@@ -30,7 +30,7 @@ namespace {
 // seconds into a kernel's running total and ACOUSTIC_RAD_KERNEL_TIMES printed it as
 // 13,257 ms/step beside neighbours reading 0.01. Dropping the sample is right: it is one
 // dispatch of thousands, and an instrument that reported zero throughout would be obvious.
-double GpuSeconds(MTL::CommandBuffer *cb) {
+double GpuSeconds(const MTL::CommandBuffer *cb) {
     const double start = cb->GPUStartTime(), end = cb->GPUEndTime();
     return start > 0. && end > start ? end - start : 0.;
 }
@@ -77,7 +77,7 @@ namespace {
 // null. The two specializing libraries differ only in the constant's index and type.
 MTL::ComputePipelineState *MakePipeline(MTL::Device *device, MTL::Library *library, const char *name, const void *value = nullptr, MTL::DataType type = MTL::DataTypeNone, int fc_index = 0) {
     const profile::Scope scope{"startup/pipeline_create"};
-    auto *fn_name = NS::String::string(name, NS::UTF8StringEncoding);
+    const auto *fn_name = NS::String::string(name, NS::UTF8StringEncoding);
     MTL::Function *fn{nullptr};
     if (value) {
         auto *constants = MTL::FunctionConstantValues::alloc()->init();
@@ -103,7 +103,7 @@ MTL::ComputePipelineState *MetalContext::RadiationPipeline(const char *name, int
     // and the rest are the fixed-cost probe documented in RadiationParams.h. Keyed into the
     // cache, so one process can hold several levels and dispatch them side by side.
     const std::string key = std::string{"rad/"} + name + (floor_probe ? "#probe" + std::to_string(floor_probe) : "");
-    if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
     if (!RadiationLib) {
         const profile::Scope scope{"startup/msl_compile_radiation"};
         RadiationLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationParams.h") + ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationKernels.metal"));
@@ -113,7 +113,7 @@ MTL::ComputePipelineState *MetalContext::RadiationPipeline(const char *name, int
 
 MTL::ComputePipelineState *MetalContext::RoomPipeline(const char *name) {
     const std::string key = std::string{"room/"} + name;
-    if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
     if (!RoomLib) {
         const profile::Scope scope{"startup/msl_compile_room"};
         RoomLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_ROOM_MSL_DIR} + "/RoomParams.h") + ReadFile(std::string{ACOUSTIC_ROOM_MSL_DIR} + "/RoomKernels.metal"));
@@ -123,7 +123,7 @@ MTL::ComputePipelineState *MetalContext::RoomPipeline(const char *name) {
 
 MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool apply_faces) {
     const std::string key = apply_faces ? std::string{name} + "#faces" : std::string{name};
-    if (auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
     return Pipelines[key] = MakePipeline(Device, Library, name, &apply_faces, MTL::DataTypeBool, ApplyFacesFcIndex);
 }
 

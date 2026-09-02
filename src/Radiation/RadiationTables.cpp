@@ -334,7 +334,7 @@ void RadiationTables::Build(const RadiationGrid &grid, const CqmContour &contour
 
     BuildTimes().Mark("cell_weights");
     // Pass 3: resolve every stencil's pairs to entry indices.
-    auto resolve = [&](const std::vector<Pending> &pending, std::vector<RadRef> &out) {
+    const auto resolve = [&](const std::vector<Pending> &pending, std::vector<RadRef> &out) {
         out.resize(pending.size());
         ParallelFor(pending.size(), 4096, [&](size_t k) {
             const int entry = EntryOf(grid, pending[k].Cell, pending[k].Elem);

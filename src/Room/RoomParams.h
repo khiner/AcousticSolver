@@ -20,6 +20,20 @@ enum : int { RoomFccNeighbours = 12 };
 // node sets at most six of the eight bits, so all-ones is free to mean ordinary air.
 enum : int { RoomAirAdj = 0xFF };
 
+// Nodes a block of the FCC scheme's boundary lookup covers. A power of two, so a node's block
+// and its bit in that block are a shift and a mask.
+enum : int { RoomBnBlock = 32 };
+
+// One block of that lookup. Twelve adjacency bits do not fit in a byte, so the FCC scheme
+// cannot afford the Cartesian one's grid-wide array — it keeps the masks packed in boundary
+// order and reaches a node's row by rank: Occupied says which of the block's nodes are
+// boundary nodes, Rank counts the ones ahead of the block, and the bits below a node in
+// Occupied count the rest. Two words a block is 0.25 bytes a node against the two bytes a
+// grid-wide array of shorts would cost. See RoomAirFcc.
+struct RoomBnBlockEntry {
+    unsigned int Occupied, Rank;
+};
+
 // Branches a material's impedance may carry (the reference's MMb). Per-node LRC state is
 // allocated at this width whatever a scene uses.
 enum : int { RoomMaxBranches = 12 };
@@ -32,8 +46,7 @@ struct RoomMatQuad {
 // The node at (ix, iy, iz) lives at ix*Nz*Ny + iy*Nz + iz, so z is the contiguous axis.
 struct RoomGridParams {
     int Nx, Ny, Nz;
-    int Nb; // boundary nodes, rigid and lossy alike (FCC only, where they are a pass of their own)
-    int Nbl; // of those, the ones carrying a material: the frequency-dependent nodes
+    int Nbl; // boundary nodes carrying a material: the frequency-dependent ones
     int Ns; // source corners
     int Nr; // receiver corners
     int Nt; // steps in the run: the row stride of the source and receiver arrays

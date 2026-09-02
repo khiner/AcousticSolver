@@ -5,6 +5,7 @@
 #include <Metal/Metal.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -93,7 +94,6 @@ void RoomGpu::Init(const RoomScene &scene) {
     GP.Nx = scene.Nx;
     GP.Ny = scene.Ny;
     GP.Nz = scene.Nz;
-    GP.Nb = int(scene.BnIxyz.size());
     GP.Ns = scene.NumSources();
     GP.Nr = scene.NumOutputs();
     GP.Nt = scene.Nt;
@@ -117,25 +117,29 @@ void RoomGpu::Init(const RoomScene &scene) {
         buffer.Upload(values.data(), values.size() * sizeof(T));
     };
 
-    // How a boundary node reaches its adjacency mask, which is where the two schemes part: a
-    // grid-wide byte array on the Cartesian grid, one bit a node and a packed list on the FCC
-    // one. See RoomAirFcc in RoomKernels.metal.
+    // Cartesian masks are grid-wide; FCC masks are packed and reached through block rank.
     const int64_t nzny = int64_t(scene.Nz) * scene.Ny;
     const auto check_inside = [&](int ii) {
-        // The stencil mirrors a step that leaves the grid, which is only defined for a node of
-        // the interior box.
         const int64_t ix = ii / nzny, iy = (ii / scene.Nz) % scene.Ny, iz = ii % scene.Nz;
         if (ix < 1 || ix > scene.Nx - 2 || iy < 1 || iy > scene.Ny - 2 || iz < 1 || iz > scene.Nz - 2)
             throw std::runtime_error("A boundary node sits on the outer grid box, where the stencil has no mirror");
     };
     if (Fcc) {
-        std::vector<uint8_t> mask(size_t((nodes + 7) / 8), 0);
+        std::vector<RoomBnBlockEntry> blocks(size_t((nodes + RoomBnBlock - 1) / RoomBnBlock), RoomBnBlockEntry{});
+        int previous = -1;
         for (int const ii : scene.BnIxyz) {
             check_inside(ii);
-            mask[size_t(ii) >> 3] |= uint8_t(1u << (ii & 7));
+            // Block rank requires boundary nodes in grid order.
+            if (ii <= previous) throw std::runtime_error("FCC boundary nodes are not in ascending index order, which the block ranks the interior pass reads assume");
+            previous = ii;
+            blocks[size_t(ii) / RoomBnBlock].Occupied |= 1u << (ii % RoomBnBlock);
         }
-        upload(BnMask, mask);
-        upload(BnIxyz, scene.BnIxyz);
+        uint32_t rank = 0;
+        for (auto &block : blocks) {
+            block.Rank = rank;
+            rank += uint32_t(std::popcount(block.Occupied));
+        }
+        upload(BnMask, blocks);
         upload(AdjBn, scene.AdjBn);
     } else {
         const size_t node_count = size_t(nodes);
@@ -159,6 +163,9 @@ void RoomGpu::Init(const RoomScene &scene) {
     const auto lossy = RoomLossySubset(scene);
     const auto materials = RoomMaterialCoefficients(scene);
     GP.Nbl = int(lossy.Ixyz.size());
+    // Fixed fields move 25 bytes; each LRC branch reads and writes 16 more.
+    LossyBytes = 0.;
+    for (const int8_t m : lossy.Mat) LossyBytes += 25. + 16. * double(scene.MatBranches[size_t(m)]);
     upload(BnlIxyz, lossy.Ixyz);
     upload(SsafBnl, lossy.Ssaf);
     upload(MatBnl, lossy.Mat);
@@ -180,7 +187,6 @@ void RoomGpu::Init(const RoomScene &scene) {
     Params.Upload(&GP, sizeof GP);
 
     PsoAir = ctx.RoomPipeline(Fcc ? "RoomAirFcc" : "RoomAir");
-    if (Fcc) PsoRigid = ctx.RoomPipeline("RoomRigidFcc");
     PsoLossy = ctx.RoomPipeline("RoomLossy");
     PsoIo = ctx.RoomPipeline("RoomIo");
     PsoEnergy = ctx.RoomPipeline(Fcc ? "RoomEnergyFcc" : "RoomEnergy");
@@ -212,11 +218,11 @@ void RoomGpu::RunSteps(int n_steps) {
         if (StepN >= GP.Nt) throw std::runtime_error("Room step index ran past the scene's step count");
         const RoomStepParams step{StepN};
 
-        Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &Params});
-        if (Fcc) Timed(1, "rigid", PsoRigid, Blocks1d(GP.Nb), {Group, 1, 1}, {&U[I0], &U[I1], &AdjBn, &BnIxyz, &Params});
+        if (Fcc) Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &AdjBn, &Params});
+        else Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &Params});
         if (GP.Nbl > 0)
-            Timed(2, "lossy", PsoLossy, Blocks1d(GP.Nbl), {Group, 1, 1}, {&U[I0], &Ub[I0b], &Ub[I2b], &Vh1, &Gh1, &BnlIxyz, &SsafBnl, &MatBnl, &MatMb, &MatBeta, &MatQuads, &Params});
-        Timed(3, "io", PsoIo, Blocks1d(GP.Nr + GP.Ns), {Group, 1, 1}, {&U[I0], &Out, &U[I1], &OutIxyz, &InSigs, &InIxyz, &Params}, &step, sizeof step);
+            Timed(1, "lossy", PsoLossy, Blocks1d(GP.Nbl), {Group, 1, 1}, {&U[I0], &Ub[I0b], &Ub[I2b], &Vh1, &Gh1, &BnlIxyz, &SsafBnl, &MatBnl, &MatMb, &MatBeta, &MatQuads, &Params});
+        Timed(2, "io", PsoIo, Blocks1d(GP.Nr + GP.Ns), {Group, 1, 1}, {&U[I0], &Out, &U[I1], &OutIxyz, &InSigs, &InIxyz, &Params}, &step, sizeof step);
 
         std::swap(I0, I1); // u(n+1) becomes the current level, u(n) the one to overwrite
         // The boundary ring rotates the other way: what was just written becomes u1b, and the
@@ -234,11 +240,11 @@ void RoomGpu::Seed(const std::vector<float> &u) {
     const size_t bytes = u.size() * sizeof(float);
     if (bytes != size_t(GP.Nx) * GP.Ny * GP.Nz * sizeof(float)) throw std::runtime_error("Seed state is not one value a node");
     MetalContext::Get().Drain();
-    for (auto &level : U) level.Upload(u.data(), bytes);
+    for (const auto &level : U) level.Upload(u.data(), bytes);
     // At rest means at rest everywhere, walls included.
     Vh1.Zero(Vh1.Capacity());
     Gh1.Zero(Gh1.Capacity());
-    for (auto &b : Ub) b.Zero(b.Capacity());
+    for (const auto &b : Ub) b.Zero(b.Capacity());
 }
 
 double RoomGpu::Energy(int x0, int x1, int y0, int y1, int z0, int z1) {
@@ -260,10 +266,10 @@ double RoomGpu::Energy(int x0, int x1, int y0, int y1, int z0, int z1) {
     return total;
 }
 
-double RoomGpu::TimeInteriorPass(MTL::ComputePipelineState *pso, std::initializer_list<GpuSlice> buffers, int reps) {
+double RoomGpu::TimePass(MTL::ComputePipelineState *pso, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, int reps) {
     auto &ctx = MetalContext::Get();
     for (int round = 0; round < 2; ++round) {
-        for (int i = 0; i < reps; ++i) ctx.Dispatch(pso, AirTiles, AirThreads, buffers);
+        for (int i = 0; i < reps; ++i) ctx.Dispatch(pso, blocks, threads, buffers);
         ctx.Sync();
         if (round == 0) ctx.TakeBatchGpuSeconds(); // the clock is still ramping through this one
     }
@@ -273,7 +279,17 @@ double RoomGpu::TimeInteriorPass(MTL::ComputePipelineState *pso, std::initialize
 RoomGpu::Bandwidth RoomGpu::Roofline(int reps) {
     auto *stream = MetalContext::Get().RoomPipeline("RoomStream");
     const double nodes = double(int64_t(GP.Nx - 2) * (GP.Ny - 2) * (GP.Nz - 2));
-    return {TimeInteriorPass(PsoAir, {&U[I0], &U[I1], &BnMask, &Params}, reps), TimeInteriorPass(stream, {&U[I0], &U[I1], &Params}, reps), 12. * nodes};
+    const double update = Fcc ? TimePass(PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &AdjBn, &Params}, reps) : TimePass(PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &Params}, reps);
+    return {update, TimePass(stream, AirTiles, AirThreads, {&U[I0], &U[I1], &Params}, reps), 12. * nodes};
+}
+
+RoomGpu::Bandwidth RoomGpu::LossyRoofline(int reps) {
+    if (GP.Nbl == 0) return {0., 0., 0.};
+    auto &ctx = MetalContext::Get();
+    auto *stream = ctx.RoomPipeline("RoomLossyStream");
+    const Dim3 blocks = Blocks1d(GP.Nbl), threads{Group, 1, 1};
+    const double update = TimePass(PsoLossy, blocks, threads, {&U[I0], &Ub[I0b], &Ub[I2b], &Vh1, &Gh1, &BnlIxyz, &SsafBnl, &MatBnl, &MatMb, &MatBeta, &MatQuads, &Params}, reps);
+    return {update, TimePass(stream, blocks, threads, {&U[I0], &Ub[I0b], &Ub[I2b], &Vh1, &Gh1, &BnlIxyz, &SsafBnl, &MatBnl, &MatMb, &Params}, reps), LossyBytes};
 }
 
 void RoomGpu::ReportTimings(const std::vector<KernelTimes> &timings) {

@@ -1073,7 +1073,18 @@ void RooflineRung(const std::string &config_file, int reps) {
     const double gb = band.Bytes / 1e9;
     std::printf("[roofline] %s %s %d x %d x %d, %.2fM nodes, %.0f MB a pass\n", config_file.c_str(), scene.Fcc ? "FCC" : "cart", scene.Nx, scene.Ny, scene.Nz, double(scene.NumNodes()) / 1e6, 1e3 * gb);
     std::printf("  two-level stream  %8.4f ms  %6.0f GB/s\n", 1e3 * band.Stream, gb / band.Stream);
-    std::printf("  interior update   %8.4f ms  %6.0f GB/s  %.0f%% of the stream | %.1fs\n", 1e3 * band.Update, gb / band.Update, 100. * band.Stream / band.Update, Now() - t0);
+    std::printf("  interior update   %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * band.Update, gb / band.Update, 100. * band.Stream / band.Update);
+
+    // The boundary pass against its own ceiling, not the grid pass's: it gathers and scatters
+    // over a subset of the nodes across eight streams, and a dense stream is not its roof.
+    const auto lossy = gpu.LossyRoofline(reps);
+    if (lossy.Bytes > 0.) {
+        const double lgb = lossy.Bytes / 1e9;
+        std::printf("  lossy nodes       %d of %d boundary, %.0f MB a pass\n", int(std::count_if(scene.MatBn.begin(), scene.MatBn.end(), [](int8_t m) { return m >= 0; })), int(scene.BnIxyz.size()), 1e3 * lgb);
+        std::printf("  boundary stream   %8.4f ms  %6.0f GB/s\n", 1e3 * lossy.Stream, lgb / lossy.Stream);
+        std::printf("  boundary update   %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * lossy.Update, lgb / lossy.Update, 100. * lossy.Stream / lossy.Update);
+    }
+    std::printf("  | %.1fs\n", Now() - t0);
 }
 } // namespace
 

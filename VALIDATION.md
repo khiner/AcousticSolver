@@ -629,10 +629,12 @@ Identical is meant literally: scenes are that implementation's voxelizer output,
 The interior comes in two stencils, chosen per scene: the 7-point Cartesian one and the 13-point one on the face-centred-cubic sublattice.
 Both are validated the same way and against their own references, and the two are compared at equal output bandwidth at the end of this section.
 
-A step is three dispatches on the Cartesian grid and four on the FCC one — two and three where a room's walls are all rigid — where the reference engine's per-step body is ten passes over whole grids, or eleven on the FCC grid.
-What the passes did is not skipped, it is folded: the halo mirrors are read rather than written (a step that would leave the grid is a step back onto the opposite neighbour, composed one axis at a time — which is exactly what the three mirror passes left behind), the absorbing shell needs the level the interior update overwrote and that is the value the update already has in a register, which node is on the shell and how hard it absorbs come out of the node's position, and on the Cartesian grid the rigid boundary is the interior update with a node's missing neighbours dropped, so one byte of adjacency a node replaces a second streaming of both levels.
-The FCC grid keeps its boundary pass separate, because there twelve adjacency bits do not fit in a byte and its levels are small enough to be cheap to read twice — the measurement is under **What the step costs**.
-Every fold is exact: all five scenes render byte-identical across the change.
+A step is three dispatches on either grid — two where a room's walls are all rigid — where the reference engine's per-step body is ten passes over whole grids, or eleven on the FCC grid.
+What the passes did is not skipped, it is folded: the halo mirrors are read rather than written (a step that would leave the grid is a step back onto the opposite neighbour, composed one axis at a time — which is exactly what the three mirror passes left behind), the absorbing shell needs the level the interior update overwrote and that is the value the update already has in a register, which node is on the shell and how hard it absorbs come out of the node's position, and the rigid boundary is the interior update with a node's missing neighbours dropped, so a node's adjacency replaces a second streaming of both levels.
+How a node reaches that adjacency is where the two grids part.
+Six bits ride beside every Cartesian node for seven eighths of a byte each; twelve do not, and a grid-wide array of shorts at two bytes a node costs an FCC grid more than the second pass it would save, which is what an earlier attempt at the fold measured.
+So the FCC masks stay packed in boundary order and a node reaches its row by rank: one occupancy word and one running count per block of 32 nodes, a quarter of a byte a node, and the count of occupied nodes below it in its own block.
+Every fold is exact: all five scenes render byte-identical across both changes.
 
 ```
 build/RoomTest                         # the default ladder: modes, energy, tube, balance, golden
@@ -641,7 +643,7 @@ build/RoomTest --gate                  # every rung checked, nonzero exit on a m
 build/RoomTest --modes --count 24      # more eigenmodes
 build/RoomTest --tube --length 4000    # a longer impedance tube
 build/RoomTest --soak --steps 1000000  # a longer soak
-build/RoomTest --roofline --scene ../Scenes/RoomChurch/config.json   # bandwidth against a plain stream
+build/RoomTest --roofline --scene ../Scenes/RoomChurch/config.json   # both passes against their own plain streams
 build/RoomTest --implicit              # the Smits & Bilbao 2025 implicit scheme, measured against both
 build/RoomTest --golden --scene ../Scenes/RoomChurch/config.json --gen ../gen/room/RoomChurch
 script/ValidateRoom                    # the regression gate: the ladder, then all five scenes (~55s)
@@ -770,28 +772,44 @@ So the question a room solver's performance reduces to is what fraction of the m
 
 | scene | a pass moves | two-level stream | interior update | update / stream |
 |---|---|---|---|---|
-| RoomChurch | 247 MB | 404 GB/s | 373 GB/s | 92% |
-| RoomConcertHall | 675 MB | 409 GB/s | 376 GB/s | 92% |
-| RoomChurchFcc | 51 MB | 658 GB/s | 593 GB/s | 90% |
+| RoomChurch | 247 MB | 401 GB/s | 370 GB/s | 92% |
+| RoomConcertHall | 675 MB | 403 GB/s | 373 GB/s | 93% |
+| RoomChurchFcc | 51 MB | 670 GB/s | 461 GB/s | 69% |
+
+The frequency-dependent boundary gets a ceiling of its own from the same rung, because the grid pass's is not one it could ever reach: it gathers and scatters over a subset of the nodes across eight streams rather than two, and what it moves a lossy node is that node's own scalars, a read-modify-write of `u0` at a grid index, and the LRC velocity and integral of each of its material's branches — 176 of those ~201 bytes at the eleven branches every scene here uses.
+`RoomLossyStream` moves exactly those, over the same nodes, in the same two-loop shape, with none of the arithmetic.
+
+| scene | lossy nodes | a pass moves | boundary stream | boundary update | update / stream |
+|---|---|---|---|---|---|
+| RoomChurch | 496k of 949k | 100 MB | 286 GB/s | 287 GB/s | 100% |
+| RoomConcertHall | 1.45M of 2.54M | 292 MB | 307 GB/s | 307 GB/s | 100% |
+| RoomChurchFcc | 150k of 277k | 30 MB | 562 GB/s | 554 GB/s | 98% |
+
+**The boundary pass is at its own roof on every scene that has one**, which is the answer to the obvious question about it: 287 GB/s next to a grid pass's 370 looks like a shortfall and is not one.
+A scattered eight-stream pass simply does not reach a dense two-stream rate, and this one is within measurement of everything its access pattern allows.
 
 **The ceiling is a property of the footprint, not of the machine.**
-A stream over the church's 247 MB reaches 404 GB/s and over the hall's 675 MB reaches 409, while the FCC church's 51 MB reaches 658 — the smaller grid is partly served by cache, and a full-bandwidth room will sit at the 400 GB/s end whatever the scheme.
+A stream over the church's 247 MB reaches 401 GB/s and over the hall's 675 MB reaches 403, while the FCC church's 51 MB reaches 670 — the smaller grid is partly served by cache, and a full-bandwidth room will sit at the 400 GB/s end whatever the scheme.
 That is the number a step should be judged against, and it is roughly half of what the same machine gives a few-megabyte working set.
 
 The two shoeboxes are not on that table because at 6 MB and 1 MB a pass is latency-bound rather than bandwidth-bound: the stream itself measures 706 and 120 GB/s, the second of which is below what the real step achieves, because 200 back-to-back dispatches over 0.13M nodes are measuring dispatch cost and not the memory system.
 Their step cost is dispatch count, which is why they gained most when the step went from ten dispatches to two.
 
-Counting the bytes a step cannot avoid — the two levels, the byte of adjacency a node carries on the Cartesian grid or the bit it carries on the FCC one, and the impedance branches' own state at a lossy node — the church moves 372 MB a step and the hall 1031 MB, which against their measured times is **366 and 371 GB/s, or 91% of each grid's stream ceiling**.
-The FCC church moves 85 MB a step at 410 GB/s, 62% of its ceiling, and the difference is its separate boundary pass reading both levels a second time at the boundary nodes.
+Counting the bytes a step cannot avoid — the two levels, the adjacency a node carries (a byte on the Cartesian grid, a quarter of one plus the packed mask at a boundary node on the FCC grid), and the impedance branches' own state at a lossy node — the church moves 372 MB a step and the hall 1031 MB, which against their measured times is **366 and 371 GB/s, or 91% of each grid's stream ceiling**.
+The FCC church moves 86 MB a step at 437 GB/s, 64% of its ceiling.
+Where the two grids' steps go is worth putting side by side, because they are limited by different things.
+On the Cartesian church the two passes measured alone come to 0.667 and 0.348 ms against a 1.016 ms step: they account for it exactly, and both are at their own roofs, so that step is finished.
+On the FCC church they come to 0.110 and 0.055 ms against a 0.197 ms step, and the 0.03 ms that is in neither is the drain between dependent dispatches — the interior pass writes the `u0` the boundary pass then reads.
+That is why the FCC grid gained from going four dispatches to three and the Cartesian one did not: its dispatches are 6-17x shorter, so a fixed cost between them is a real share rather than noise.
+Its interior pass at 69% of stream is the other half, and that is the rigid boundary's twelve masked neighbour reads at 6.3% of the nodes, which is arithmetic and divergence rather than traffic.
 
 `ACOUSTIC_ROOM_KERNEL_TIMES=1` puts each dispatch in its own command buffer and times it, which is how a step is split between kernels.
-On the Cartesian church the serialized total comes to 1.024 ms/step against 1.016 uninstrumented, so the attribution is the real one; on the FCC church it comes to 0.784 against 0.207, because a command buffer's own fixed cost dominates a dispatch that short — those shares are directional only.
+On the Cartesian church the serialized total comes to 1.024 ms/step against 1.016 uninstrumented, so the attribution is the real one; on the FCC church it comes to 0.585 against 0.197, because a command buffer's own fixed cost dominates a dispatch that short — those shares are directional only.
 
 | kernel | RoomChurch | RoomChurchFcc |
 |---|---|---|
-| interior update, with the rigid boundary on the Cartesian grid | 68.0% | 59.1% |
-| frequency-dependent boundary | 31.7% | 28.5% |
-| rigid boundary, a pass of its own on the FCC grid | — | 10.9% |
+| interior update, with the rigid boundary folded in | 68.0% | 69.1% |
+| frequency-dependent boundary | 31.7% | 29.5% |
 | receivers and source | 0.4% | 1.5% |
 
 ## Cartesian against FCC, at equal output bandwidth
@@ -809,24 +827,25 @@ GPU busy from `ACOUSTIC_PROFILE=1`, taken from an interleaved run on a quiet M5 
 | step rate | 18.20 kHz | 7.71 kHz | 12.74 kHz | 5.40 kHz |
 | steps | 36,410 | 15,416 | 12,744 | 5,396 |
 | node-steps | 19.3 G | 1.95 G | 268.6 G | 23.8 G |
-| µs/step, GPU | 15.7 | 7.7 | 1016 | 207 |
-| ps/node-step | 29.6 | 60.7 | 48.2 | 46.9 |
+| µs/step, GPU | 15.7 | 7.3 | 1016 | 197 |
+| ps/node-step | 29.6 | 57.4 | 48.2 | 44.6 |
 | two-level state | 4.2 MB | 1.0 MB | 169 MB | 35 MB |
-| render, wall | 0.6s | 0.2s | 12.9s | 1.2s |
+| render, wall | 0.6s | 0.2s | 12.9s | 1.1s |
 | worst receiver vs its own fp64 truth | 40.73 dB | 38.76 dB | 48.91 dB | 48.60 dB |
 
 **FCC wins, by an order of magnitude in wall clock, and the whole margin is fewer node-steps rather than a cheaper node-step.**
-On the church it is 11.6× less GPU time and 10.8× less wall clock.
+On the church it is 12.2× less GPU time and 11.7× less wall clock.
 The arithmetic behind it: at equal fmax the FCC spacing is 10.5/7.7 = 1.36× coarser, so once the fold is counted it holds 2(10.5/7.7)³ = 5.1× fewer nodes per unit volume — 4.8× measured, the difference being the fixed three-and-a-half-cell halo, which is a larger share of a smaller grid — and the Courant number and the spacing together drop the step rate by √3(10.5/7.7) = 2.36×.
-That is 11.3× fewer node-steps, and the remaining 3% is the FCC step being slightly cheaper per node-step than the Cartesian one.
-Cost per node-step is 48.2 ps Cartesian against 46.9 ps FCC — the same number, though the FCC stencil reads twelve neighbours where the Cartesian one reads six.
+That is 11.3× fewer node-steps, and the remaining 8% is the FCC step being cheaper per node-step than the Cartesian one.
+Cost per node-step is 48.2 ps Cartesian against 44.6 ps FCC, near enough the same number though the FCC stencil reads twelve neighbours where the Cartesian one reads six.
 That is the roofline saying what it always says here: both kernels stream two pressure levels and the extra neighbour reads are cache hits, so bytes moved and not arithmetic sets the cost.
-Those two near-equal totals are not made of the same parts, though, and the roofline table above says how: the FCC interior pass runs at 593 GB/s against the Cartesian one's 373, so per node-step it is a third cheaper — and the FCC grid gives that back at its boundaries, which are a larger share of a coarser room (6.3% of its nodes are boundary nodes against 4.5%, and 3.4% lossy against 2.4%) and which it updates in a pass of their own.
+The two are not made of the same parts, though, and the roofline table above says how: the FCC pass runs at 461 GB/s against the Cartesian one's 370, but against a ceiling that is 1.7× higher, so it reaches 69% of its own stream where the Cartesian pass reaches 92% of its.
+The FCC grid gives its bandwidth advantage back at its boundaries, which are a larger share of a coarser room — 6.3% of its nodes are boundary nodes against 4.5%, and 3.4% lossy against 2.4% — and which carry twelve masked neighbour reads each.
 Peak state falls by the same 4.8×, which matters more than the time does for the full-bandwidth rooms that do not fit at all on the Cartesian grid.
 
 Two things the margin is not:
 
-- **Not the small end.** The FCC shoebox gets 4.8× of GPU time and 3.0× of wall clock, because at 0.13M nodes a step is latency and dispatch count rather than memory traffic — 7.7 µs over an eighth of a million nodes against 15.7 µs for four times the nodes. The ratio approaches the arithmetic one as the room grows.
+- **Not the small end.** The FCC shoebox gets 4.8× of GPU time and 3.0× of wall clock, because at 0.13M nodes a step is latency and dispatch count rather than memory traffic — 7.3 µs over an eighth of a million nodes against 15.7 µs for four times the nodes. The ratio approaches the arithmetic one as the room grows.
 - **Not equal accuracy at the walls.** The pairing equalises *interior* dispersion, and nothing else. At equal fmax the FCC grid's spacing is 1.36× coarser in absolute terms, so a room's surfaces are staircased more coarsely, and the FCC rigid wall is not the exact half-cell mirror that the Cartesian one is on an axis-aligned box: the FCC shoebox's modes sit 0.9–2.0% low where the Cartesian shoebox's sit within 0.033%, all of it the wall. Through the WAV chain the two church discretisations still agree on the room — T20 1.88–2.24 s Cartesian against 1.51–2.35 s FCC over the six receivers — but the FCC one leaves 3.3% of its energy in the last tenth of the record against 0.2%.
 
 So: FCC for bandwidth, and it is not close; the Cartesian grid keeps the sharper boundary at a given fmax, and on an axis-aligned box keeps an exactly analytic one.

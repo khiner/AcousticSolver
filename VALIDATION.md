@@ -912,52 +912,219 @@ Against the church, at the 1% worst-direction phase error all three schemes are 
 
 **The implicit scheme wins the interior, by 4.7× of GPU time and 6.1× of state against FCC.**
 The implicit column is the interior alone — the other two include their boundary passes — and it is a projection from a measured step: `--implicit` times the church's own 21.0 × 13.7 × 7.4 m room at the scheme's 183 mm spacing, 116 × 76 × 41 nodes, at 0.1074 ms a step, and the FCC church is 1.12s of `gpu/exec` measured interleaved with it.
-The paper's own benchmark on an RTX 4090 puts the same comparison at 4.0× with boundaries included on both sides, and its measured boundary overhead for this scheme is 27%, which would leave 3.7× here.
+The paper's own benchmark on an RTX 4090 puts the same comparison at 4.0× with boundaries included on both sides, and its measured boundary overhead for this scheme is 27%; the boundary measured below costs 0.9% at this footprint and 12.3% at DRAM scale, so the margin here survives it.
 
 The whole margin is node-steps again, and more of it than FCC's was: 29× fewer than FCC, given back 6.3× by a step that costs 24 streams instead of 3.
 In bytes the implicit step moves 77.5 GB against the FCC step's 459 GB, a ratio of 5.9× where the time ratio is 4.7×, and the difference is footprint: at 4.3 MB a pass the implicit church's passes reach 323 GB/s where the FCC church's reach 409.
 The scheme does stream properly at scale — over a 384³ box, 680 MB a pass, a step runs at 334 GB/s, which is 81% of that footprint's 413 GB/s two-level stream, in the same band as the explicit church's 91%.
 The one pass that falls short is the right-hand side, at 63% of the stream: it reads two grids with 27-point neighbourhoods rather than one, and two independent gather patterns do not cache as well as one.
 
-### A rigid box, and what a boundary costs
+### A rigid room, and what the boundary costs
 
-`--implicit` also runs the scheme in a rigid box rather than a periodic one, which is the rung that would say whether it is a room solver.
-The wall is the Neumann image the explicit schemes use for their halo: a step that would leave the grid comes back to the node one step inside, so a grid of N nodes spans (N−1)h and the discrete modes are cos(mπi/(N−1)).
-That image makes the mode an exact discrete eigenvector the same way the periodic wrap makes a plane wave one — at i = 0 both neighbours are i = 1 and the cosine's evenness supplies the identity, at i = N−1 both are N−2 and cos(mπ − k) = cos(mπ)cos(k) supplies it again — so one step reads 2cos(ωT) − 1 back at the corner and the measurement is exact.
+`--implicit` also runs the scheme in a rigid room rather than a periodic box, which is the rung that says whether it is a room solver.
+The wall is the paper's own, from Sec IV: **every neighbour that lies outside the room is dropped from the sum, and its share of the diagonal is dropped with it**.
+That is not the Neumann image the explicit schemes use for their halo, and the difference is not cosmetic.
+The image maps a wall-crossing diagonal offset onto a node that does not map back, so the 27-point operator it builds is asymmetric — its spectrum is not the one the paper's stability analysis covers, and it grew at every Courant number tried, non-monotonically, which is why no smaller λ was a fix.
+Drop-ghost is exactly symmetric, and it is a full-cell finite-volume termination: the wall sits on the cell face, **half a cell outside the outermost node**, so a room of N nodes is N·h on that axis rather than the image's (N−1)·h.
 
-**The interior is right.** Over the 16 lowest modes of a 40 × 33 × 28 box the scheme lands within **0.026% of Morse & Ingard**, against the explicit Cartesian scheme's 0.033% and the FCC scheme's 0.9–2.0%, and within **1.2e-5** of the relation its own floats give, which is the Jacobi truncation and single precision together.
-At 2.68 points per wavelength it resolves a room's modes as well as a 10.5-point grid does.
+**How it reaches the kernels is one byte a node.**
+The grid carries a one-node halo that nothing ever writes, so a step that leaves the room reads the zero it was allocated with and the sums need no mask at all — a term the sum should not have is a read of a node that holds zero.
+What that does not supply is the diagonal, because every coefficient is divided through by the interior's.
+A node's three corrections are a function of its three kept neighbour counts alone (`RoomImplicitTerm`): `Cn` and `Cp` against the right-hand side's two diagonal terms, and one factor `Fd = d₀/d` after each sweep, which is all a sweep's diagonal needs because the sweep's whole expression is a single division by it.
+A rectangular room has four distinct triples, so what rides beside the grid is a byte indexing a table, read inside the uniform passes rather than applied in scattered passes of their own.
+Air's entry is `{0, 0, 1}` and costs the pass nothing but the byte; a node outside the room is `{0, 0, 0}`, whose `Fd` zeroes it every sweep, which is how the same byte would hold the outside of a room that is not a box.
 
-**The wall is unstable, and not for want of a smaller Courant number.**
-Seeded with noise so every eigenvalue is excited, and read as a growth *rate* — `log(max|u|)` fitted against step index — rather than as a verdict on one soak length, because the instability takes tens of thousands of steps to become visible and a pass/fail on "did the envelope move" mostly measures how long the run was:
+**The operator in the kernels is the operator on paper.**
+There is no exact discrete mode to read a closed form against — the image had one and drop-ghost does not — so the machine-precision checks are two others.
+One step of the GPU's kernels against the same step taken on the host in double agrees to **1.2e-7 of the level**, which is single precision.
+And the scheme's discrete energy `E = ½⟨M d, d⟩ + ½⟨K uⁿ⁺¹, uⁿ⟩` is conserved by the wall as well as by the interior: over 20,000 steps from noise, **3.3e-5 of E₀** in fp32.
+An operator that is not exactly symmetric and negative semidefinite cannot hold that, whatever a mode soak says.
+
+**The wall's own Courant limit is 0.8405, just above the published 0.8400 — and 0.06% of margin is not enough for fp32.**
+Seeded with independent noise on both levels, each with its mean removed — the constant vector is in both Laplacians' null space, and its round-off wander is not the wall moving — and read as a growth *rate* fitted from `log(max|u|)` against step index over 40,000 steps:
 
 | λ | of the free-space limit | growth, dB per 1000 steps | |
 |---|---|---|---|
-| 0.8400 | 100% | +0.3211 | grows |
-| 0.7980 | 95% | +0.2308 | grows |
-| 0.7560 | 90% | +0.0071 | holds |
-| 0.7140 | 85% | −0.0211 | holds |
-| 0.6720 | 80% | +0.0068 | holds |
-| 0.5880 | 70% | +0.1403 | grows |
-| 0.5040 | 60% | +0.0253 | grows |
-| 0.4200 | 50% | +0.0476 | grows |
+| 0.8400 | 100% | +0.0737 | grows |
+| 0.7980 | 95% | −0.0016 | holds |
+| 0.7560 | 90% | −0.0008 | holds |
+| 0.7140 | 85% | +0.0083 | holds |
+| 0.6720 | 80% | +0.0116 | holds |
+| 0.5880 | 70% | −0.0032 | holds |
+| 0.5040 | 60% | −0.0025 | holds |
+| 0.4200 | 50% | +0.0009 | holds |
 
-Those rates are the scale a render is judged at: over the full-bandwidth scene's 77,078 steps, +0.01 dB per thousand is +0.8 dB and +0.32 is +25.
+The legs below the limit scatter by about ±0.012, which is the fit's own resolution at this soak length and the reason the verdict is drawn at 0.02 rather than at zero.
+Only the top leg is outside it, and the sweep is **monotone**, which the image's failure was not: there, half the free-space limit still grew.
 
-**A Courant condition is monotone and this is not**, so lowering λ is not the fix — half the free-space limit still grows.
-A single mode hides it for a long time: at the published λ the mode (0,1,1) reads 1.0026 against an exact 1.0020 after 5,000 steps and 1.038 after 20,000, then 10⁶ by 80,000, because what grows is an eigenvalue the seed barely projects onto until round-off finds it.
-That is why the sweep seeds noise, and it is worth keeping in mind for any invented boundary: a mode soak that looks clean for twenty thousand steps is not evidence.
+The rung does not leave that to the soak.
+The wall's own limit is the λ at which `1 + Lim + (λ²/4) Lex` loses positivity, and it is computed directly — power iteration on the pencil `(−Lex, 1 + Lim)` in double, with `1 + Lim` inverted by the same Jacobi sweeps the stepper uses — at **0.8405** against the free-space 0.8400.
+**So the boundary costs nothing in Courant number**, which is the paper's energy framework doing what it is for.
+But the published λ sits at 99.94% of it, and that is what the +0.074 is: a mode with E ≈ 0 accumulating round-off in single precision.
+The energy says the same thing from the other side — it is conserved to 6–7e-5 at *every* λ in the table, because the scheme conserves E whatever λ is and what a λ past the limit costs is E's positivity, so an indefinite E is conserved while the amplitude it no longer bounds grows.
+Reporting both is what separates the Courant failure from a broken operator.
+A room would therefore be stepped at 95%, not because the wall is unstable but because 0.06% of margin is not a margin in fp32.
 
-The reason is visible in the operator. The periodic stencil the paper's stability analysis covers is symmetric; the image is not.
-At an edge node the step off the grid doubles a neighbour's weight, so the matrix carries a row of weight 2 against a column of weight 1 and is symmetric only in a weighted inner product — its spectrum is not the one Eq. 16's limit was derived for, and nothing about λ_max carries over.
+**The interior is right, and the wall is where the paper puts it.**
+Product cosines are no longer exact discrete eigenvectors — under drop-ghost they differ from the true ones at wall-crossing diagonal offsets — so the mode frequency is read as the Rayleigh quotient `⟨K v, v⟩/⟨M v, v⟩` of the cosine sampled at the cell centres, which is what the generalised eigenvalue is stationary about.
+Over the 16 lowest modes of a 40 × 33 × 28 room, against Morse & Ingard:
 
-**So a rigid room is not free either**, which is the practical finding.
-The paper's own boundary is an admittance condition derived inside this lineage's energy framework, which is what makes such conditions provably stable, and it is not implemented here — substituting an image for it does not work at any Courant number tried.
-Integrating this scheme therefore starts one step earlier than the frequency-dependent walls below: it starts at the published boundary condition, on the rigid case, where there is at least a formulation to follow.
+| wall placed at | worst error |
+|---|---|
+| (N − 1) h, the image's convention | 4.995% |
+| N h, the full cell's nominal | 1.971% |
+| (N + 0.444) h, fitted | 0.712% |
 
-**It is not integrated, and the obstacle is the walls rather than the arithmetic.**
+The fitted offset is the measurement: the wall sits about half a cell out, as the finite-volume reading says, and the ~0.44 h beyond the node is the 27-point stencil's own boundary layer rather than an order-of-accuracy defect.
+What is left after the fit is anisotropic — axial modes read high and oblique ones low — and shrinks with the grid rather than with the mode, so at a production room's node counts it is a part in ten thousand.
 
-- **The scheme's boundary condition is frequency-independent.** The paper's admittance γ is a real scalar, and its concluding remarks name frequency-dependent boundaries as future work. Every wall in every scene here is a set of LRC branches — eleven of them per material on the church — so the published scheme cannot render any scene in `Scenes/` but the two rigid shoeboxes. Combining the node-local branch solve with a Jacobi-iterated interior is unpublished work with no reference to check against.
+**The wall costs 0.9% of a step at the church's footprint and 12.3% at DRAM scale.**
+Measured against the same room stepped by the same passes without the code, alternated and taken at their best because the GPU's clock drifts over a rung by more than the difference:
+
+| | 114 × 74 × 39 | 382 × 382 × 382 |
+|---|---|---|
+| room nodes | 0.329M | 55.74M |
+| wall nodes | 30,636 (9.31%) | 870,968 (1.56%) |
+| Jacobi sweep, no wall | 0.0105 ms | 2.137 ms |
+| Jacobi sweep, walled | 0.0106 ms | 2.553 ms |
+| a step, no wall | 0.0900 ms | 17.78 ms |
+| a step, walled | 0.0908 ms | 19.97 ms |
+| the wall | +0.9% | +12.3% |
+
+**The code is what the wall costs, and two bytes is 16.7% more traffic on a twelve-byte pass.**
+The sweep's own ratio is +19.4%, and at the church's footprint every pass is cache-resident and it is nearly free.
+The width is not set by the rigid case, which needs three terms and would fit a byte at a measured +8.4% on the sweep and **+7.0%** on the step — it is set by curved absorbing walls, for the reason under the geometry survey below.
+**Both are well inside the paper's own 27% figure for its boundary overhead**, and the two-byte code leaves the 4.7× interior margin against FCC at about **4.2×** at DRAM scale and essentially intact at the church's.
+It is also the reason the cost barely depends on the room: the code is read unconditionally at every node, so a wall of any shape costs the same as a box's.
+Applying the same terms in scattered passes over a boundary-node list instead — the obvious alternative, two extra dispatches a sweep — measured +21% at the church's footprint and within noise of the code at 382³, and it cannot mask the outside of a room that is not a box at all; it is not in the tree.
+
+### An absorbing wall, and geometry that is not the array
+
+**Nothing in the kernels changes for the paper's admittance γ.**
+`G = (λ/2)·β·γ` is diagonal, so it lands on `A`'s diagonal and on the `u^(n−1)` coefficient — which is exactly where `RoomImplicitTerm`'s `Fd` and `Cp` already are:
+
+    Cp = 1 − (d − G)/d0        Fd = d0/(d + G)
+
+`Cn` is untouched, the off-diagonals are untouched, the traffic is unchanged, and the Courant limit is unchanged — `E ≥ 0` is a condition on `Lim` and `Lex` alone, and a nonnegative `G` only makes `A` more diagonally dominant, which the Jacobi sweep likes.
+
+**β is the one new number**, and it is a property of the node's ghost set: `β_i = Σ_r nex_r Σ_j (n_i · j)` over the ghost offsets `j`, with `n_i` the *true* outward normal rather than the staircase's.
+On a grid-aligned flat wall every ghost has `n·j = 1` in its own class, so β is `Lex0+Lex1+Lex2` — measured at **1.000000000**, which is the check that the paper's two readings of `α_r` have not been crossed.
+
+**The wall's energy balance is exact.**
+With a wall that absorbs, what is conserved is E *plus* the running loss, which the scheme fixes at `½⟨G D, D⟩` a step with `D = u^(n+1) − u^(n−1)`.
+Over 2,000 steps from noise, while the wall removes **65% of E₀**, `|E + loss − E₀|` stays within **4.3e-7 of E₀** in fp32.
+
+**And it decays like the room it is.**
+For an axial mode the pressure is antinodal at the two walls it runs into and uniform across the four it does not, so `α = cγ(2/Lx + 1/Ly + 1/Lz)` — the slab's `2γc/L` with the side walls added, and independent of the mode index, which is what makes it readable off the energy: the modes the seed's own error also excites decay at the same rate. At γ = 0.05 on the 40 × 33 × 28 room:
+
+| mode | nepers a step | analytic | ratio |
+|---|---|---|---|
+| 1 | 4.598e-3 | 4.810e-3 | 0.956 |
+| 2 | 4.681e-3 | 4.810e-3 | 0.973 |
+| 3 | 4.758e-3 | 4.810e-3 | 0.989 |
+| 4 | 4.930e-3 | 4.810e-3 | 1.025 |
+
+**On geometry that is not the array**, the wall is surveyed rather than stepped: whether β survives a slanted or curved surface, how many distinct terms a staircase produces, and how much of the bounding box is outside the room are all properties of the voxelisation, and a yawed box, a sphere and a column give the inside test and the true normal in closed form. Each is placed off the grid centre by a fraction of a cell, because a centred shape is symmetric under the octahedral group and its distinct terms come out forty-eight times too few.
+
+| in a 96³ array | the array | a yawed box | a sphere | a column in the array |
+|---|---|---|---|---|
+| inside | 100% | 55.2% | 49.6% | 96.5% |
+| wall nodes, 26 directions | 54,152 | 44,595 | 40,729 | 61,840 |
+| … of them in the 6-direction set | 100% | 77.5% | 56.2% | 94.2% |
+| β, mean | 1.004 | 0.817 | 0.678 | 0.952 |
+| β, min | 1.000 | 0.000 | 0.012 | 0.013 |
+| β negative | 0 | 0 | 0 | 0 |
+| distinct terms | 3 | 21 | 40,338 | 7,649 |
+| … with β to 8 bits | 3 | 21 | 518 | 422 |
+| kept-count classes | 3 | 11 | 44 | 45 |
+
+**β holds up, and its mean reproduces the compensation paper's own numbers.**
+It stays nonnegative everywhere, including on the column, whose wall is the only one here that is convex into the room — a box and a sphere are concave from the inside at every point.
+And the mean is the compensation: β at 0.678 on a sphere says an uncompensated wall would over-absorb by 32%, against the −34% in T60 that Smits reports for a sphere, and 0.817 on the yawed box says 18%, against a reported −18% to −42% on rotated boxes.
+That is an independent arrival at the same number from the scheme's own β rather than from a reflection-coefficient analysis.
+
+**A curved wall is what sets the code's width.**
+A sphere produces 40,338 distinct terms for 40,729 wall nodes — β is continuous in the normal, so very nearly every wall node is its own term.
+Quantising β to 8 bits collapses that to **518**, which is still past the 255 a byte can index, and a scene with several materials multiplies it.
+So the code is a ushort, indexing the table directly, which holds to 65,535 terms and so to every grid validated here; it costs the +12.3% a step in the table above against a byte's +7.0%.
+A production room has more wall nodes than 65,535, and the way out is the packing the terms already invite — `Cn` depends on the kept counts alone, of which there are 44 even on a sphere, and only `Cp` and `Fd` need β, so six bits of class and ten of quantised β fit the same two bytes.
+That is a change to the table and not to the kernels, and it is not built.
+
+**And the reference voxeliser's boundary set is 56% of what a 27-point stencil needs.**
+PFFDTD marks a node when one of its *six* axis legs crosses the surface. The 27-point stencil also needs the nodes whose only crossings are diagonal — the tips of a 45° staircase — and on a sphere those are 44% of the wall.
+Its ray march is already parameterised by the stencil (`NN`, `VV`, `uvv`), but the half-leg length it tests hits against is a scalar, and a 27-point stencil has three different leg lengths.
+
+### The same room, off the grid
+
+The survey above is static: β's mean matching the compensation paper is a count, not a simulation.
+A box yawed off the grid is the experiment that steps it.
+It is still a box — its modes are still `(c/2)√(Σ(mₐ/Lₐ)²)` at its own side lengths and an axial mode still decays at `cγ(2/Lx + 1/Ly + 1/Lz)`, and nothing analytic about it changes when it is turned.
+What changes is that four of its six walls are now staircases.
+The room is 2.376 × 2.376 × 3.123 m at 22.9°, 488,205 of a 96³ array's nodes, 44,595 of them wall over 23 distinct terms; frequencies are the Rayleigh quotient of the true room's mode sampled at the nodes it keeps, and decay is read off the energy.
+
+**Staircasing does not move the mode frequencies.**
+Over the 12 lowest modes the worst error is **0.387%**, after fitting one offset across the three sides — which has to be fitted because the inside test keeps a node when it is half a cell in from the surface, and against a centre placed a fraction of a cell off the grid that leaves the outermost node between half a cell and a cell and a half from the wall.
+The grid-aligned room leaves 0.712% at a third the side length, and this residual is the same `h/L` boundary layer rather than anything the staircase adds.
+
+**And the compensation is what makes the decay right.**
+The same room stepped twice, once with β reading the surface's normal and once with the node keeping the staircased area it actually exposes:
+
+| mode | compensated | ratio | staircased | ratio |
+|---|---|---|---|---|
+| 1 | 1.999e-3 | 0.978 | 2.361e-3 | 1.155 |
+| 2 | 2.004e-3 | 0.981 | 2.378e-3 | 1.164 |
+| 3 | 2.029e-3 | 0.993 | 2.429e-3 | 1.188 |
+| 4 | 2.078e-3 | 1.017 | 2.478e-3 | 1.213 |
+
+nepers a step, against an analytic 2.044e-3.
+**Compensated the staircased room decays within 2% of the room it stands for; uncompensated it over-absorbs by 17% to 20%**, which is a T60 short by 15% to 17% — inside the −18% to −42% Smits reports for rotated boxes, at the mild end, which is where a single 22.9° yaw belongs.
+That is the compensation earning its place on a stepped room rather than in a surface count, and it is the rung that says this boundary is a room solver and not a box solver.
+
+### Walls that are frequency-dependent
+
+Every wall in every scene here is a set of parallel LRC branches, not a real admittance, and the paper names frequency-dependent boundaries as future work.
+Bilbao & Hamilton 2017 gives the recursion for them, and against this scheme it comes to two things and no more.
+**The branches' summed discrete admittance is one nonnegative scalar on the diagonal** — where `RoomImplicitTerm`'s `Fd` and `Cp` already put a real γ, so nothing off-diagonal changes and `NodeG` is the only line that moves.
+**The branch history is a term on the right-hand side**, which is all the memory the wall has.
+So the wall costs the same two scattered passes an explicit step already pays — `RoomImplicitWallRhs` before the sweeps and `RoomImplicitWallStep` after them — and **the P Jacobi sweeps stay uniform and never see the branches**.
+The branch state is one `(vh, gh)` pair a branch a node, and one float a node for the level two steps back, against the explicit path's three-deep ring, because the implicit step keeps both levels behind it rather than overwriting one.
+
+**A branch of pure resistance is a real admittance, and reads as one to the last bit.**
+`D = F = 0` leaves `b = γ` and the history term identically zero, so the two paths have to produce the same grid. Over 64 steps from noise they differ by **exactly zero**, which is the check that the branch algebra is wired where γ was.
+
+**The energy identity holds with branch storage in it.**
+Multiplying the branch relation by `μ(vh)` telescopes: `Dh vh² + Fh gh²` is stored and `2 Eh μ(vh)²` leaves a step, so what the room conserves is the interior energy, plus `(λ/2)·β·Σ_m [Dh vh² + Fh gh²]` at every wall node, plus everything dissipated so far.
+Over 2,000 steps from noise, while the wall dissipates 43% of E₀, that sum holds to **3.2e-6 of E₀** in fp32.
+The stored term peaks at 4.5e-4 of E₀ — small, but two orders above the residual, so it is carrying its weight rather than being invisible.
+That identity is the one the 2017 analysis leaves at nearest-neighbour cells and the 2025 analysis leaves out, and it is what says a wide-stencil implicit scheme and a branch wall compose.
+
+**And the decay follows the wall's admittance across frequency.**
+The wall is a resonance at 200 Hz beside a resistive floor, so `Re{Y}` is not one number the decay could match by accident — it rises to the resonance and falls past it. Against `α = c·Re{Y(f)}·(2/Lx + 1/Ly + 1/Lz)`:
+
+| mode | Hz | Re{Y} | nepers a step | analytic | ratio |
+|---|---|---|---|---|---|
+| 1 | 129.8 | 0.0322 | 2.774e-3 | 3.096e-3 | 0.896 |
+| 2 | 259.6 | 0.0410 | 3.842e-3 | 3.948e-3 | 0.973 |
+| 3 | 389.5 | 0.0229 | 2.126e-3 | 2.205e-3 | 0.964 |
+| 4 | 519.3 | 0.0167 | 1.607e-3 | 1.604e-3 | 1.002 |
+
+The measured decay is **non-monotonic in the mode index and peaks where `Re{Y}` peaks**, tracking a 2.5× variation in the wall's own admittance.
+Modes 2 to 4 land within 4%; mode 1 is 10% low, and about half of that is the same low-mode deficit the real-admittance table above shows.
+The rest is the estimator: it reads the slope of log E, which assumes the modes the seed's own error also excites decay at the same rate as the one seeded — true of a real γ and false of this wall.
+That is why the window is ten decibels of early decay rather than the whole run, the same reason a room's T10 is.
+
+**The outside does not move the margin.**
+Half a sphere's bounding box is outside the room, and those nodes are masked by the same byte but not skipped — every pass carries them.
+The explicit path carries the identical bounding box, though, so this does not touch the 4.4× against FCC; it costs absolute time and memory on both sides equally.
+
+**What is still open.**
+β can only go negative where a node sees wall in opposite directions and the normal it is assigned points at the smaller side — a gap of one or two cells. No analytic shape here has one, and a real mesh at 183 mm will; a one-cell slot gives β = 0 exactly, which is stable but absorbs nothing.
+The normal at a 90° room edge is also a convention rather than a fact: taking the bisector gives β = 1.19 there and taking one of the two faces, as a mesh's nearest-triangle lookup would, gives 0.84.
+Edge nodes are 6% of the wall on the 40 × 33 × 28 room, which is the right size to be that room's own 3–4% absorption deficit — the yawed room, four times the side and so a quarter the edge fraction, sits inside 2%.
+
+**It is not integrated, and what is left is the voxeliser and the absence of a truth to check against.**
+
+- **No voxeliser emits what a 27-point wall needs.** The reference marks a node when one of its six axis legs crosses the surface, and does not export the nearest triangle it already found; the 27-point stencil needs 26 legs and the true normal at every node with a crossing. On a curved wall that is nearly twice as many nodes. Widening its ray march is contained — the stencil is already a parameter — but the leg length it tests against is a scalar and three lengths would have to travel with the directions.
 - **There is no golden at that grid step.** Every gate in `script/ValidateRoom` is an SNR against PFFDTD's own output on the *same* voxelized input. At 183 mm the discrete problem is a different one, so there is no CUDA golden, no fp64 truth, and no bit-identity argument — the validation apparatus of the whole solver does not transfer.
 - **2.68 points per wavelength is the geometry as well as the field.** The pairing above equalises interior dispersion and nothing else, the same caveat the Cartesian-against-FCC verdict carries, but three times as coarse. The paper compensates the absorption bias staircasing causes, and demonstrates it on a rotated rectangular room; nothing in it claims a complex room is the same room at 183 mm as at 47.
 

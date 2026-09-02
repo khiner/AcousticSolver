@@ -369,9 +369,9 @@ kernel void RoomEnergyFcc(device float *out, device const float *unew, device co
 
 // --- The optimised implicit scheme of Smits & Bilbao 2025 -------------------------------
 //
-// An evaluation, not a stepper the solver uses: free space on a periodic box, no boundaries
-// of any kind. See RoomImplicitParams for the scheme and for what the coefficients already
-// have folded in.
+// An evaluation, not a stepper the solver uses: free space on a periodic box, and the paper's
+// rigid wall on a rectangular room. See RoomImplicitParams for the scheme and for what the
+// coefficients already have folded in, and RoomImplicitTerm for the wall.
 //
 // A step is one RoomImplicitRhs followed by a fixed number of RoomImplicitJacobi sweeps —
 // the paper's own solver, chosen because the iteration count that reaches single precision
@@ -422,22 +422,26 @@ kernel void RoomImplicitJacobi(device float *xn, device const float *x, device c
     xn[ii] = bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z);
 }
 
-// The same three sums over a rigid box rather than a periodic one. A step that would leave
-// the grid comes back to the node one step inside it, which is the Neumann image of a wall
-// lying on the boundary node — exact for an axis-aligned box, and the same device the
-// explicit schemes use for their halo. The box a grid of N nodes spans is therefore
-// (N - 1) * h on that axis, and its discrete modes are cos(m*pi*i/(N-1)).
+// The same three sums with a wall rather than a periodic wrap, under the boundary condition
+// of Smits & Bilbao 2025 Sec IV: every neighbour that lies outside the room is dropped from
+// the sum, and its share of the diagonal is dropped with it.
 //
-// This is not the paper's boundary condition. The paper carries a real admittance gamma and
-// names frequency-dependent walls as future work; gamma = 0 is a rigid wall, and for an
-// axis-aligned box the image above is what a rigid wall means. Nothing here reaches a wall
-// that absorbs. See RoomImplicitBox in RoomImplicit.cpp for what that costs the scheme.
-static inline void RoomImplicitSumsBox(device const float *u, int ix, int iy, int iz,
-                                       constant RoomImplicitParams &p, thread float3 &s) {
+// The grid carries a one-node halo that nothing ever writes, so it holds zero for the whole
+// run and the first half needs no mask at all — a term the sum should not have is a read of a
+// node that holds zero. The second half is what RoomImplicitTerm carries, because the uniform
+// coefficients are already divided through by the interior diagonal.
+//
+// This is not the Neumann image, which is what a step reflected back to the node one layer in
+// would give. The image maps a wall-crossing diagonal offset onto a node that does not map
+// back, so the 27-point operator it builds is asymmetric and grows at every Courant number
+// tried. Drop-ghost is exactly symmetric, and puts the wall half a cell outside the outermost
+// node rather than on it.
+static inline void RoomImplicitSumsWall(device const float *u, int ix, int iy, int iz,
+                                        constant RoomImplicitParams &p, thread float3 &s) {
     const int nzny = p.Nz * p.Ny;
-    const int xm = (ix == 0 ? 1 : ix - 1) * nzny, x0 = ix * nzny, xp = (ix == p.Nx - 1 ? p.Nx - 2 : ix + 1) * nzny;
-    const int ym = (iy == 0 ? 1 : iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy == p.Ny - 1 ? p.Ny - 2 : iy + 1) * p.Nz;
-    const int zm = (iz == 0 ? 1 : iz - 1), z0 = iz, zp = (iz == p.Nz - 1 ? p.Nz - 2 : iz + 1);
+    const int xm = (ix - 1) * nzny, x0 = ix * nzny, xp = (ix + 1) * nzny;
+    const int ym = (iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy + 1) * p.Nz;
+    const int zm = iz - 1, z0 = iz, zp = iz + 1;
 
     s.x = u[xm + y0 + z0] + u[xp + y0 + z0] + u[x0 + ym + z0] + u[x0 + yp + z0] + u[x0 + y0 + zm] + u[x0 + y0 + zp];
     s.y = u[xm + ym + z0] + u[xm + yp + z0] + u[xp + ym + z0] + u[xp + yp + z0] +
@@ -447,25 +451,59 @@ static inline void RoomImplicitSumsBox(device const float *u, int ix, int iy, in
         u[xp + ym + zm] + u[xp + ym + zp] + u[xp + yp + zm] + u[xp + yp + zp];
 }
 
-kernel void RoomImplicitRhsBox(device float *bp, device const float *un, device const float *up,
-                               constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
-    const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
-    if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
+// The walled passes run over the array's interior rather than the whole array, and read two
+// bytes a node for the terms its geometry gives it. See RoomImplicitTerm: for ordinary air
+// those terms are {0, 0, 1} and cost the pass nothing but the code, and for a node outside the
+// room they are {0, 0, 0}, whose Fd holds it at the zero the sums rely on — which is how a
+// room that is not the array is stepped without the passes knowing about it.
+kernel void RoomImplicitRhsWall(device float *bp, device const float *un, device const float *up,
+                                device const ushort *code, device const RoomImplicitTerm *terms,
+                                constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
+    if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     float3 sn, sp;
-    RoomImplicitSumsBox(un, ix, iy, iz, p, sn);
-    RoomImplicitSumsBox(up, ix, iy, iz, p, sp);
+    RoomImplicitSumsWall(un, ix, iy, iz, p, sn);
+    RoomImplicitSumsWall(up, ix, iy, iz, p, sp);
+    const RoomImplicitTerm w = terms[code[ii]];
+    bp[ii] = p.R1 * sn.x + p.R2 * sn.y + p.R3 * sn.z + (p.Rc + w.Cn) * un[ii] -
+        (p.Q1 * sp.x + p.Q2 * sp.y + p.Q3 * sp.z + (1.f - w.Cp) * up[ii]);
+}
+
+kernel void RoomImplicitJacobiWall(device float *xn, device const float *x, device const float *bp,
+                                   device const ushort *code, device const RoomImplicitTerm *terms,
+                                   constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
+    if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
+    const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    float3 s;
+    RoomImplicitSumsWall(x, ix, iy, iz, p, s);
+    xn[ii] = (bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z)) * terms[code[ii]].Fd;
+}
+
+// The same two passes without the byte, which is the ceiling the walled step is read against:
+// what the wall costs is the difference between a step encoded over these and one encoded over
+// the two above. They step nothing meaningful on their own — the diagonal they leave at the
+// interior's value is wrong at every node the wall touches.
+kernel void RoomImplicitRhsNoWall(device float *bp, device const float *un, device const float *up,
+                                  constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
+    if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
+    const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    float3 sn, sp;
+    RoomImplicitSumsWall(un, ix, iy, iz, p, sn);
+    RoomImplicitSumsWall(up, ix, iy, iz, p, sp);
     bp[ii] = p.R1 * sn.x + p.R2 * sn.y + p.R3 * sn.z + p.Rc * un[ii] -
         (p.Q1 * sp.x + p.Q2 * sp.y + p.Q3 * sp.z + up[ii]);
 }
 
-kernel void RoomImplicitJacobiBox(device float *xn, device const float *x, device const float *bp,
-                                  constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
-    const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
-    if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
+kernel void RoomImplicitJacobiNoWall(device float *xn, device const float *x, device const float *bp,
+                                     constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
+    if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     float3 s;
-    RoomImplicitSumsBox(x, ix, iy, iz, p, s);
+    RoomImplicitSumsWall(x, ix, iy, iz, p, s);
     xn[ii] = bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z);
 }
 
@@ -492,4 +530,62 @@ kernel void RoomImplicitStream(device float *xn, device const float *x, device c
     if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     xn[ii] = bp[ii] - p.Q1 * x[ii];
+}
+
+// The same over the room of a walled grid, which is the ceiling the walled passes are read
+// against: a smaller box inside a larger array reaches DRAM differently from the whole array.
+kernel void RoomImplicitStreamWall(device float *xn, device const float *x, device const float *bp,
+                                   constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
+    if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
+    const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    xn[ii] = bp[ii] - p.Q1 * x[ii];
+}
+
+// The frequency-dependent wall's two passes, which the sweeps between them never see.
+//
+// A wall of parallel LRC branches, each an admittance 1/(D s + E + F/s) discretised by the
+// trapezoid rule, carries a velocity vh and its running integral gh a branch a node. Written
+// out, the branch relation is
+//
+//   Dh (vh^n - vh^(n-1)) + Eh mu(vh) + Fh mu(gh) = mu(delta u)
+//
+// with mu the two-point average — Dh, Eh and Fh being D/Ts, E and F*Ts, and RoomMatQuad
+// holding what falls out of solving it for vh^n. The node's own equation then takes
+// lambda*beta*sum_m mu(vh_m), whose half depends on the level being solved for and rides on
+// the diagonal, and whose other half is this:
+kernel void RoomImplicitWallRhs(device float *bp, device const float *vh1, device const float *gh1,
+                                device const RoomImplicitWall *wall, device const int *mat_mb,
+                                device const RoomMatQuad *mat_quads, constant RoomImplicitParams &p,
+                                uint nb [[thread_position_in_grid]]) {
+    if (int(nb) >= p.Nw) return;
+    const RoomImplicitWall w = wall[nb];
+    float psi = 0.f;
+    for (int m = 0; m < mat_mb[w.Mat]; ++m) {
+        const RoomMatQuad q = mat_quads[w.Mat * RoomMaxBranches + m];
+        const int i = m * p.Nw + int(nb);
+        psi += 2.f * q.BDh * vh1[i] - q.BFh * gh1[i];
+    }
+    bp[w.Ixyz] -= w.Psi * psi;
+}
+
+// And the branch step, node-local, once the solve has produced the level it needs. `ub` is the
+// node's own value two levels back, which the grid no longer holds by now — one float a wall
+// node against the explicit path's three-deep ring, because the implicit step keeps both
+// levels behind it rather than overwriting one.
+kernel void RoomImplicitWallStep(device const float *un, device const float *up, device float *ub,
+                                 device float *vh1, device float *gh1, device const RoomImplicitWall *wall,
+                                 device const int *mat_mb, device const RoomMatQuad *mat_quads,
+                                 constant RoomImplicitParams &p, uint nb [[thread_position_in_grid]]) {
+    if (int(nb) >= p.Nw) return;
+    const RoomImplicitWall w = wall[nb];
+    const float du = un[w.Ixyz] - ub[nb];
+    for (int m = 0; m < mat_mb[w.Mat]; ++m) {
+        const int i = m * p.Nw + int(nb);
+        const RoomMatQuad q = mat_quads[w.Mat * RoomMaxBranches + m];
+        const float v = q.B * du + q.Bd * vh1[i] - 2.f * q.BFh * gh1[i];
+        gh1[i] += .5f * (v + vh1[i]);
+        vh1[i] = v;
+    }
+    ub[nb] = up[w.Ixyz];
 }

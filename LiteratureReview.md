@@ -89,6 +89,13 @@ The core:
 - **Bilbao. "Modeling of complex geometries and boundary conditions in FD/FV time domain room
   acoustics simulation." TASLP 21(7), 2013.** doi:10.1109/TASL.2013.2256897 — origin of the
   locally-conforming FV boundary-cell idea.
+- **Hamilton. "Finite volume perspectives on finite difference schemes and boundary formulations for
+  wave simulation." DAFx 2014.** — reads the two usual FD wall terminations as two choices of boundary
+  cell: the full cell gives the non-centered update (drop the ghost, lower the diagonal) with the wall
+  on the cell face half a cell out, and the half cell gives the centered update (the Neumann image)
+  with the wall on the node. Both second order, on different domains. Stability is the cell volume
+  left after the interior pyramids, which is why the full cell carries slack where the image does not.
+  This is what the implicit scheme's rigid wall in [VALIDATION.md](VALIDATION.md) rests on.
 - **Bilbao & Hamilton. "Passive volumetric time domain simulation for room acoustics applications."
   JASA 145(4), 2019.** doi:10.1121/1.5095876 — the passivity framing (lossless interior + passive
   wall-admittance feedback) the family's stability argument rests on.

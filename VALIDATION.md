@@ -644,6 +644,7 @@ build/RoomTest --modes --count 24      # more eigenmodes
 build/RoomTest --tube --length 4000    # a longer impedance tube
 build/RoomTest --soak --steps 1000000  # a longer soak
 build/RoomTest --roofline --scene ../Scenes/RoomChurch/config.json   # both passes against their own plain streams
+build/RoomTest --roofline --fcc --cells 1000 --repeat 20              # the same on a bare air grid of any size
 build/RoomTest --implicit              # the Smits & Bilbao 2025 implicit scheme, measured against both
 build/RoomTest --golden --scene ../Scenes/RoomChurch/config.json --gen ../gen/room/RoomChurch
 script/ValidateRoom                    # the regression gate: the ladder, then all five scenes (~55s)
@@ -802,6 +803,30 @@ On the Cartesian church the two passes measured alone come to 0.667 and 0.348 ms
 On the FCC church they come to 0.110 and 0.055 ms against a 0.197 ms step, and the 0.03 ms that is in neither is the drain between dependent dispatches — the interior pass writes the `u0` the boundary pass then reads.
 That is why the FCC grid gained from going four dispatches to three and the Cartesian one did not: its dispatches are 6-17x shorter, so a fixed cost between them is a real share rather than noise.
 Its interior pass at 69% of stream is the other half, and that is the rigid boundary's twelve masked neighbour reads at 6.3% of the nodes, which is arithmetic and divergence rather than traffic.
+
+### How it scales
+
+Every scene here is validation-scale, so the rung takes `--cells` as well as `--scene`: a grid of nothing but air, at any size, where every wall is the absorbing shell and there are no boundary nodes to build.
+It answers the one question the scenes cannot, which is whether a node-step still costs what it costs once a grid is far larger than any of them.
+
+| grid | nodes | state | two-level stream | interior update | update / stream | ps a node-step |
+|---|---|---|---|---|---|---|
+| 256³ | 16.8M | 0.13 GB | 397 GB/s | 386 GB/s | 97% | 31.1 |
+| 512³ | 134M | 1.07 GB | 384 GB/s | 363 GB/s | 94% | 33.1 |
+| 700³ | 343M | 2.74 GB | 363 GB/s | 345 GB/s | 95% | 34.8 |
+| 900³ | 729M | 5.83 GB | 371 GB/s | 348 GB/s | 94% | 34.5 |
+| 1000³ | 1.00G | 8.00 GB | 378 GB/s | 353 GB/s | 93% | 34.0 |
+| 1280³ | 2.10G | 16.78 GB | 354 GB/s | 325 GB/s | 92% | 37.0 |
+
+**A node-step costs what it costs.** The only real step is 256³ to 512³, which is a working set leaving cache for DRAM, and from there to 2.1 billion nodes the cost moves 12% while the grid grows 16×.
+The update holds 92-97% of its own stream throughout.
+
+The last row is the ceiling: at 2,147,483,647 nodes the 32-bit node indexing the kernels use runs out, and `RoomGpu::Init` throws above it.
+That is 16.8 GB of state against this machine's 22.61 GB per-buffer limit and 30.15 GB recommended working set, so **the indexing binds before the memory does** on the explicit schemes.
+
+An air grid also isolates what a boundary costs, and the answer reframes the tables above: 34 ps a node-step here against the FCC church's 46.9 is the church's 6.3% of boundary nodes and its lossy pass.
+**Boundary nodes are a surface and interior nodes are a volume**, so that share collapses as a room is resolved finer — at 2.23 mm a 3.4 × 2.8 × 2.3 m room is 0.5% boundary nodes against the FCC church's 6.3%.
+A full-bandwidth room is therefore closer to the air grid's cost than to any scene here.
 
 `ACOUSTIC_ROOM_KERNEL_TIMES=1` puts each dispatch in its own command buffer and times it, which is how a step is split between kernels.
 On the Cartesian church the serialized total comes to 1.024 ms/step against 1.016 uninstrumented, so the attribution is the real one; on the FCC church it comes to 0.585 against 0.197, because a command buffer's own fixed cost dominates a dispatch that short — those shares are directional only.

@@ -1064,14 +1064,35 @@ void ImplicitCostRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
 // stream over the same box move the same twelve bytes a node-step, so the stream is the grid's
 // own ceiling under the conditions of the moment and the update's share of it is the roofline
 // statement.
-void RooflineRung(const std::string &config_file, int reps) {
+// A grid of nothing but air, for asking how a scheme streams at a size no scene here reaches.
+// Every wall is the absorbing shell, so there are no boundary nodes to build and none of the
+// O(volume) surface search SealedBox does — which is what makes a 10^9-node grid constructible
+// in the time it takes to allocate it. The spacing is a real one so the coefficients are, but
+// nothing about this grid is a room: it is the interior update's streaming behaviour alone.
+RoomScene AirGrid(int nx, int ny, int nz, bool fcc) {
+    RoomScene scene;
+    scene.Fcc = fcc;
+    scene.Nx = nx;
+    scene.Ny = ny;
+    scene.Nz = nz;
+    scene.H = 0.0326857142857142;
+    scene.C = 343.2;
+    scene.L = fcc ? 0.999 : 0.999 / std::numbers::sqrt3;
+    scene.L2 = scene.L * scene.L;
+    scene.Ts = scene.L * scene.H / scene.C;
+    scene.Srate = 1. / scene.Ts;
+    scene.Nt = 1;
+    scene.Output = "AirGrid";
+    return scene;
+}
+
+void RooflineRung(const RoomScene &scene, const std::string &label, int reps) {
     const double t0 = Now();
-    RoomScene const scene = LoadRoomScene(config_file);
     RoomGpu gpu;
     gpu.Init(scene);
     const auto band = gpu.Roofline(reps);
     const double gb = band.Bytes / 1e9;
-    std::printf("[roofline] %s %s %d x %d x %d, %.2fM nodes, %.0f MB a pass\n", config_file.c_str(), scene.Fcc ? "FCC" : "cart", scene.Nx, scene.Ny, scene.Nz, double(scene.NumNodes()) / 1e6, 1e3 * gb);
+    std::printf("[roofline] %s %s %d x %d x %d, %.2fM nodes, %.0f MB a pass\n", label.c_str(), scene.Fcc ? "FCC" : "cart", scene.Nx, scene.Ny, scene.Nz, double(scene.NumNodes()) / 1e6, 1e3 * gb);
     std::printf("  two-level stream  %8.4f ms  %6.0f GB/s\n", 1e3 * band.Stream, gb / band.Stream);
     std::printf("  interior update   %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * band.Update, gb / band.Update, 100. * band.Stream / band.Update);
 
@@ -1084,13 +1105,14 @@ void RooflineRung(const std::string &config_file, int reps) {
         std::printf("  boundary stream   %8.4f ms  %6.0f GB/s\n", 1e3 * lossy.Stream, lgb / lossy.Stream);
         std::printf("  boundary update   %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * lossy.Update, lgb / lossy.Update, 100. * lossy.Stream / lossy.Update);
     }
-    std::printf("  | %.1fs\n", Now() - t0);
+    std::printf("  %.1f ps a node-step, %.2f GB of state | %.1fs\n", 1e12 * band.Update / double(int64_t(scene.Nx - 2) * (scene.Ny - 2) * (scene.Nz - 2)), double(scene.NumNodes()) * 8. / 1e9, Now() - t0);
 }
 } // namespace
 
 int main(int argc, char **argv) {
     bool modes = false, energy = false, tube = false, balance = false, soak = false, golden = false, gate = false, any = false, fcc = false, roofline = false, implicit = false;
     int repeat = 4, count = 16, steps = 0, reports = 10, length = 2000;
+    int cells[3] = {0, 0, 0};
     std::string config_file, gen_dir;
     for (int a = 1; a < argc; ++a) {
         const std::string arg = argv[a];
@@ -1111,7 +1133,14 @@ int main(int argc, char **argv) {
         else if (arg == "--length" && a + 1 < argc) length = std::atoi(argv[++a]);
         else if (arg == "--scene" && a + 1 < argc) config_file = argv[++a];
         else if (arg == "--gen" && a + 1 < argc) gen_dir = argv[++a];
-        else {
+        else if (arg == "--cells" && a + 1 < argc) {
+            // One extent, or three separated by commas: --cells 1024 or --cells 1200,700,700
+            if (std::sscanf(argv[++a], "%d,%d,%d", &cells[0], &cells[1], &cells[2]) != 3) cells[1] = cells[2] = cells[0];
+            if (cells[0] < 6 || cells[1] < 6 || cells[2] < 6) {
+                std::printf("--cells needs at least 6 on every axis\n");
+                return 1;
+            }
+        } else {
             std::printf("unknown arg %s\n", arg.c_str());
             return 1;
         }
@@ -1127,7 +1156,11 @@ int main(int argc, char **argv) {
     if (balance) BalanceRung(steps ? steps : 20000, reports, false);
     if (soak) SoakRung(steps ? steps : 500000, reports, false);
     if (golden) GoldenRung(config_file, gen_dir, false);
-    if (roofline) RooflineRung(config_file, repeat == 4 ? 200 : repeat);
+    if (roofline) {
+        const int reps = repeat == 4 ? 200 : repeat;
+        if (cells[0] > 0) RooflineRung(AirGrid(cells[0], cells[1], cells[2], fcc), "air grid", reps);
+        else RooflineRung(LoadRoomScene(config_file), config_file, reps);
+    }
     if (implicit) {
         for (const auto &s : {Implicit2Pct, Implicit1Pct, ImplicitHalfPct}) ImplicitRung(s, count == 16 ? 96 : count, steps ? steps : 2000);
         // Two footprints, because the ceiling is a property of the footprint. The first is

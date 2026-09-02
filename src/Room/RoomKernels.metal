@@ -422,6 +422,68 @@ kernel void RoomImplicitJacobi(device float *xn, device const float *x, device c
     xn[ii] = bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z);
 }
 
+// The same three sums over a rigid box rather than a periodic one. A step that would leave
+// the grid comes back to the node one step inside it, which is the Neumann image of a wall
+// lying on the boundary node — exact for an axis-aligned box, and the same device the
+// explicit schemes use for their halo. The box a grid of N nodes spans is therefore
+// (N - 1) * h on that axis, and its discrete modes are cos(m*pi*i/(N-1)).
+//
+// This is not the paper's boundary condition. The paper carries a real admittance gamma and
+// names frequency-dependent walls as future work; gamma = 0 is a rigid wall, and for an
+// axis-aligned box the image above is what a rigid wall means. Nothing here reaches a wall
+// that absorbs. See RoomImplicitBox in RoomImplicit.cpp for what that costs the scheme.
+static inline void RoomImplicitSumsBox(device const float *u, int ix, int iy, int iz,
+                                       constant RoomImplicitParams &p, thread float3 &s) {
+    const int nzny = p.Nz * p.Ny;
+    const int xm = (ix == 0 ? 1 : ix - 1) * nzny, x0 = ix * nzny, xp = (ix == p.Nx - 1 ? p.Nx - 2 : ix + 1) * nzny;
+    const int ym = (iy == 0 ? 1 : iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy == p.Ny - 1 ? p.Ny - 2 : iy + 1) * p.Nz;
+    const int zm = (iz == 0 ? 1 : iz - 1), z0 = iz, zp = (iz == p.Nz - 1 ? p.Nz - 2 : iz + 1);
+
+    s.x = u[xm + y0 + z0] + u[xp + y0 + z0] + u[x0 + ym + z0] + u[x0 + yp + z0] + u[x0 + y0 + zm] + u[x0 + y0 + zp];
+    s.y = u[xm + ym + z0] + u[xm + yp + z0] + u[xp + ym + z0] + u[xp + yp + z0] +
+        u[xm + y0 + zm] + u[xm + y0 + zp] + u[xp + y0 + zm] + u[xp + y0 + zp] +
+        u[x0 + ym + zm] + u[x0 + ym + zp] + u[x0 + yp + zm] + u[x0 + yp + zp];
+    s.z = u[xm + ym + zm] + u[xm + ym + zp] + u[xm + yp + zm] + u[xm + yp + zp] +
+        u[xp + ym + zm] + u[xp + ym + zp] + u[xp + yp + zm] + u[xp + yp + zp];
+}
+
+kernel void RoomImplicitRhsBox(device float *bp, device const float *un, device const float *up,
+                               constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
+    if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
+    const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    float3 sn, sp;
+    RoomImplicitSumsBox(un, ix, iy, iz, p, sn);
+    RoomImplicitSumsBox(up, ix, iy, iz, p, sp);
+    bp[ii] = p.R1 * sn.x + p.R2 * sn.y + p.R3 * sn.z + p.Rc * un[ii] -
+        (p.Q1 * sp.x + p.Q2 * sp.y + p.Q3 * sp.z + up[ii]);
+}
+
+kernel void RoomImplicitJacobiBox(device float *xn, device const float *x, device const float *bp,
+                                  constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
+    if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
+    const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    float3 s;
+    RoomImplicitSumsBox(x, ix, iy, iz, p, s);
+    xn[ii] = bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z);
+}
+
+// Source and receiver for the implicit stepper. Receivers read the level behind, the way
+// RoomIo does, and the source adds into the level just solved before the rotation.
+kernel void RoomImplicitIo(device float *un, device float *out, device const float *up,
+                           device const int *out_ixyz, device const float *in_sigs,
+                           device const int *in_ixyz, constant RoomImplicitParams &p,
+                           constant RoomStepParams &st, uint i [[thread_position_in_grid]]) {
+    if (int(i) < p.Nr) {
+        out[int(i) * p.Nt + st.Step] = up[out_ixyz[i]];
+        return;
+    }
+    const int k = int(i) - p.Nr;
+    if (k >= p.Ns) return;
+    un[in_ixyz[k]] += in_sigs[k * p.Nt + st.Step];
+}
+
 // The traffic a sweep cannot avoid, with none of its work: the twelve bytes of two reads and
 // a write both kernels above move a node, over the same buffers and the same box.
 kernel void RoomImplicitStream(device float *xn, device const float *x, device const float *bp,

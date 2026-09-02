@@ -132,6 +132,27 @@ SCENES = {
         "duration": 1.0,
         "materials": CTK_MATERIALS,
     },
+    # The one production-resolution scene: RoomShoeboxFcc's own room, unchanged, at exactly
+    # twenty times its bandwidth. Twenty times the cells against a twentieth of the spacing is
+    # the same box to the millimetre, so the pair is one room at 1 kHz and at 20 kHz and every
+    # number that moves between them is bandwidth rather than geometry.
+    #
+    # Its walls carry a material where the validation shoeboxes are rigid, because a rigid box
+    # never decays and this is the scene meant to be listened to. Half a second is far longer
+    # than a 13 m3 room with plasterboard walls rings for.
+    #
+    # 616M nodes and 4.9 GB of two-level state: it fits this machine with room to spare, and it
+    # fits a rented 4090's 24 GB, which is what keeps a CUDA golden reachable at this size.
+    "RoomShoeboxFccFull": {
+        "fcc": True,
+        "shoebox_cells": (1340, 1040, 860),
+        "fmax": 20000.0,
+        "PPW": 7.7,
+        "duration": 0.5,
+        "source": SHOEBOX_SOURCE,
+        "receivers": SHOEBOX_RECEIVERS,
+        "materials": {"Walls": "ctk_walls.h5"},
+    },
 }
 
 
@@ -147,11 +168,12 @@ def model_json_path(scene, sim_dir):
 
 
 def write_shoebox_model(scene, path):
-    """A rigid box in the model-export format the reference's Sketchup plugin writes.
+    """A box in the model-export format the reference's Sketchup plugin writes.
 
-    Sides are 0 and the material is _RIGID, which is how that format spells an unlabelled
-    surface. Normals point out of the room so the reference's divergence-theorem volume
-    comes out positive.
+    Sides are 0, and the surface carries whichever single material the scene names — _RIGID,
+    which is how that format spells an unlabelled surface, unless `materials` gives one.
+    Normals point out of the room so the reference's divergence-theorem volume comes out
+    positive.
     """
     h = grid_spacing(scene)
     Lx, Ly, Lz = (n * h for n in scene["shoebox_cells"])
@@ -178,9 +200,10 @@ def write_shoebox_model(scene, path):
     def place(fracs):
         return [f * L for f, L in zip(fracs, (Lx, Ly, Lz))]
 
+    label = next(iter(scene.get("materials", {})), "_RIGID")
     model = {
         "mats_hash": {
-            "_RIGID": {
+            label: {
                 "tris": tris,
                 "pts": pts,
                 "sides": [0] * len(tris),

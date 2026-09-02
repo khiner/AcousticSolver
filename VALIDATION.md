@@ -645,7 +645,7 @@ build/RoomTest --tube --length 4000    # a longer impedance tube
 build/RoomTest --soak --steps 1000000  # a longer soak
 build/RoomTest --roofline --scene ../Scenes/RoomChurch/config.json   # both passes against their own plain streams
 build/RoomTest --roofline --fcc --cells 1000 --repeat 20              # the same on a bare air grid of any size
-build/RoomTest --implicit              # the Smits & Bilbao 2025 implicit scheme, measured against both
+build/RoomTest --implicit              # the Smits & Bilbao 2025 implicit scheme: dispersion, a rigid box, and what it costs
 build/RoomTest --golden --scene ../Scenes/RoomChurch/config.json --gen ../gen/room/RoomChurch
 script/ValidateRoom                    # the regression gate: the ladder, then all five scenes (~55s)
 script/RunRoomReference --score        # what the reference engines score against their own fp64 truth
@@ -918,6 +918,40 @@ The whole margin is node-steps again, and more of it than FCC's was: 29× fewer 
 In bytes the implicit step moves 77.5 GB against the FCC step's 459 GB, a ratio of 5.9× where the time ratio is 4.7×, and the difference is footprint: at 4.3 MB a pass the implicit church's passes reach 323 GB/s where the FCC church's reach 409.
 The scheme does stream properly at scale — over a 384³ box, 680 MB a pass, a step runs at 334 GB/s, which is 81% of that footprint's 413 GB/s two-level stream, in the same band as the explicit church's 91%.
 The one pass that falls short is the right-hand side, at 63% of the stream: it reads two grids with 27-point neighbourhoods rather than one, and two independent gather patterns do not cache as well as one.
+
+### A rigid box, and what a boundary costs
+
+`--implicit` also runs the scheme in a rigid box rather than a periodic one, which is the rung that would say whether it is a room solver.
+The wall is the Neumann image the explicit schemes use for their halo: a step that would leave the grid comes back to the node one step inside, so a grid of N nodes spans (N−1)h and the discrete modes are cos(mπi/(N−1)).
+That image makes the mode an exact discrete eigenvector the same way the periodic wrap makes a plane wave one — at i = 0 both neighbours are i = 1 and the cosine's evenness supplies the identity, at i = N−1 both are N−2 and cos(mπ − k) = cos(mπ)cos(k) supplies it again — so one step reads 2cos(ωT) − 1 back at the corner and the measurement is exact.
+
+**The interior is right.** Over the 16 lowest modes of a 40 × 33 × 28 box the scheme lands within **0.026% of Morse & Ingard**, against the explicit Cartesian scheme's 0.033% and the FCC scheme's 0.9–2.0%, and within **1.2e-5** of the relation its own floats give, which is the Jacobi truncation and single precision together.
+At 2.68 points per wavelength it resolves a room's modes as well as a 10.5-point grid does.
+
+**The wall is unstable, and not for want of a smaller Courant number.**
+Seeded with noise so every eigenvalue is excited, and judged on whether the envelope of max|u| in the last tenth of a run matches the first tenth:
+
+| λ | of the free-space limit | envelope | |
+|---|---|---|---|
+| 0.8400 | 100% | 18.4 → 101.4 | grows |
+| 0.7980 | 95% | 4.80 → 16.7 | grows |
+| 0.7560 | 90% | 3.59 → 7.11 | grows |
+| 0.7140 | 85% | 4.11 → 3.83 | holds |
+| 0.6720 | 80% | 3.24 → 2.96 | holds |
+| 0.5880 | 70% | 2.89 → 5.89 | grows |
+| 0.5040 | 60% | 2.19 → 2.46 | grows |
+| 0.4200 | 50% | 2.53 → 3.27 | grows |
+
+**A Courant condition is monotone and this is not**, so lowering λ is not the fix — half the free-space limit still grows.
+A single mode hides it for a long time: at the published λ the mode (0,1,1) reads 1.0026 against an exact 1.0020 after 5,000 steps and 1.038 after 20,000, then 10⁶ by 80,000, because what grows is an eigenvalue the seed barely projects onto until round-off finds it.
+That is why the sweep seeds noise, and it is worth keeping in mind for any invented boundary: a mode soak that looks clean for twenty thousand steps is not evidence.
+
+The reason is visible in the operator. The periodic stencil the paper's stability analysis covers is symmetric; the image is not.
+At an edge node the step off the grid doubles a neighbour's weight, so the matrix carries a row of weight 2 against a column of weight 1 and is symmetric only in a weighted inner product — its spectrum is not the one Eq. 16's limit was derived for, and nothing about λ_max carries over.
+
+**So a rigid room is not free either**, which is the practical finding.
+The paper's own boundary is an admittance condition derived inside this lineage's energy framework, which is what makes such conditions provably stable, and it is not implemented here — substituting an image for it does not work at any Courant number tried.
+Integrating this scheme therefore starts one step earlier than the frequency-dependent walls below: it starts at the published boundary condition, on the rigid case, where there is at least a formulation to follow.
 
 **It is not integrated, and the obstacle is the walls rather than the arithmetic.**
 

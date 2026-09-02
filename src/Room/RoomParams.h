@@ -81,6 +81,7 @@ struct RoomStepParams {
 // neighbours, but nothing here assumes it.
 struct RoomImplicitParams {
     int Nx, Ny, Nz;
+    int Nr, Ns, Nt; // receiver corners, source corners, and the row stride of both arrays
     float R1, R2, R3, Rc;
     float Q1, Q2, Q3;
 };

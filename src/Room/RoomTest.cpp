@@ -55,6 +55,7 @@
 #include <filesystem>
 #include <fstream>
 #include <numbers>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -891,7 +892,7 @@ RoomImplicitParams ImplicitCoefficients(const ImplicitScheme &s, double lambda, 
     const double ediag = 6. * s.Lex[0] + 3. * s.Lex[1] + 2. * s.Lex[2];
     const double jd = 1. - (6. * s.Lim[0] + 3. * s.Lim[1] + 2. * s.Lim[2]);
     const double l2 = lambda * lambda;
-    return {nx, ny, nz, float((2. * n[0] + l2 * e[0]) / jd), float((2. * n[1] + l2 * e[1]) / jd), float((2. * n[2] + l2 * e[2]) / jd), float((2. * jd - l2 * ediag) / jd), float(n[0] / jd), float(n[1] / jd), float(n[2] / jd)};
+    return {nx, ny, nz, 0, 0, 0, float((2. * n[0] + l2 * e[0]) / jd), float((2. * n[1] + l2 * e[1]) / jd), float((2. * n[2] + l2 * e[2]) / jd), float((2. * jd - l2 * ediag) / jd), float(n[0] / jd), float(n[1] / jd), float(n[2] / jd)};
 }
 
 // What the scheme in force does to a plane wave, from those same floats. On a periodic box a
@@ -907,12 +908,15 @@ double ImplicitTwoCosOmegaT(const RoomImplicitParams &p, double kx, double ky, d
 }
 
 struct ImplicitBox {
-    ImplicitBox(const ImplicitScheme &s, int nx, int ny, int nz)
-        : Scheme(s), Lambda(std::min(s.Lambda, ImplicitCourantLimit(s))), P(ImplicitCoefficients(s, Lambda, nx, ny, nz)), Nodes(size_t(nx) * ny * nz) {
+    // `rigid` swaps the periodic wrap for the Neumann image of a wall on the boundary node,
+    // which turns the dispersion instrument into a room: a box of (N-1)*h on each axis whose
+    // discrete modes are cos(m*pi*i/(N-1)). Everything else about a step is unchanged.
+    ImplicitBox(const ImplicitScheme &s, int nx, int ny, int nz, bool rigid = false, double lambda = 0.)
+        : Scheme(s), Lambda(lambda > 0. ? lambda : std::min(s.Lambda, ImplicitCourantLimit(s))), P(ImplicitCoefficients(s, Lambda, nx, ny, nz)), Nodes(size_t(nx) * ny * nz) {
         for (auto *b : {&Prev, &Cur, &Bp, &Tmp}) b->ResizeZeroed(Nodes * sizeof(float));
         auto &ctx = MetalContext::Get();
-        Rhs = ctx.RoomPipeline("RoomImplicitRhs");
-        Jacobi = ctx.RoomPipeline("RoomImplicitJacobi");
+        Rhs = ctx.RoomPipeline(rigid ? "RoomImplicitRhsBox" : "RoomImplicitRhs");
+        Jacobi = ctx.RoomPipeline(rigid ? "RoomImplicitJacobiBox" : "RoomImplicitJacobi");
         Stream = ctx.RoomPipeline("RoomImplicitStream");
         Threads = {32, 4, 4};
         Tiles = {(uint32_t(nz) + Threads.x - 1) / Threads.x, (uint32_t(ny) + Threads.y - 1) / Threads.y, (uint32_t(nx) + Threads.z - 1) / Threads.z};
@@ -1020,6 +1024,163 @@ void ImplicitRung(const ImplicitScheme &scheme, int n, int steps) {
         peak = std::max(peak, std::abs(a));
     }
     std::printf("  %d steps at that mode: peak amplitude %.6f against the exact %.6f, worst deviation %.2e | %.1fs\n", steps, peak, 1. / c0, drift, Now() - t0);
+}
+
+// The implicit scheme in a rigid box, against Morse & Ingard. This is the rung that says
+// whether the scheme is a room solver rather than a dispersion instrument, and it is available
+// without any reference implementation: a rigid box has analytic eigenfrequencies at any grid
+// spacing, so nothing about it needs a golden.
+//
+// The Neumann image makes cos(m*pi*i/(N-1)) an exact discrete eigenvector, the same way the
+// periodic wrap does for a plane wave — at i = 0 both neighbours are i = 1 and the cosine's
+// evenness supplies the identity, and at i = N-1 both are N-2 and cos(m*pi - k) = cos(m*pi)
+// cos(k) supplies it again. So seeding both levels with a mode and stepping once reads
+// 2 cos(wT) - 1 back at the corner, exactly as in free space, and two errors separate:
+// against the relation the floats in force give, which is the realisation (Jacobi truncation
+// and single precision), and against Morse & Ingard, which is the scheme.
+void ImplicitModeRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int count, int soak) {
+    const double t0 = Now();
+    const double h = 0.0326857142857142, c = 343.2;
+    ImplicitBox box(scheme, nx, ny, nz, true);
+    const double ts = box.Lambda * h / c;
+    const int n[3] = {nx, ny, nz};
+    const double side[3] = {(nx - 1) * h, (ny - 1) * h, (nz - 1) * h};
+
+    struct Mode {
+        int m[3];
+        double F;
+    };
+    std::vector<Mode> modes;
+    for (int a = 0; a <= 5; ++a) {
+        for (int b = 0; b <= 5; ++b) {
+            for (int d = 0; d <= 5; ++d) {
+                if (a + b + d == 0) continue;
+                const double f = .5 * c * std::sqrt(std::pow(a / side[0], 2.) + std::pow(b / side[1], 2.) + std::pow(d / side[2], 2.));
+                modes.push_back({{a, b, d}, f});
+            }
+        }
+    }
+    std::sort(modes.begin(), modes.end(), [](const Mode &p, const Mode &q) { return p.F < q.F; });
+    if (int(modes.size()) > count) modes.resize(size_t(count));
+
+    std::printf("[implicit] %s rigid %d x %d x %d box, %.3f x %.3f x %.3f m, lambda %.3f, %d Jacobi sweeps\n", scheme.Name, nx, ny, nz, side[0], side[1], side[2], box.Lambda, scheme.Sweeps);
+    std::printf("  %-8s %12s %12s %10s %12s\n", "mode", "analytic Hz", "measured Hz", "error", "vs relation");
+
+    std::vector<float> seed(box.Nodes);
+    double worst_analytic = 0., worst_relation = 0.;
+    for (const auto &mode : modes) {
+        double k[3];
+        for (int a = 0; a < 3; ++a) k[a] = std::numbers::pi * mode.m[a] / (n[a] - 1);
+        for (int ix = 0; ix < nx; ++ix) {
+            const double cx = std::cos(k[0] * ix);
+            for (int iy = 0; iy < ny; ++iy) {
+                const double cy = std::cos(k[1] * iy);
+                for (int iz = 0; iz < nz; ++iz) {
+                    seed[size_t(ix) * ny * nz + size_t(iy) * nz + iz] = float(cx * cy * std::cos(k[2] * iz));
+                }
+            }
+        }
+        box.Prev.Upload(seed.data(), seed.size() * sizeof(float));
+        box.Cur.Upload(seed.data(), seed.size() * sizeof(float));
+        box.Step();
+
+        // The corner, where every cosine is 1 and the seed is largest.
+        const double measured = double(box.Cur.As<float>()[0]) + 1.;
+        const double predicted = ImplicitTwoCosOmegaT(box.P, k[0], k[1], k[2]);
+        if (!(std::abs(measured) < 2.)) {
+            std::printf("  %d,%d,%d  mode is not resolved by this grid\n", mode.m[0], mode.m[1], mode.m[2]);
+            continue;
+        }
+        const double f_m = std::acos(measured / 2.) / (2. * std::numbers::pi * ts);
+        const double f_p = std::acos(predicted / 2.) / (2. * std::numbers::pi * ts);
+        const double err = f_m / mode.F - 1.;
+        worst_analytic = std::max(worst_analytic, std::abs(err));
+        worst_relation = std::max(worst_relation, std::abs(f_m - f_p) / f_p);
+        std::printf("  %d,%d,%d    %12.5f %12.5f %+9.4f %% %12.2e\n", mode.m[0], mode.m[1], mode.m[2], mode.F, f_m, 100. * err, std::abs(f_m - f_p) / f_p);
+    }
+    std::printf("  worst vs Morse & Ingard %.4f %%, worst vs the relation the floats in force give %.2e\n", 100. * worst_analytic, worst_relation);
+
+    // A one-step reading cannot see an unstable wall, which is the failure mode a boundary
+    // condition invented for a scheme has. Run the highest mode tested for `steps` steps: with
+    // both levels seeded alike the modal amplitude is cos((n - 1/2) wT) / cos(wT/2) exactly, so
+    // any growth is the boundary and not the scheme.
+    const auto &last = modes.back();
+    double k[3];
+    for (int a = 0; a < 3; ++a) k[a] = std::numbers::pi * last.m[a] / (n[a] - 1);
+    for (int ix = 0; ix < nx; ++ix) {
+        const double cx = std::cos(k[0] * ix);
+        for (int iy = 0; iy < ny; ++iy) {
+            const double cy = std::cos(k[1] * iy);
+            for (int iz = 0; iz < nz; ++iz) seed[size_t(ix) * ny * nz + size_t(iy) * nz + iz] = float(cx * cy * std::cos(k[2] * iz));
+        }
+    }
+    box.Prev.Upload(seed.data(), seed.size() * sizeof(float));
+    box.Cur.Upload(seed.data(), seed.size() * sizeof(float));
+    const double wt = std::acos(ImplicitTwoCosOmegaT(box.P, k[0], k[1], k[2]) / 2.), c0 = std::cos(wt / 2.);
+    double drift = 0., peak = 0.;
+    for (int i = 0; i < soak; ++i) {
+        box.Step();
+        const double a = double(box.Cur.As<float>()[0]);
+        drift = std::max(drift, std::abs(a - std::cos((i + 1.5) * wt) / c0));
+        peak = std::max(peak, std::abs(a));
+    }
+    std::printf("  mode %d,%d,%d held %d steps: peak %.6f against the exact %.6f, worst deviation %.2e | %.1fs\n", last.m[0], last.m[1], last.m[2], soak, peak, 1. / c0, drift, Now() - t0);
+}
+
+// What Courant number the rigid box actually holds at, which is a different number from the
+// free-space one the scheme is published with and is the reason this boundary is not a room
+// solver yet.
+//
+// The periodic operator the paper's stability analysis covers is symmetric. The Neumann image
+// is not: at an edge node the step off the grid doubles a neighbour's weight, so the matrix
+// picks up a row of weight 2 against a column of weight 1, and is only symmetric in a weighted
+// inner product. Its spectrum is therefore not the one Eq. 16's limit was derived for, and
+// nothing guarantees lambda_max carries over. This sweep measures what does.
+void ImplicitBoxCourantRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int soak) {
+    const double t0 = Now();
+    const double free_limit = std::min(scheme.Lambda, ImplicitCourantLimit(scheme));
+    const int n[3] = {nx, ny, nz};
+    std::printf("[implicit] %s rigid %d x %d x %d box: what Courant number holds, %d steps a leg\n", scheme.Name, nx, ny, nz, soak);
+    std::printf("  free-space limit is %.4f, seeded with noise so every eigenvalue is excited\n", free_limit);
+
+    double best = 0.;
+    for (const double scale : {1.0, 0.95, 0.9, 0.85, 0.8, 0.7, 0.6, 0.5}) {
+        const double lambda = free_limit * scale;
+        ImplicitBox box(scheme, nx, ny, nz, true, lambda);
+        // Noise, not a mode. An unstable wall is one eigenvalue outside the unit circle, and
+        // which one is not known in advance — seeding a single mode finds it only if that mode
+        // happens to project onto it, which is why a mode soak can read clean for twenty
+        // thousand steps and diverge by eighty. Noise projects onto all of them at once.
+        std::mt19937 rng{12345};
+        std::uniform_real_distribution<float> uniform{-1.f, 1.f};
+        std::vector<float> seed(box.Nodes);
+        for (auto &v : seed) v = uniform(rng);
+        box.Prev.Upload(seed.data(), seed.size() * sizeof(float));
+        box.Cur.Upload(seed.data(), seed.size() * sizeof(float));
+
+        // The envelope, not a threshold: an energy-conserving scheme holds max|u| flat, so what
+        // says stable is the last tenth of the run reading like the first tenth. A peak alone
+        // cannot separate growth from the interference a noise seed makes on its own.
+        const auto envelope = [&](int from, int to) {
+            double m = 0.;
+            for (int i = from; i < to; ++i) {
+                box.Step();
+                if ((i + 1) % 250 && i + 1 != to) continue; // the readback synchronises, so sample it
+                const float *u = box.Cur.As<float>();
+                for (size_t j = 0; j < box.Nodes; j += 97) m = std::max(m, std::abs(double(u[j])));
+            }
+            return m;
+        };
+        const double early = envelope(0, soak / 10);
+        envelope(soak / 10, soak - soak / 10);
+        const double late = envelope(soak - soak / 10, soak);
+        const double growth = late / early;
+        const bool held = growth < 1.05 && std::isfinite(growth);
+        if (held && lambda > best) best = lambda;
+        std::printf("  lambda %.4f (%.0f%% of free space)  envelope %.4g -> %.4g, x%-10.4g  %s\n", lambda, 100. * scale, early, late, growth, held ? "holds" : "GROWS");
+    }
+    if (best > 0.) std::printf("  largest holding: lambda %.4f, %.0f%% of the free-space limit | %.1fs\n", best, 100. * best / free_limit, Now() - t0);
+    else std::printf("  nothing held: the image is unstable at every Courant number tried | %.1fs\n", Now() - t0);
 }
 
 // What a step of the implicit scheme costs, against the traffic it cannot avoid. A sweep and
@@ -1167,6 +1328,8 @@ int main(int argc, char **argv) {
         // RoomChurch's own 21.0 x 13.7 x 7.4 m room at the 1% scheme's grid step of 183 mm,
         // from the 2.68 points per wavelength measured above at 700 Hz. The second is large
         // enough to be served by DRAM rather than cache, where a full-bandwidth room sits.
+        ImplicitModeRung(Implicit1Pct, 40, 33, 28, count == 16 ? 16 : count, steps ? steps : 20000);
+        ImplicitBoxCourantRung(Implicit1Pct, 40, 33, 28, steps ? steps : 20000);
         ImplicitCostRung(Implicit1Pct, 116, 76, 41, repeat == 4 ? 200 : repeat);
         ImplicitCostRung(Implicit1Pct, 384, 384, 384, repeat == 4 ? 20 : repeat);
     }

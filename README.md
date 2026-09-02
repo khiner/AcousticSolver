@@ -4,17 +4,18 @@ Each is validated against its reference implementation or an analytic ladder —
 
 ## WaveBlender
 
-A from-scratch Metal port of [WaveBlender](https://github.com/kangruix/WaveBlender) (Xue et al., SIGGRAPH Asia 2024), an FDTD acoustic wave solver that renders sound for animated scenes from coupled sources: vibrating rigid bodies (modal), water bubbles, speakers, point impulses, and occluders.
-Output is validated per-scene against the CUDA reference's listener outputs, committed under `gen/cuda/` — see [VALIDATION.md](VALIDATION.md), which also covers the five places this deliberately departs from the reference, including a modal timestep bug that puts the three Modal scenes at envelope rather than waveform agreement until the references are regenerated.
+A from-scratch Metal port of [WaveBlender](https://github.com/kangruix/WaveBlender) (Xue et al., SIGGRAPH Asia 2024), an FDTD acoustic solver for animated scenes with coupled modal bodies, water bubbles, speakers, point impulses, and occluders.
+Per-scene listener output is validated against the CUDA reference under `gen/cuda/`.
+[VALIDATION.md](VALIDATION.md) also documents five intentional departures, including a reference modal-timestep bug that limits the three Modal scenes to envelope agreement until their goldens are regenerated.
 
-The ~12 GB of scene data is not vendored: run `script/FetchScenes` to download it into `Scenes/` (checksummed against `script/scenes.sha256`).
-Ten scenes come from the WaveBlender dataset and include their own `config.json`. Cymbal and WineglassTap come from the earlier wavesolver dataset ([Wang et al. 2018](https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html)), which WaveBlender used but never re-published.
-The fetch script renames and moves their files into our layout, and their configs are in `config/`.
+The approximately 12 GB scene dataset is not vendored.
+`script/FetchScenes` downloads it into `Scenes/` and verifies it against `script/scenes.sha256`.
+Ten scenes come from the WaveBlender dataset with their own `config.json`; Cymbal and WineglassTap come from the earlier wavesolver dataset ([Wang et al. 2018](https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html)), which WaveBlender used but did not republish.
+The fetch script maps those two scenes into this repository's layout, with configs under `config/`.
 
 Wall-clock per scene. CUDA reference on an RTX 4090 (Linux, CUDA 12.8), Metal on an Apple M5 Max.
-The Metal column is a cool sweep — one scene per idle GPU, two minutes apart, on an otherwise
-quiet machine — because this GPU's thermal drift is large enough (a scene measures 43s cool and
-53s heat-soaked) that back-to-back suite timings are not comparable across runs:
+The Metal column is a cool sweep: one scene per idle GPU, two minutes apart, on an otherwise quiet machine.
+Thermal drift can move one scene from 43s cool to 53s heat-soaked, so back-to-back suite timings are not comparable across runs.
 
 | Scene | RTX 4090 | Initial Metal port | Current |
 |---|---|---|---|
@@ -32,63 +33,45 @@ quiet machine — because this GPU's thermal drift is large enough (a scene meas
 | WineglassTap | 32.0s | — | 2.7s |
 | **Total** | **1354.3s** | **1170.0s** (ten scenes) | **290.0s** |
 
-Cymbal and WineglassTap were added after the initial port, so the middle column is empty for
-them. Cymbal's 10.2s reads its 11 GB of per-frame shell data from the page cache. The first read
-from disk takes 40.9s. The reference read the same data from a RAM disk.
+Cymbal and WineglassTap were added after the initial port, so they have no middle-column result.
+Cymbal's 10.2s result reads its 11 GB of per-frame shell data from the page cache; a cold read takes 40.9s, while the reference used a RAM disk.
 
 Notable performance changes relative to upstream WaveBlender:
 
-- Three scenes step at the grid's Courant limit rather than at the audio rate they inherited (TalkFan/Trumpet 88.2 → 66.15 kHz, 2016Pour 192 → 128 kHz): 1.34–1.5× fewer timesteps, and *less* numerical dispersion, since this scheme's spatial and temporal truncation errors cancel most fully at the stability limit. Retimed configs live in `config/`; the CUDA reference was regenerated at the matching rates so the validation verdicts are unchanged.
+- Three scenes use the grid's Courant limit instead of their inherited audio rate (TalkFan/Trumpet 88.2 → 66.15 kHz, 2016Pour 192 → 128 kHz). This takes 1.34–1.5× fewer timesteps and reduces numerical dispersion because the spatial and temporal truncation errors cancel most fully at the stability limit. Retimed configs live in `config/`, with regenerated CUDA references at matching rates.
 - One fused full-grid kernel per FDTD step (velocity + pressure, ping-pong buffers) instead of separate passes, with byte cell states and blending weights derived in-kernel.
-- PML split-pressure fields packed into dense shell slabs (full-grid storage left most of each cache line untouched in the x-tapered strips), and threadgroup shapes chosen per scene grid size.
-- Boundary conditions applied to the velocities as they are written by the fused step, rather than by a separate dispatch per timestep, so each thread transforms exactly the faces it owns.
-  A runtime probe picks this or the standalone dispatches per scene.
-- The GPU runs batch N while the CPU prepares batch N+1, with one sync per batch.
-  The next batch's command buffers are encoded and committed before the sync (gated on a shared event the host signals after its fresh-cell writes), and the fresh-cell least-squares systems are factorized pre-sync, so the GPU restarts almost immediately.
-  Batches with no fresh cells — half of them in a typical animated scene, all of them in some — have nothing for the host to write, so their gate opens *before* the sync and the host round trip leaves the GPU's critical path entirely.
-- Bubble mass-matrix inverses are precomputed on worker threads with Accelerate (AMX) and chained across adjacent event intervals by low-rank updates, so the coupled-bubble solve applies two matrix-vector products per RK4 stage.
-  Those two products are independent, so they run on separate cores once an inverse outgrows the cache, which also keeps the solve thread out of the precompute workers' memory bandwidth.
+- PML split-pressure fields packed into dense shell slabs instead of sparse full-grid storage, with threadgroup shapes selected for each scene's grid size.
+- Boundary conditions applied as the fused step writes velocity, so each thread transforms only the faces it owns. A runtime probe chooses between this path and standalone dispatches for each scene.
+- The GPU runs batch N while the CPU prepares batch N+1, with one synchronization per batch. Command buffers are committed before the sync behind a shared-event gate, and fresh-cell systems are factorized in advance. Batches without fresh cells open the gate before the sync and remove the host round trip from the GPU's critical path.
+- Bubble mass-matrix inverses are precomputed on Accelerate worker threads and chained across adjacent event intervals with low-rank updates. The coupled-bubble solve then applies two independent matrix-vector products per RK4 stage, using separate cores once an inverse outgrows the cache.
 - The fresh-cell least-squares solve runs per connected component, in parallel.
 - Modal filter coefficients are computed once, and modal transfer-matrix rows are reused across batches when the pose and boundary face are unchanged.
 - Flat, data-oriented CPU batch prep: lookup tables instead of sets/maps, bounds-limited grid sweeps, time-windowed impulse queries, and parallel rasterization and closest-point queries.
 
 ## SonicRadiation
 
-A second, independent solver implementing [SonicRadiation](https://arxiv.org/abs/2508.08775) (Jin, Zhu, Wang, Li — CAVW/CASA 2026), written from the paper; no reference implementation is public.
-It shares this repo's Metal runtime, scene configs, mesh loading and listener output with the WaveBlender path, and nothing else — `src/Radiation/` is a parallel solver, not a mode of the first one.
+`src/Radiation/` is an independent implementation of [SonicRadiation](https://arxiv.org/abs/2508.08775) (Jin, Zhu, Wang, Li — CAVW/CASA 2026), written from the paper because no reference implementation is public.
+It shares the Metal runtime, scene format, mesh loading, and listener output with WaveBlender but uses a separate solver.
 
-Where WaveBlender rasterizes solids into the grid and reconciles the boundary with ghost cells, fresh-cell extrapolation and per-cell blending weights, this method deletes that entire stack. Every cell is an air cell. A time-domain BEM (BDF2 convolution quadrature) carries the near-field boundary potentials on the object's own triangles, a scalar second-order FDTD grid carries far-field transport, and the two couple through purely local per-step operations:
+SonicRadiation couples a time-domain boundary-element method on the object's triangle mesh to a scalar FDTD grid for far-field transport.
+The GPU time loop requires no fresh-cell solve, rasterization synchronization, or other per-batch host round trip.
+Moving rigid bodies are supported by rebuilding geometry-dependent data between simulation epochs.
 
-- Each cell stores only its **far-field** pressure — the contribution of boundary elements outside its Chebyshev-R1 neighbourhood. Neighbour terms in the Laplacian are corrected for the set difference between adjacent cells' far sets by direct retarded-potential evaluation (the paper's Eq. 12).
-- Element Dirichlet values close the system each step: near elements by direct BEM sums, far elements by trilinear interpolation of grid far-field values re-based onto the element's own far set (Eqs. 17–20).
-- The domain is terminated by the same quadratic-ramp split-field PML as the main solver, run as the first-order pressure–velocity system in an 8-cell shell. Eliminating the velocities from that staggered scheme yields exactly the interior's scalar update, so the seam adds no scheme mismatch beyond the PML's own reflection floor.
-
-There is no per-batch host round trip in the time loop at all — no fresh cells to solve, no rasterization to sync on. A batch uploads its Neumann samples and runs.
+The method targets closed, rigid, modal bodies.
+Water, speakers, point impulses, occluders, and thin shells remain on the WaveBlender path.
+Listener output is available both as a grid sample and through the paper's retarded-potential evaluation, written under `build/radiation/` as `<output>_grid.bin` and `<output>_eq5.bin` with metadata in `<output>.json`.
 
 ```
-build/AcousticSolver --radiation config/WineglassTap.json                # render a scene
-build/AcousticSolver --radiation --seconds 0.3 config/WineglassTap.json  # just the first 0.3s
-build/RadiationTest                                                     # the validation ladder (~0.7s)
-build/RadiationTest --mesh <obj> --cell <metres>                        # what remeshing does to a scene mesh
-build/RadiationTest --stability --time 10                               # long-run growth probe
-build/RadiationTest --move 2.0 --epoch 16                               # dynamic geometry
-script/ValidateRadiation                                                # the regression gate (~8s)
-script/RadiationBench --rounds 3 RadiationTest --v2 --res 60            # interleaved A/B against another commit
-script/RadiationModes                                                   # per-mode cross-check against the WaveBlender path
+build/AcousticSolver --radiation config/WineglassTap.json
+build/AcousticSolver --radiation --seconds 0.3 config/WineglassTap.json
+build/RadiationTest
+script/ValidateRadiation
+script/RadiationModes
 ```
 
-The gate is the ladder under `RadiationTest --gate`, where every rung is checked against the value recorded in [VALIDATION.md](VALIDATION.md) rather than merely printed, plus a scene render byte-compared against `gen/radiation/`. `config/WineglassTap_move.json` is the moving scene it renders — 50 ms of the wineglass translating and rotating, 11 geometry epochs — since every config from the dataset carries an identity animation track and would leave the epoch path uncovered.
-
-A body that moves follows its scene's animation track: the geometry tables are rebuilt at epochs paced by how far the body has travelled rather than by a step count, each set built for the midpoint of the interval it serves, on a worker thread while the GPU steps the previous one. Two things make a rebuild affordable enough to hide. The convolution-quadrature weights of every non-self pair are a scaled sum of two universal functions of the retarded delay, tabulated once, so a rebuild costs no contour transforms at all; and an epoch carries its element-element weights over from the last one, since rigid motion leaves every quantity they are built from alone. WineglassTap's scene build is 1.8s against 6.3s before, of which the tables are 0.78s. An epoch after the first also builds its weights straight into the half-precision layout the GPU reads, so the float copies — some 2.5 GB for this scene — are never allocated.
-
-Scope is what the method covers: closed, rigid, modal bodies. Water, speakers, point impulses, occluders and thin shells stay on the WaveBlender path. Listener output is written on both paths the method offers — the grid sample and the Eq. 5 retarded-potential evaluation — into `build/radiation/` as `<output>_grid.bin` and `<output>_eq5.bin`, with the step rate in `<output>.json` (it runs at the grid's Courant limit, not the config's FDTD rate). They have opposite error profiles (grid dispersion versus convolution-quadrature frequency warping), so which one wins depends on the listener's distance.
-
-WineglassTap renders in under eight minutes on an M5 Max — 118,888 steps at the grid's Courant limit, over 13,852 boundary elements and 1.2 GB of convolution-quadrature tables. About four fifths of a step is the two convolution passes over those tables; the scalar FDTD interior that the WaveBlender path spends nearly all its time in is 0.4% here. Those passes are bound by the weight stream rather than by the arithmetic over it, which is why the weights are signed bytes with a power-of-two scale per lag window. The method buys the vanished host round trip and a boundary treatment with no ghost cells, and pays for it in the boundary integral.
-
-Departures from the paper, all forced by measurement (see [VALIDATION.md](VALIDATION.md)):
-
-- The paper's literal near-set radii leave the boundary–grid feedback loop with gain slightly above one. The defaults here are R1=2 (rather than 1) plus a one-zero filter on the interpolated far-field feedback, which nulls the grid-Nyquist mode the loop amplifies.
-- Element counts, and therefore every table built over them, scale near-quadratically with mesh density, so scene meshes are retargeted to the grid by incremental isotropic remeshing before anything else happens.
+`script/ValidateRadiation` checks analytic behavior, stability, moving geometry, and deterministic scene output against the committed golden.
+`script/RadiationModes` cross-checks modal output against WaveBlender.
+[VALIDATION.md](VALIDATION.md) records the numerical methods, implementation departures, thresholds, and detailed results.
 
 ## Room acoustics
 

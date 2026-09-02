@@ -37,6 +37,12 @@
 //              oversampling ratio it needs for 1% worst-direction phase error, and what a
 //              step costs against the traffic it cannot avoid. --count sets the box side and
 //              --repeat the dispatch count of the cost measurement.
+//   --projection A tiny runtime check of the implicit solver's zero-mean projection:
+//              recursive reduction, interval scheduling, and preservation of outside zeros.
+//   --marginal The R111 room at 8 cm: growth against Jacobi sweep count, then receiver and
+//              mean behavior at three projection cadences. --steps may shorten every leg.
+//   --projection-cost The isolated pair projection beside a whole implicit step, at the two
+//              footprints used by the implicit cost rung.
 //
 // Set ACOUSTIC_ROOM_KERNEL_TIMES to have every dispatch isolated in its own command buffer
 // and timed. That serializes the step, so it is a diagnostic run, not a mode to measure in.
@@ -49,6 +55,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -62,6 +69,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -83,6 +91,16 @@ void AtMost(const char *what, double got, double most) {
 
 double Now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+template<typename F> double TimeGpu(int reps, F &&once) {
+    auto &ctx = MetalContext::Get();
+    for (int round = 0; round < 2; ++round) {
+        for (int i = 0; i < reps; ++i) once();
+        ctx.Sync();
+        if (round == 0) ctx.TakeBatchGpuSeconds();
+    }
+    return ctx.TakeBatchGpuSeconds() / reps;
 }
 
 struct Box {
@@ -844,639 +862,22 @@ void GoldenRung(const std::string &config_file, const std::string &gen_dir, bool
     }
 }
 
-// --- The optimised implicit scheme of Smits & Bilbao 2025 -------------------------------
-//
-// Free space on a periodic box, no boundaries: the question is whether the interior economics
-// beat the explicit FCC scheme's, and the paper's own boundary conditions are
-// frequency-independent, so they could not carry these scenes' walls anyway.
+#include "RoomImplicit.inc"
 
-// A scheme in the paper's parameters: the weights of the three compact Laplacians in the
-// explicit and implicit operators, the Courant number it is stable to, the dispersion-error
-// threshold it was optimised against, and the Jacobi iteration count Table II records for it.
-struct ImplicitScheme {
-    const char *Name;
-    double Lex[3], Lim[3], Lambda, Eps;
-    int Sweeps;
-};
-
-// Table II, row IM at each of the three dispersion-error thresholds. Each is measured against
-// its own threshold, since that is what its parameters were optimised for. The 1% row is the
-// threshold both explicit schemes are calibrated at.
-constexpr ImplicitScheme Implicit2Pct{"IM 2%", {0.390, 0.610, 0.000}, {0., 2.09e-3, 41.17e-3}, 0.845, .02, 7};
-constexpr ImplicitScheme Implicit1Pct{"IM 1%", {0.404, 0.553, 0.043}, {0., 9.75e-3, 28.37e-3}, 0.840, .01, 7};
-constexpr ImplicitScheme ImplicitHalfPct{"IM 0.5%", {0.400, 0.580, 0.020}, {0., 0.91e-3, 29.95e-3}, 0.850, .005, 6};
-
-// Where the drop-ghost wall effectively sits, in cells beyond the outermost node, as
-// ImplicitModeRung fits it. The full cell puts it at 0.5 and the 27-point stencil's own
-// boundary layer pulls it in; the fit drifts with grid size (0.48 at N ~ 11, 0.44 at N ~ 33),
-// so this is the value for room-sized grids and the rung that measures it prints its own.
-constexpr double ImplicitWallOffset = 0.44;
-
-// The Courant limit the scheme's own parameters give, from the paper's Eq. 16: with
-// lbar_ex(b) = -sum_r l_r^ex L_r(b) and lbar_im(b) = 1 + sum_r l_r^im L_r(b) evaluated at the
-// three corner cases of Table I, stability needs lambda^2 <= 4 lbar_im / lbar_ex at each.
-// Recomputed rather than read off Table II's lambda_max, which is rounded to three places:
-// IM 0.5%'s 0.850 is above its own limit of 0.8494, and grows a free-space mode by four orders
-// of magnitude in 2000 steps.
-double ImplicitCourantLimit(const ImplicitScheme &s) {
-    static constexpr double L[3][3] = {{-4., -4., -4.}, {-8., -4., 0.}, {-12., 0., -4.}};
-    double limit = 1e30;
-    for (const auto &lb : L) {
-        double ex = 0., im = 1.;
-        for (int r = 0; r < 3; ++r) {
-            ex -= s.Lex[r] * lb[r];
-            im += s.Lim[r] * lb[r];
-        }
-        if (ex > 0.) limit = std::min(limit, std::sqrt(4. * im / ex));
-    }
-    return limit;
-}
-
-// The scheme's coefficients as the kernels hold them, narrowed to float once here so that
-// everything predicted about the scheme is predicted from the numbers in force. The three
-// Laplacians contribute S1 - 6u, S2/4 - 3u and S3/4 - 2u, so a weight vector l gives neighbour
-// coefficients (l0, l1/4, l2/4) and a diagonal of -(6 l0 + 3 l1 + 2 l2), and the whole system
-// is divided through by the implicit operator's diagonal.
-RoomImplicitParams ImplicitCoefficients(const ImplicitScheme &s, double lambda, int nx, int ny, int nz) {
-    const double e[3] = {s.Lex[0], s.Lex[1] / 4., s.Lex[2] / 4.};
-    const double n[3] = {s.Lim[0], s.Lim[1] / 4., s.Lim[2] / 4.};
-    const double ediag = 6. * s.Lex[0] + 3. * s.Lex[1] + 2. * s.Lex[2];
-    const double jd = 1. - (6. * s.Lim[0] + 3. * s.Lim[1] + 2. * s.Lim[2]);
-    const double l2 = lambda * lambda;
-    return {nx, ny, nz, 0, 0, 0, 0, float((2. * n[0] + l2 * e[0]) / jd), float((2. * n[1] + l2 * e[1]) / jd), float((2. * n[2] + l2 * e[2]) / jd), float((2. * jd - l2 * ediag) / jd), float(n[0] / jd), float(n[1] / jd), float(n[2] / jd)};
-}
-
-// What the scheme in force does to a plane wave, from those same floats. On a periodic box a
-// plane wave is an exact discrete eigenvector, and the neighbour sums have symbols
-// S1 = 2(cx+cy+cz), S2 = 4(cx cy + cx cz + cy cz), S3 = 8 cx cy cz, so the modal amplitude
-// obeys a^(n+1) = 2 cos(wT) a^n - a^(n-1) with the ratio below. Started from a^0 = a^1 = 1,
-// a^2 + 1 is 2 cos(wT) exactly, which is what the rung reads off the grid in one step.
-double ImplicitTwoCosOmegaT(const RoomImplicitParams &p, double kx, double ky, double kz) {
-    const double cx = std::cos(kx), cy = std::cos(ky), cz = std::cos(kz);
-    const double s1 = 2. * (cx + cy + cz), s2 = 4. * (cx * cy + cx * cz + cy * cz), s3 = 8. * cx * cy * cz;
-    const double off = p.Q1 * s1 + p.Q2 * s2 + p.Q3 * s3;
-    return 1. + ((p.R1 * s1 + p.R2 * s2 + p.R3 * s3 + p.Rc) - (off + 1.)) / (1. + off);
-}
-
-// The scheme's neighbour coefficients, undivided: the implicit operator's off-diagonals per
-// offset class, and the explicit one's. The three compact Laplacians contribute S1 - 6u,
-// S2/4 - 3u and S3/4 - 2u, so a weight vector l gives (l0, l1/4, l2/4).
-double ImplicitNim(const ImplicitScheme &s, int r) { return r == 0 ? s.Lim[0] : s.Lim[r] / 4.; }
-double ImplicitNex(const ImplicitScheme &s, int r) { return r == 0 ? s.Lex[0] : s.Lex[r] / 4.; }
-
-// A voxelised room: the 26 legs of every node that cross the surface, which of them the fill
-// reaches, and at every node the wall touches the true outward normal and the material of the
-// triangle it belongs to. Everything the boundary asks of geometry, precomputed, so a shape
-// backed by this answers the same questions a closed form does.
-struct ImplicitVoxels {
-    int N[3]{0, 0, 0};
-    std::vector<uint32_t> Blocked; // 26 bits a node, in ImplicitLegBit order
-    std::vector<uint8_t> Filled; // what the flood fill reaches
-    std::vector<float> Normals; // three a node, meaningful where the wall touches
-    std::vector<int8_t> Mat; // the material a wall node carries, -1 elsewhere
-    size_t At(int ix, int iy, int iz) const { return (size_t(ix) * size_t(N[1]) + size_t(iy)) * size_t(N[2]) + size_t(iz); }
-};
-
-// Which bit of a node's 26-leg mask an offset owns. The offsets run in raster order with the
-// node itself skipped, so this is a position in a 3x3x3 minus one.
-inline int ImplicitLegBit(int dx, int dy, int dz) {
-    const int i = (dx + 1) * 9 + (dy + 1) * 3 + (dz + 1);
-    return i < 13 ? i : i - 1;
-}
-
-// The room a grid holds, for the questions the boundary asks of geometry: is this node inside,
-// and what is the true outward normal at it. Three cases, all in closed form — the array
-// itself, a box yawed off the grid so its walls staircase, and a sphere, which carries every
-// orientation and a curvature at once. The last two are what the staircase-compensation paper
-// validates against, and between them there is no mesh and no voxeliser standing between the
-// geometry and the numbers.
-//
-// Node i sits at i, and the wall lies half a cell beyond the outermost node the room keeps —
-// the convention the box's own modes measure at (N + 0.44) h. So `inside` means at least half
-// a cell in from the surface, and the extents below are where the wall is, not where the last
-// node is.
-struct ImplicitShape {
-    enum Kind { Array,
-                Slanted,
-                Sphere,
-                Obstacle,
-                Voxels };
-
-    explicit ImplicitShape(const ImplicitVoxels &vox) : ImplicitShape(Voxels, vox.N[0], vox.N[1], vox.N[2]) { Vox = &vox; }
-
-    ImplicitShape(Kind k, int nx, int ny, int nz, double angle = 0.) : K(k), N{nx, ny, nz}, Cos(std::cos(angle)), Sin(std::sin(angle)) {
-        // Off the grid's centre by a different fraction of a cell on each axis. A shape
-        // centred on the grid is symmetric under the octahedral group, and its distinct
-        // boundary terms then come out forty-eight times too few — which would read as the
-        // code byte having room it does not have.
-        static constexpr double Break[3]{0.37, 0.19, 0.23};
-        double fit = 1e30;
-        for (int a = 0; a < 3; ++a) {
-            Cen[a] = .5 * (N[a] - 1) + (k == Array ? 0. : Break[a]);
-            fit = std::min(fit, std::min(Cen[a], N[a] - 1 - Cen[a]) + .5);
-        }
-        // A sphere is the largest the array holds; an obstacle is a column standing in it,
-        // small enough that its own wall is nowhere near the array's.
-        Rad = k == Obstacle ? .4 * fit : fit;
-        Ext[2] = std::min(Cen[2], N[2] - 1 - Cen[2]) + .5;
-        // The largest yawed box the array holds: a yaw of theta grows a half-extent's
-        // footprint on both in-plane axes by |cos| + |sin|.
-        Ext[0] = Ext[1] = std::min(fit, Ext[2]) / (std::abs(Cos) + std::abs(Sin));
-    }
-
-    const char *Name() const {
-        static const char *const Names[4]{"the array", "a yawed box", "a sphere", "a column in the array"};
-        return Names[K];
-    }
-
-    void Local(const double p[3], double q[3]) const {
-        q[0] = Cos * p[0] + Sin * p[1];
-        q[1] = Cos * p[1] - Sin * p[0];
-        q[2] = p[2];
-    }
-
-    double FromCentre(int ix, int iy, int iz, double p[3]) const {
-        p[0] = ix - Cen[0];
-        p[1] = iy - Cen[1];
-        p[2] = iz - Cen[2];
-        return std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
-    }
-
-    bool Inside(int ix, int iy, int iz) const {
-        if (ix < 0 || iy < 0 || iz < 0 || ix >= N[0] || iy >= N[1] || iz >= N[2]) return false;
-        // The fill is what the room is, and it has to be, because the passes drop a ghost by
-        // reading the zero the node across the wall is held at. That only works when the nodes
-        // held at zero are exactly the far side of every cut leg — which is what a fill over
-        // the *same* twenty-six legs the stencil uses gives, and what one over six does not.
-        if (K == Voxels) return Vox->Filled[Vox->At(ix, iy, iz)] != 0;
-        if (K == Array) return true;
-        double p[3];
-        const double radius = FromCentre(ix, iy, iz, p);
-        if (K == Sphere) return radius <= Rad - .5;
-        if (K == Obstacle) return radius >= Rad + .5; // and inside the array, tested above
-        double q[3];
-        Local(p, q);
-        return std::abs(q[0]) <= Ext[0] - .5 && std::abs(q[1]) <= Ext[1] - .5 && std::abs(q[2]) <= Ext[2] - .5;
-    }
-
-    // The true outward unit normal of the surface nearest an inside node — the mesh's normal,
-    // not the staircase's, which is the whole point of the compensation. Zero where there is
-    // no surface to be near, which is also where there are no ghosts.
-    void Normal(int ix, int iy, int iz, double n[3]) const {
-        n[0] = n[1] = n[2] = 0.;
-        if (K == Voxels) {
-            for (int a = 0; a < 3; ++a) n[a] = double(Vox->Normals[3 * Vox->At(ix, iy, iz) + size_t(a)]);
-            return;
-        }
-        if (K == Array) {
-            n[0] = double(ix == N[0] - 1) - double(ix == 0);
-            n[1] = double(iy == N[1] - 1) - double(iy == 0);
-            n[2] = double(iz == N[2] - 1) - double(iz == 0);
-        } else {
-            double p[3];
-            const double radius = FromCentre(ix, iy, iz, p);
-            if (K == Sphere) {
-                for (int a = 0; a < 3; ++a) n[a] = p[a];
-            } else if (K == Obstacle) {
-                // Two surfaces here, and the node belongs to whichever is nearer — which is
-                // what a mesh's nearest-triangle lookup would decide. Out of the room means
-                // *into* the column, so its normal points inward.
-                int face = 0;
-                for (int a = 1; a < 3; ++a)
-                    if (Wall(a) - std::abs(p[a]) < Wall(face) - std::abs(p[face])) face = a;
-                if (radius - Rad < Wall(face) - std::abs(p[face])) {
-                    for (int a = 0; a < 3; ++a) n[a] = -p[a];
-                } else {
-                    n[face] = p[face] < 0. ? -1. : 1.;
-                }
-            } else {
-                double q[3];
-                Local(p, q);
-                int face = 0; // the wall the node is nearest, which is the triangle it belongs to
-                for (int a = 1; a < 3; ++a)
-                    if (Ext[a] - std::abs(q[a]) < Ext[face] - std::abs(q[face])) face = a;
-                double m[3]{0., 0., 0.};
-                m[face] = q[face] < 0. ? -1. : 1.;
-                n[0] = Cos * m[0] - Sin * m[1];
-                n[1] = Sin * m[0] + Cos * m[1];
-                n[2] = m[2];
-            }
-        }
-        const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        if (len > 0.)
-            for (int a = 0; a < 3; ++a) n[a] /= len;
-    }
-
-    // Where the array's own wall is on an axis, as a distance from the centre.
-    double Wall(int a) const { return std::min(Cen[a], N[a] - 1 - Cen[a]) + .5; }
-
-    // How many of the 6 face, 12 edge and 8 corner neighbours a node keeps under the
-    // drop-ghost boundary. A face neighbour steps on one axis, an edge neighbour on two and a
-    // corner neighbour on three, so when the room is the array the counts are the elementary
-    // symmetric polynomials in how many steps each axis has left, and the interior's
-    // (6, 12, 8) is the case every axis has both.
-    // Whether the step from this node to that neighbour crosses the wall. For a voxelised room
-    // that is what the mesh said and not what the fill did — a model that is not closed leaks
-    // the fill, and never leaks a cut leg.
-    bool Blocked(int ix, int iy, int iz, int dx, int dy, int dz) const {
-        if (K == Voxels) return (Vox->Blocked[Vox->At(ix, iy, iz)] & (1u << ImplicitLegBit(dx, dy, dz))) != 0;
-        return !Inside(ix + dx, iy + dy, iz + dz);
-    }
-
-    void Counts(int ix, int iy, int iz, int k[3]) const {
-        if (K == Voxels) {
-            const uint32_t blocked = Vox->Blocked[Vox->At(ix, iy, iz)];
-            k[0] = k[1] = k[2] = 0;
-            for (int dx = -1; dx <= 1; ++dx)
-                for (int dy = -1; dy <= 1; ++dy)
-                    for (int dz = -1; dz <= 1; ++dz) {
-                        const int r = dx * dx + dy * dy + dz * dz;
-                        if (r && !(blocked & (1u << ImplicitLegBit(dx, dy, dz)))) ++k[r - 1];
-                    }
-            return;
-        }
-        if (K == Array) {
-            const int a = int(ix > 0) + int(ix < N[0] - 1), b = int(iy > 0) + int(iy < N[1] - 1), c = int(iz > 0) + int(iz < N[2] - 1);
-            k[0] = a + b + c;
-            k[1] = a * b + a * c + b * c;
-            k[2] = a * b * c;
-            return;
-        }
-        k[0] = k[1] = k[2] = 0;
-        for (int dx = -1; dx <= 1; ++dx)
-            for (int dy = -1; dy <= 1; ++dy)
-                for (int dz = -1; dz <= 1; ++dz) {
-                    const int r = dx * dx + dy * dy + dz * dz;
-                    if (r && Inside(ix + dx, iy + dy, iz + dz)) ++k[r - 1];
-                }
-    }
-
-    Kind K;
-    const ImplicitVoxels *Vox{nullptr}; // set only for Voxels, where the geometry is precomputed
-    int N[3]; // NOLINT(modernize-use-default-member-init) the constructor's arguments are where it comes from
-    double Cos, Sin;
-    double Cen[3], Ext[3], Rad;
-};
-
-// What a node's ghost set gives it: the counts it keeps in each offset class, and the paper's
-// `beta_i = sum_r nex_r * sum_j (n_i . j)` over the ghost offsets j, with n_i the true outward
-// normal.
-//
-// On a grid-aligned flat wall every ghost offset has n.j = 1 in its own class, so beta comes
-// out at Lex0 + Lex1 + Lex2 = 1 exactly — that is the check that the paper's two readings of
-// alpha_r have not been crossed. A slanted or curved wall gets less, and that is the staircase
-// compensation doing its work: the aggregate absorbing weight follows the true wall area
-// rather than the staircased one, which is what keeps absorption from being over-represented.
-double ImplicitWallSample(const ImplicitShape &shape, int ix, int iy, int iz, const double nex[3], int k[3], bool compensated) {
-    double n[3];
-    shape.Normal(ix, iy, iz, n);
-    k[0] = k[1] = k[2] = 0;
-    double beta = 0., faces = 0., projected = 0.;
-    for (int dx = -1; dx <= 1; ++dx)
-        for (int dy = -1; dy <= 1; ++dy)
-            for (int dz = -1; dz <= 1; ++dz) {
-                const int r = dx * dx + dy * dy + dz * dz;
-                if (!r) continue;
-                if (!shape.Blocked(ix, iy, iz, dx, dy, dz)) {
-                    ++k[r - 1];
-                    continue;
-                }
-                const double projection = n[0] * dx + n[1] * dy + n[2] * dz;
-                beta += nex[r - 1] * projection;
-                if (r == 1) { // the only ghosts that stand for a face of the node's cell
-                    ++faces;
-                    projected += projection;
-                }
-            }
-    // Uncompensated: the node's wall keeps the *staircased* area rather than the true area it
-    // stands for, which is the error the 2024 compensation paper measures at -18% to -42% in
-    // T60 on rotated boxes and -34% on a sphere. Per node that ratio is the exposed faces over
-    // their projection onto the true surface, which is 1 on a grid-aligned wall — so this and
-    // the compensated reading agree exactly where staircasing costs nothing.
-    if (!compensated && projected > 0.) beta *= faces / projected;
-    // Never below zero. beta is provably nonnegative wherever the boundary is locally planar,
-    // because the ghost set is then the outward half-space — but a node that sees wall in
-    // *opposite* directions, which is a gap of a cell or two, gets a normal pointing at one of
-    // them and the other side subtracts. A real room at 183 mm has a few hundredths of a
-    // percent of those. Left alone, G = (lambda/2) beta gamma would go negative there and take
-    // the wall out of the energy framework that makes it stable, so the node goes rigid: an
-    // ambiguous normal is not a licence to add energy.
-    return std::max(beta, 0.);
-}
-
-// Least-squares slope of `y` against `x` from sample `from` on, which is how both soaks read a
-// rate: a growth or a decay per step means the same thing at any run length, where "did it
-// move" mostly measures how long the run was. Infinite when there is too little to fit.
-double ImplicitSlope(const std::vector<double> &x, const std::vector<double> &y, size_t from = 0) {
-    if (x.size() < from + 4) return std::numeric_limits<double>::infinity();
-    const double count = double(x.size() - from);
-    double sx = 0., sy = 0., sxx = 0., sxy = 0.;
-    for (size_t i = from; i < x.size(); ++i) {
-        sx += x[i];
-        sy += y[i];
-        sxx += x[i] * x[i];
-        sxy += x[i] * y[i];
-    }
-    return (count * sxy - sx * sy) / (count * sxx - sx * sx);
-}
-
-// What a wall is: a real admittance, the paper's own case, or a set of parallel LRC branches,
-// which is what every scene here carries. Both reach the scheme the same way — one nonnegative
-// scalar on the diagonal — and the branches also carry the memory that makes them
-// frequency-dependent. See RoomImplicitWall.
-struct ImplicitWall {
-    double Gamma{0.}; // a real admittance, when the wall has no branches
-    double Ts{0.}; // the time step the branches are discretised at
-    std::vector<double> Def; // (D, E, F) triples, the format the scenes' materials come in
-    int Branches() const { return int(Def.size()) / 3; }
-};
-
-struct ImplicitBox {
-    // `rigid` swaps the periodic wrap for the drop-ghost wall of Smits & Bilbao 2025 Sec IV,
-    // which turns the dispersion instrument into a room: every neighbour outside the room
-    // leaves both the sum and the diagonal. The grid then carries a one-node halo that no
-    // pass ever writes, so a neighbour outside the room reads the zero it was allocated with
-    // and the sums need no mask, and RoomImplicitTerm carries the diagonal the dropped ghosts
-    // took with them. The wall lies half a cell outside the outermost node, so a room of N
-    // nodes is N*h on that axis rather than the image's (N-1)*h.
-    //
-    // `gamma` is the paper's real admittance, uniform over the wall. Nothing about the step
-    // changes with it: G = (lambda/2) beta gamma is diagonal, so it lands on A's diagonal and
-    // on the u^(n-1) coefficient, which is where RoomImplicitTerm's Fd and Cp already are. It
-    // does not move the Courant limit either — E >= 0 is a condition on Lim and Lex alone, and
-    // a nonnegative G only makes A more diagonally dominant, which the Jacobi sweep likes.
-    //
-    // `kind` is the room the array holds. Array is the array itself, and the two others are a
-    // staircase cut out of it — their outside nodes are stepped like any other and held at zero
-    // by their own terms, so nothing about the passes knows the difference. `compensated` off
-    // gives beta the staircase's normal instead of the surface's, which is the absorption bias
-    // the compensation exists to remove.
-    ImplicitBox(const ImplicitScheme &s, int nx, int ny, int nz, bool rigid = false, double lambda = 0., ImplicitWall wall = {}, ImplicitShape::Kind kind = ImplicitShape::Array, double angle = 0., bool compensated = true, const ImplicitVoxels *vox = nullptr)
-        : Scheme(s), Lambda(lambda > 0. ? lambda : std::min(s.Lambda, ImplicitCourantLimit(s))), Wall(std::move(wall)), Compensated(compensated),
-          Shape(vox ? ImplicitShape(*vox) : ImplicitShape(kind, nx, ny, nz, angle)), Pad(rigid ? 1 : 0),
-          Nx(nx), Ny(ny), Nz(nz), Gx(nx + 2 * Pad), Gy(ny + 2 * Pad), Gz(nz + 2 * Pad),
-          P(ImplicitCoefficients(s, Lambda, Gx, Gy, Gz)), Nodes(size_t(Gx) * Gy * Gz), Room(size_t(nx) * ny * nz) {
-        for (auto *b : {&Prev, &Cur, &Bp, &Tmp}) b->ResizeZeroed(Nodes * sizeof(float));
-        auto &ctx = MetalContext::Get();
-        Rhs = ctx.RoomPipeline(rigid ? "RoomImplicitRhsNoWall" : "RoomImplicitRhs");
-        Jacobi = ctx.RoomPipeline(rigid ? "RoomImplicitJacobiNoWall" : "RoomImplicitJacobi");
-        Stream = ctx.RoomPipeline(rigid ? "RoomImplicitStreamWall" : "RoomImplicitStream");
-        Threads = {32, 4, 4};
-        Tiles = {(uint32_t(nz) + Threads.x - 1) / Threads.x, (uint32_t(ny) + Threads.y - 1) / Threads.y, (uint32_t(nx) + Threads.z - 1) / Threads.z};
-        if (!rigid) return;
-
-        RhsFused = ctx.RoomPipeline("RoomImplicitRhsWall");
-        JacobiFused = ctx.RoomPipeline("RoomImplicitJacobiWall");
-
-        // The branch coefficients, through the scenes' own derivation so that the arithmetic
-        // the wall runs is the arithmetic the explicit path runs.
-        if (Wall.Branches()) {
-            RoomScene scene;
-            scene.Ts = Wall.Ts;
-            scene.MatBranches = {Wall.Branches()};
-            scene.MatDef = Wall.Def;
-            Mats = RoomMaterialCoefficients(scene);
-            WallRhsPso = ctx.RoomPipeline("RoomImplicitWallRhs");
-            WallStepPso = ctx.RoomPipeline("RoomImplicitWallStep");
-        }
-        std::vector<RoomImplicitWall> lossy;
-
-        // Two bytes a wall node into a table of the distinct terms, and a uint of the legs it
-        // keeps — which the passes cannot infer from a zero across the wall once a room's own
-        // surfaces are thinner than a cell (see RoomImplicitSumsMasked). Both ride in wall
-        // order and a node reaches its row by rank through RoomImplicitBlockEntry, so what is
-        // grid-wide is three words a block of 32 nodes rather than six bytes a node. A rigid
-        // box needs three terms and a yawed one twenty-one, so a byte would do for both; a
-        // sphere needs forty thousand, because beta is a continuous function of the surface's
-        // normal and very nearly every wall node is then its own term. That is what sets the
-        // code's width.
-        //
-        // The table is indexed directly here, which holds to 65,535 terms and so to the grids
-        // this validates on. A production room has more wall nodes than that, and the way out
-        // is the packing the terms already invite: Cn depends on the kept counts alone, of
-        // which there are at most a few dozen, so six bits of class and ten of quantised beta
-        // fit the same two bytes. That is a change to this table and not to the kernels.
-        std::vector<RoomImplicitTerm> terms{{0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}}; // air, and outside
-        std::vector<RoomImplicitBlockEntry> blocks((Nodes + RoomBnBlock - 1) / RoomBnBlock, RoomImplicitBlockEntry{});
-        std::vector<uint16_t> code;
-        std::vector<uint32_t> keep;
-        for (int ix = 0; ix < nx; ++ix) {
-            for (int iy = 0; iy < ny; ++iy) {
-                for (int iz = 0; iz < nz; ++iz) {
-                    const size_t ii = Index(ix, iy, iz); // ascending over this loop, which is the order rank walks
-                    if (!Shape.Inside(ix, iy, iz)) {
-                        blocks[ii / RoomBnBlock].Outside |= 1u << (ii % RoomBnBlock);
-                        continue;
-                    }
-                    ++InsideNodes;
-                    int k[3];
-                    Shape.Counts(ix, iy, iz, k);
-                    if (k[0] == 6 && k[1] == 12 && k[2] == 8) continue; // ordinary air
-                    if (WallScalar() != 0.) WallG.emplace_back(int(ii), NodeG(ix, iy, iz));
-                    if (Wall.Branches()) lossy.push_back({int(ii), 0, float(Lambda * Beta(ix, iy, iz) / Diagonal())});
-                    const RoomImplicitTerm t = WallTerms(ix, iy, iz);
-                    size_t c = 2;
-                    while (c < terms.size() && !(terms[c].Cn == t.Cn && terms[c].Cp == t.Cp && terms[c].Fd == t.Fd)) ++c;
-                    if (c == terms.size()) terms.push_back(t);
-                    if (c > 65535) throw std::runtime_error("more than 65535 distinct boundary terms");
-                    blocks[ii / RoomBnBlock].Wall |= 1u << (ii % RoomBnBlock);
-                    code.push_back(uint16_t(c));
-                    uint32_t bits = 0;
-                    for (int dx = -1; dx <= 1; ++dx)
-                        for (int dy = -1; dy <= 1; ++dy)
-                            for (int dz = -1; dz <= 1; ++dz) {
-                                if (!(dx || dy || dz) || Shape.Blocked(ix, iy, iz, dx, dy, dz)) continue;
-                                bits |= 1u << ImplicitLegBit(dx, dy, dz);
-                            }
-                    keep.push_back(bits);
-                    ++WallNodes;
-                }
-            }
-        }
-        uint32_t rank = 0;
-        for (auto &b : blocks) {
-            b.Rank = rank;
-            rank += uint32_t(std::popcount(b.Wall));
-        }
-        Blocks.ResizeZeroed(blocks.size() * sizeof(RoomImplicitBlockEntry));
-        Blocks.Upload(blocks.data(), blocks.size() * sizeof(RoomImplicitBlockEntry));
-        Keep.ResizeZeroed(keep.size() * sizeof(uint32_t));
-        Keep.Upload(keep.data(), keep.size() * sizeof(uint32_t));
-
-        Codes = int(terms.size());
-        Code.ResizeZeroed(code.size() * sizeof(uint16_t));
-        Code.Upload(code.data(), code.size() * sizeof(uint16_t));
-        Terms.ResizeZeroed(terms.size() * sizeof(RoomImplicitTerm));
-        Terms.Upload(terms.data(), terms.size() * sizeof(RoomImplicitTerm));
-        if (lossy.empty()) return;
-
-        P.Nw = int(lossy.size());
-        WallList.ResizeZeroed(lossy.size() * sizeof(RoomImplicitWall));
-        WallList.Upload(lossy.data(), lossy.size() * sizeof(RoomImplicitWall));
-        const int mb = Wall.Branches();
-        MatMb.ResizeZeroed(sizeof(int));
-        MatMb.Upload(&mb, sizeof(int));
-        MatQuads.ResizeZeroed(Mats.Quads.size() * sizeof(RoomMatQuad));
-        MatQuads.Upload(Mats.Quads.data(), Mats.Quads.size() * sizeof(RoomMatQuad));
-        for (auto *b : {&Vh, &Gh}) b->ResizeZeroed(size_t(mb) * lossy.size() * sizeof(float));
-        Ub.ResizeZeroed(lossy.size() * sizeof(float));
-        WallThreads = {64, 1, 1};
-        WallTiles = {(uint32_t(P.Nw) + WallThreads.x - 1) / WallThreads.x, 1, 1};
-    }
-
-    // What rides on the diagonal: a real admittance, or the branches' summed discrete one.
-    double WallScalar() const { return Wall.Branches() ? double(Mats.Beta[0]) : Wall.Gamma; }
-
-    // The scheme's neighbour coefficients, undivided: the implicit operator's off-diagonals
-    // and the explicit one's, per offset class.
-    double Nim(int r) const { return ImplicitNim(Scheme, r); }
-    double Nex(int r) const { return ImplicitNex(Scheme, r); }
-    // The implicit operator's diagonal at a node keeping k neighbours a class, and the
-    // explicit one's, both as the interior case when no counts are given.
-    double Diagonal(const int k[3] = nullptr) const {
-        static constexpr int Full[3]{6, 12, 8};
-        const int *c = k ? k : Full;
-        return 1. - (Nim(0) * c[0] + Nim(1) * c[1] + Nim(2) * c[2]);
-    }
-    double ExDiagonal(const int k[3] = nullptr) const {
-        static constexpr int Full[3]{6, 12, 8};
-        const int *c = k ? k : Full;
-        return Nex(0) * c[0] + Nex(1) * c[1] + Nex(2) * c[2];
-    }
-
-    size_t Index(int ix, int iy, int iz) const { return (size_t(ix + Pad) * Gy + size_t(iy + Pad)) * Gz + size_t(iz + Pad); }
-
-    // What a node's step needs beyond the uniform coefficients, from the neighbours it keeps.
-    // Rc and the u^(n-1) coefficient are what the uniform pass writes with the interior
-    // diagonal d0 in them, so what a wall node needs added back is the difference against its
-    // own diagonal d, and the whole sweep's diagonal is one factor d0/d because the sweep is
-    // one division by it. An interior node's terms are {0, 0, 1}, which is code 0.
-    RoomImplicitTerm WallTerms(int ix, int iy, int iz) const {
-        if (!Shape.Inside(ix, iy, iz)) return {0.f, 0.f, 0.f};
-        int k[3];
-        Shape.Counts(ix, iy, iz, k);
-        const double d = Diagonal(k), ex = ExDiagonal(k), d0 = Diagonal(), g = NodeG(ix, iy, iz);
-        return {float((2. * d - Lambda * Lambda * ex) / d0 - double(P.Rc)), float(1. - (d - g) / d0), float(d0 / (d + g))};
-    }
-
-    // The wall's admittance term at a node, G = (lambda/2) beta gamma. Zero off the wall, and
-    // zero everywhere when the wall is rigid, which is what leaves WallTerms the rigid ones.
-    double Beta(int ix, int iy, int iz) const {
-        const double nex[3]{Nex(0), Nex(1), Nex(2)};
-        int k[3];
-        return ImplicitWallSample(Shape, ix, iy, iz, nex, k, Compensated);
-    }
-    double NodeG(int ix, int iy, int iz) const {
-        const double scalar = WallScalar();
-        return scalar == 0. ? 0. : .5 * Lambda * Beta(ix, iy, iz) * scalar;
-    }
-
-    // Seeds the two levels from functions of the room coordinates, leaving the halo at rest.
-    // They are separate because seeding both alike starts the scheme from rest, and a mode
-    // started from rest carries an amplitude of 1/cos(wT/2) — which at the top of the band is
-    // large enough to be mistaken for growth.
-    template<typename F, typename G> void Seed(F &&cur, G &&prev) {
-        std::vector<float> a(Nodes, 0.f), b(Nodes, 0.f);
-        for (int ix = 0; ix < Nx; ++ix)
-            for (int iy = 0; iy < Ny; ++iy)
-                for (int iz = 0; iz < Nz; ++iz) {
-                    if (!Shape.Inside(ix, iy, iz)) continue; // outside stays at the rest the sums need
-                    a[Index(ix, iy, iz)] = float(cur(ix, iy, iz));
-                    b[Index(ix, iy, iz)] = float(prev(ix, iy, iz));
-                }
-        Cur.Upload(a.data(), a.size() * sizeof(float));
-        Prev.Upload(b.data(), b.size() * sizeof(float));
-        if (!P.Nw) return;
-        // Seeding restarts the run, so the wall goes back to rest — and its record of the
-        // level two steps back becomes the level the seed just put behind.
-        const size_t branch_bytes = size_t(Wall.Branches()) * size_t(P.Nw) * sizeof(float);
-        Vh.Zero(branch_bytes);
-        Gh.Zero(branch_bytes);
-        std::vector<float> behind(size_t(P.Nw));
-        const RoomImplicitWall *list = WallList.As<RoomImplicitWall>();
-        for (int i = 0; i < P.Nw; ++i) behind[size_t(i)] = b[size_t(list[i].Ixyz)];
-        Ub.Upload(behind.data(), behind.size() * sizeof(float));
-    }
-
-    // Four grids of state, which is the paper's S = 4: the two levels behind, the Jacobi
-    // constant vector, and one scratch grid the sweeps ping-pong through. With an odd sweep
-    // count the answer lands in the grid the oldest level occupied, so nothing is copied and
-    // the rotation is a swap of handles.
-    //
-    // `wall` off encodes the same passes without the byte that carries the wall's terms. It
-    // steps nothing meaningful — the diagonal it leaves at the interior's value is wrong at
-    // every node the wall touches — and exists so that what the wall costs can be read against
-    // the same room rather than against a periodic box of a different shape.
-    void Step(bool wall = true) {
-        auto &ctx = MetalContext::Get();
-        const bool fused = WallNodes > 0 && wall;
-        if (fused) ctx.Dispatch(RhsFused, Tiles, Threads, {&Bp, &Cur, &Prev, &Blocks, &Code, &Terms, &Keep}, &P, sizeof P);
-        else ctx.Dispatch(Rhs, Tiles, Threads, {&Bp, &Cur, &Prev}, &P, sizeof P);
-        // The wall's memory, once a step and over the wall alone. The sweeps below it never
-        // see the branches: what they carry rides on the diagonal, inside Fd.
-        if (fused && P.Nw) ctx.Dispatch(WallRhsPso, WallTiles, WallThreads, {&Bp, &Vh, &Gh, &WallList, &MatMb, &MatQuads}, &P, sizeof P);
-        const GpuBuffer *src = &Cur, *dst = &Prev;
-        for (int m = 0; m < Scheme.Sweeps; ++m) {
-            if (fused) ctx.Dispatch(JacobiFused, Tiles, Threads, {dst, src, &Bp, &Blocks, &Code, &Terms, &Keep}, &P, sizeof P);
-            else ctx.Dispatch(Jacobi, Tiles, Threads, {dst, src, &Bp}, &P, sizeof P);
-            src = dst;
-            dst = (dst == &Prev) ? &Tmp : &Prev;
-        }
-        if (src != &Prev) { // an even sweep count leaves it in the scratch grid
-            Prev.Swap(Tmp);
-        }
-        Prev.Swap(Cur); // Cur holds the new level, Prev the one it replaced
-        // And the branch step, node-local, now that the level it needs exists.
-        if (fused && P.Nw) ctx.Dispatch(WallStepPso, WallTiles, WallThreads, {&Cur, &Prev, &Ub, &Vh, &Gh, &WallList, &MatMb, &MatQuads}, &P, sizeof P);
-    }
-
-    const ImplicitScheme &Scheme;
-    double Lambda; // the scheme's own Courant limit where Table II's rounded value exceeds it
-    ImplicitWall Wall; // rigid, a real admittance, or LRC branches
-    RoomMaterials Mats; // the branches' discrete coefficients, empty without them
-    bool Compensated; // whether beta reads the surface's normal or the staircase's
-    ImplicitShape Shape; // the room the array holds
-    int Pad; // one node of halo with a wall, none on a periodic box
-    int Nx, Ny, Nz; // the room
-    int Gx, Gy, Gz; // the array the room sits in
-    RoomImplicitParams P;
-    size_t Nodes, Room;
-    size_t InsideNodes{0}; // nodes of the room, which is all of them when it is the array
-    int WallNodes{0}; // nodes the wall takes a neighbour from, 0 on a periodic box
-    int Codes{1}; // distinct boundary terms, the width of the table the code indexes
-    // G at the nodes that have one, for the host's energy accounting. Empty when gamma is
-    // zero, which is every rung but the absorbing one — a grid-wide copy of it would be as
-    // large as a level.
-    std::vector<std::pair<int, double>> WallG;
-    GpuBuffer Prev, Cur, Bp, Tmp, Blocks, Code, Terms, Keep;
-    // The LRC wall: its node list and material, a branch-major (vh, gh), and the node's own
-    // level two steps back, which the grid no longer holds when the branches want it.
-    GpuBuffer WallList, MatMb, MatQuads, Vh, Gh, Ub;
-    MTL::ComputePipelineState *Rhs, *Jacobi, *Stream, *RhsFused{}, *JacobiFused{}, *WallRhsPso{}, *WallStepPso{};
-    Dim3 Tiles, Threads, WallTiles{}, WallThreads{};
-};
-
-// One of the scheme's two Laplacians applied over the room, in double, laid out on the same
-// padded grid its argument is. `c` is the operator's three neighbour coefficients; the halo's
-// zeros mask the sums, and the diagonal follows the counts the node keeps, which is the whole
-// boundary condition.
+// Applies a masked Laplacian in double over the padded room layout.
 template<typename T> std::vector<double> ImplicitApply(const ImplicitBox &box, const T *u, const double c[3]) {
     std::vector<double> out(box.Nodes, 0.);
     for (int ix = 0; ix < box.Nx; ++ix) {
         for (int iy = 0; iy < box.Ny; ++iy) {
             for (int iz = 0; iz < box.Nz; ++iz) {
                 double s[3]{0., 0., 0.};
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int r = dx * dx + dy * dy + dz * dz;
-                            // The legs the surface cuts leave the sum, the same way they leave
-                            // the kernels': a room's own surfaces are thinner than a cell in
-                            // places, and the zero across the wall is not there to be read.
-                            if (r && !box.Shape.Blocked(ix, iy, iz, dx, dy, dz)) s[r - 1] += double(u[box.Index(ix + dx, iy + dy, iz + dz)]);
-                        }
-                int k[3];
-                box.Shape.Counts(ix, iy, iz, k);
+                int k[3]{0, 0, 0};
+                for (const auto &leg : ImplicitLegs) {
+                    if (!box.Shape.Blocked(ix, iy, iz, leg.Dx, leg.Dy, leg.Dz)) {
+                        s[leg.Class] += double(u[box.Index(ix + leg.Dx, iy + leg.Dy, iz + leg.Dz)]);
+                        ++k[leg.Class];
+                    }
+                }
                 double v = 0.;
                 for (int r = 0; r < 3; ++r) v += c[r] * (s[r] - k[r] * double(u[box.Index(ix, iy, iz)]));
                 out[box.Index(ix, iy, iz)] = v;
@@ -1486,16 +887,8 @@ template<typename T> std::vector<double> ImplicitApply(const ImplicitBox &box, c
     return out;
 }
 
-// The largest Courant number at which the scheme's energy is positive, which is the wall's own
-// stability limit and a different number from the free-space one the scheme is published with.
-// E >= 0 iff 1 + Lim + (lambda^2/4) Lex > 0, so the limit is 2/sqrt(rho) with rho the largest
-// eigenvalue of the pencil (-Lex, 1 + Lim).
-//
-// Power iteration in double, run until the Rayleigh quotient settles, with 1 + Lim inverted by
-// the same Jacobi sweeps the stepper uses — its diagonal dominance is what the whole scheme
-// rests on, so a handful reach double precision. The constant vector is in Lex's null space
-// and the iteration maps it to zero, so the scheme's physical null mode needs no removing.
-// The quotient approaches rho from below, so a run cut short reports the limit too high.
+// Finds the walled energy limit 2/sqrt(rho), where rho is the largest eigenvalue of
+// (-Lex, 1 + Lim), using double-precision power iteration and Jacobi inversion.
 double ImplicitCriticalLambda(const ImplicitBox &box, int cap) {
     const double nim[3]{box.Nim(0), box.Nim(1), box.Nim(2)}, nex[3]{box.Nex(0), box.Nex(1), box.Nex(2)};
     std::vector<double> v(box.Nodes, 0.), w(box.Nodes, 0.);
@@ -1506,7 +899,6 @@ double ImplicitCriticalLambda(const ImplicitBox &box, int cap) {
             for (int iz = 0; iz < box.Nz; ++iz)
                 if (box.Shape.Inside(ix, iy, iz)) v[box.Index(ix, iy, iz)] = uniform(rng);
 
-    // The inner product over the room, and M w = rhs solved by sweeps of the scheme's own.
     auto dot = [&](const std::vector<double> &a, const std::vector<double> &b) {
         double q = 0.;
         for (int ix = 0; ix < box.Nx; ++ix)
@@ -1514,7 +906,7 @@ double ImplicitCriticalLambda(const ImplicitBox &box, int cap) {
                 for (int iz = 0; iz < box.Nz; ++iz) q += a[box.Index(ix, iy, iz)] * b[box.Index(ix, iy, iz)];
         return q;
     };
-    auto solve = [&](const std::vector<double> &rhs) {
+    auto const solve = [&](const std::vector<double> &rhs) {
         std::fill(w.begin(), w.end(), 0.);
         for (int sweep = 0; sweep < 12; ++sweep) {
             const auto off = ImplicitApply(box, w.data(), nim);
@@ -1524,15 +916,14 @@ double ImplicitCriticalLambda(const ImplicitBox &box, int cap) {
                         const size_t i = box.Index(ix, iy, iz);
                         int k[3];
                         box.Shape.Counts(ix, iy, iz, k);
-                        // `off` is Lim w, which already carries -lim*w at the node, so adding
-                        // that back leaves the neighbour sum alone and M's diagonal is 1 - lim.
+                        // Remove the diagonal already included in Lim*w.
                         const double lim = nim[0] * k[0] + nim[1] * k[1] + nim[2] * k[2];
                         w[i] = (rhs[i] - (off[i] + lim * w[i])) / (1. - lim);
                     }
         }
         return w;
     };
-    auto rayleigh = [&] {
+    auto const rayleigh = [&] {
         auto kv = ImplicitApply(box, v.data(), nex);
         for (auto &e : kv) e = -e;
         const auto mv = ImplicitApply(box, v.data(), nim);
@@ -1553,18 +944,8 @@ double ImplicitCriticalLambda(const ImplicitBox &box, int cap) {
     return 2. / std::sqrt(rayleigh());
 }
 
-// The one check that would have caught a room the passes cannot carry, and it costs a matvec.
-//
-// A constant pressure has no gradient, so both Laplacians must annihilate it: every row of the
-// operator has to sum to zero. Drop-ghost satisfies that by construction — a row's
-// off-diagonals sum to exactly what its diagonal dropped — and the passes realise it by
-// reading the zero the node across the wall is held at, which quietly assumes every cut leg
-// points out of the room. Where it does not, the sum keeps a neighbour the diagonal already
-// let go and the row stops summing to zero. The operator stays symmetric, so a symmetry check
-// sees nothing; what it loses is the null space, and with it the negative semidefiniteness the
-// whole energy argument rests on.
-//
-// So: the constant field over the room, zero outside it, through the operator in force.
+// Both Laplacians must annihilate constant pressure. This catches unmatched cut legs that a
+// symmetry-only check cannot see.
 double ImplicitNullResidual(const ImplicitBox &box) {
     const double nim[3]{box.Nim(0), box.Nim(1), box.Nim(2)}, nex[3]{box.Nex(0), box.Nex(1), box.Nex(2)};
     std::vector<double> one(box.Nodes, 0.);
@@ -1584,11 +965,7 @@ double ImplicitNullResidual(const ImplicitBox &box) {
     return worst;
 }
 
-// The scheme's discrete energy at the half step between two levels, from Sec V of the paper:
-// E = 1/2 <M d, d> + 1/2 <K u^(n+1), u^n> with d = u^(n+1) - u^n, M = 1 + Lim and
-// K = -lambda^2 Lex. Both operators masked as above, so this is the boundary's own energy
-// balance and not the interior's. With a rigid wall it is conserved exactly, which is the
-// machine-precision check the drop-ghost boundary has in place of an exact discrete mode.
+// Paper Sec. V energy: E = 1/2 <M d,d> + 1/2 <K u^(n+1),u^n>.
 double ImplicitEnergy(const ImplicitBox &box, const float *unew, const float *uold) {
     const double n[3]{box.Nim(0), box.Nim(1), box.Nim(2)};
     const double e[3]{box.Nex(0), box.Nex(1), box.Nex(2)};
@@ -1612,24 +989,14 @@ double ImplicitEnergy(const ImplicitBox &box, const float *unew, const float *uo
     return energy;
 }
 
-// Free-space dispersion, measured. The box is periodic and cubic, so k = 2 pi m / N along
-// whichever direction the mode vector picks, the mode is an exact discrete eigenvector, and
-// seeding both levels with it makes the next level read back 2 cos(wT) - 1 at every node.
-// Sweeping m walks a direction out in frequency, and the last mode inside the scheme's error
-// threshold gives the oversampling ratio it needs (the paper's Eq. 38). The mode grid
-// quantises that ratio, so what is reported is the conservative side of the crossing.
-//
-// Then the worst direction's last passing mode is run out for `steps` steps. With both levels
-// seeded alike the modal amplitude is a^n = cos((n - 1/2) wT) / cos(wT / 2) exactly, so the
-// deviation from it is everything the scheme's realisation adds: the Jacobi truncation at a
-// fixed sweep count, and single precision.
+// Measures periodic plane-wave dispersion and long-run drift at the worst passing direction.
 void ImplicitRung(const ImplicitScheme &scheme, int n, int steps) {
     const double t0 = Now();
     ImplicitBox box(scheme, n, n, n);
     const int dirs[3][3] = {{1, 0, 0}, {1, 1, 0}, {1, 1, 1}};
     static const char *const Names[3]{"axis", "face diagonal", "cube diagonal"};
     std::vector<float> seed(box.Nodes);
-    auto seed_mode = [&](const double kv[3]) {
+    auto const seed_mode = [&](const double kv[3]) {
         for (int ix = 0; ix < n; ++ix)
             for (int iy = 0; iy < n; ++iy)
                 for (int iz = 0; iz < n; ++iz)
@@ -1651,8 +1018,6 @@ void ImplicitRung(const ImplicitScheme &scheme, int n, int steps) {
             seed_mode(kv);
             box.Step();
 
-            // Read where the seed is largest, so the ratio is not a small difference of small
-            // numbers: the node at the origin, where the cosine is 1.
             const double measured = double(box.Cur.As<float>()[0]) + 1.;
             const double predicted = ImplicitTwoCosOmegaT(box.P, kv[0], kv[1], kv[2]);
             if (!(std::abs(measured) < 2.) || !(std::abs(predicted) < 2.)) break;
@@ -1688,9 +1053,7 @@ void ImplicitRung(const ImplicitScheme &scheme, int n, int steps) {
     std::printf("  %d steps at that mode: peak amplitude %.6f against the exact %.6f, worst deviation %.2e | %.1fs\n", steps, peak, 1. / c0, drift, Now() - t0);
 }
 
-// What the absorbing wall takes out in one step. The scheme fixes it exactly: E falls by
-// 1/2 <G D, D> with D = u^(n+1) - u^(n-1) and G = (lambda/2) beta gamma, so E plus the running
-// loss is what is conserved. G is diagonal, so this is a sum over the wall alone.
+// Absorbed energy: 1/2 <G D,D>, D = u^(n+1) - u^(n-1).
 double ImplicitLoss(const ImplicitBox &box, const float *unext, const float *uprev) {
     double loss = 0.;
     for (const auto &[i, g] : box.WallG) {
@@ -1700,26 +1063,17 @@ double ImplicitLoss(const ImplicitBox &box, const float *unext, const float *upr
     return loss;
 }
 
-// Independent noise on the two levels, each with its mean removed.
-//
-// Noise, not a mode: a wall's instability is one eigenvalue outside the unit circle and which
-// one is not known in advance, so the seed has to project onto all of them — a mode soak can
-// read clean for twenty thousand steps and diverge by eighty. The mean comes off because the
-// constant vector is in both Laplacians' null space, a physical null mode whose round-off
-// wander is not the wall moving.
+// Mean-free independent noise projects onto unknown unstable modes without exciting the
+// physical constant-pressure null mode.
 void ImplicitSeedNoise(ImplicitBox &box, uint32_t seed) {
     std::mt19937 rng{seed};
     std::uniform_real_distribution<float> uniform{-1.f, 1.f};
     const int ny = box.Ny, nz = box.Nz;
-    auto row = [&](int ix, int iy, int iz) { return (size_t(ix) * size_t(ny) + size_t(iy)) * size_t(nz) + size_t(iz); };
+    auto const row = [&](int ix, int iy, int iz) { return (size_t(ix) * size_t(ny) + size_t(iy)) * size_t(nz) + size_t(iz); };
     std::vector<float> level[2];
     for (auto &v : level) {
         v.assign(box.Room, 0.f);
-        // The mean comes off the nodes the seed actually reaches, which for a room is not the
-        // whole box. Get that wrong and the constant vector — a physical null mode of both
-        // Laplacians, and the one thing the energy does not bound — starts at nonzero and
-        // drifts linearly in n, which reads as a couple of dB per thousand steps of
-        // instability that is not there.
+        // Average only physical room nodes.
         double sum = 0.;
         size_t count = 0;
         for (int ix = 0; ix < box.Nx; ++ix)
@@ -1740,27 +1094,19 @@ void ImplicitSeedNoise(ImplicitBox &box, uint32_t seed) {
     box.Seed([&](int ix, int iy, int iz) { return level[0][(size_t(ix) * ny + size_t(iy)) * nz + size_t(iz)]; }, [&](int ix, int iy, int iz) { return level[1][(size_t(ix) * ny + size_t(iy)) * nz + size_t(iz)]; });
 }
 
-// One step of the scheme on the host in double, in the kernels' own float coefficients and
-// from the same initial guess: the right-hand side, then the scheme's fixed number of Jacobi
-// sweeps. This is what says the masked operator the kernels run is the operator on paper —
-// the drop-ghost wall has no exact discrete mode to read a closed form against, so the
-// alternative would be believing the kernel because it does not diverge.
+// Double-precision host step using the kernels' float coefficients and initial guess.
 std::vector<double> ImplicitReferenceStep(const ImplicitBox &box, const float *un, const float *up) {
     const double R[3]{box.P.R1, box.P.R2, box.P.R3}, Q[3]{box.P.Q1, box.P.Q2, box.P.Q3};
     std::vector<double> cur(box.Nodes, 0.), prev(box.Nodes, 0.), bp(box.Nodes, 0.), x(box.Nodes, 0.), xn(box.Nodes, 0.);
+    std::vector<RoomImplicitTerm> wall_terms(box.Nodes);
     for (size_t i = 0; i < box.Nodes; ++i) {
         cur[i] = double(un[i]);
         prev[i] = double(up[i]);
     }
-    // The halo is zero, so the sums need no mask: an offset that leaves the room reads it.
-    auto sums = [&](const std::vector<double> &u, int ix, int iy, int iz, double s[3]) {
+    auto const sums = [&](const std::vector<double> &u, int ix, int iy, int iz, double s[3]) {
         s[0] = s[1] = s[2] = 0.;
-        for (int dx = -1; dx <= 1; ++dx)
-            for (int dy = -1; dy <= 1; ++dy)
-                for (int dz = -1; dz <= 1; ++dz) {
-                    const int r = dx * dx + dy * dy + dz * dz;
-                    if (r && !box.Shape.Blocked(ix, iy, iz, dx, dy, dz)) s[r - 1] += u[box.Index(ix + dx, iy + dy, iz + dz)];
-                }
+        for (const auto &leg : ImplicitLegs)
+            if (!box.Shape.Blocked(ix, iy, iz, leg.Dx, leg.Dy, leg.Dz)) s[leg.Class] += u[box.Index(ix + leg.Dx, iy + leg.Dy, iz + leg.Dz)];
     };
     for (int ix = 0; ix < box.Nx; ++ix) {
         for (int iy = 0; iy < box.Ny; ++iy) {
@@ -1772,8 +1118,9 @@ std::vector<double> ImplicitReferenceStep(const ImplicitBox &box, const float *u
                 double b = double(box.P.Rc) * cur[i] - prev[i];
                 for (int r = 0; r < 3; ++r) b += R[r] * sn[r] - Q[r] * sp[r];
                 const RoomImplicitTerm t = box.WallTerms(ix, iy, iz);
+                wall_terms[i] = t;
                 bp[i] = b + double(t.Cn) * cur[i] + double(t.Cp) * prev[i];
-                x[i] = cur[i]; // the sweeps start from u^n, as the GPU's ping-pong does
+                x[i] = cur[i];
             }
         }
     }
@@ -1786,7 +1133,7 @@ std::vector<double> ImplicitReferenceStep(const ImplicitBox &box, const float *u
                     sums(x, ix, iy, iz, sx);
                     double v = bp[i];
                     for (int r = 0; r < 3; ++r) v -= Q[r] * sx[r];
-                    xn[i] = v * double(box.WallTerms(ix, iy, iz).Fd);
+                    xn[i] = v * double(wall_terms[i].Fd);
                 }
             }
         }
@@ -1795,15 +1142,37 @@ std::vector<double> ImplicitReferenceStep(const ImplicitBox &box, const float *u
     return x;
 }
 
-// The drop-ghost wall of Smits & Bilbao 2025 Sec IV, in the two ways it can be checked to
-// machine precision.
-//
-// The first is the operator: one step of the GPU's kernels against the same step taken on the
-// host in double. The second is the wall's own energy balance, which is what replaces the
-// exact discrete mode the Neumann image had. With a rigid wall the paper's
-// E = 1/2 <M d, d> + 1/2 <K u^(n+1), u^n> is conserved exactly, and it is conserved by the
-// boundary as well as the interior — an operator that is not exactly symmetric and negative
-// semidefinite cannot conserve it, whatever a mode soak says.
+void ImplicitProjectionRung(const ImplicitScheme &scheme) {
+    const double t0 = Now();
+    ImplicitBox box(scheme, 16, 15, 14, true, 0., {.05}, ImplicitShape::Slanted, .4);
+    box.SetMeanProjection(4);
+    box.Seed([](int ix, int iy, int iz) { return 1. + .01 * ix - .02 * iy + .03 * iz; }, [](int ix, int iy, int iz) { return -.5 - .02 * ix + .01 * iy + .02 * iz; });
+
+    const auto stats = [&](const float *u) {
+        double sum = 0., outside = 0.;
+        for (int ix = 0; ix < box.Nx; ++ix)
+            for (int iy = 0; iy < box.Ny; ++iy)
+                for (int iz = 0; iz < box.Nz; ++iz) {
+                    const double v = u[box.Index(ix, iy, iz)];
+                    if (box.Shape.Inside(ix, iy, iz)) sum += v;
+                    else outside = std::max(outside, std::abs(v));
+                }
+        return std::pair{sum / double(box.InsideNodes), outside};
+    };
+
+    for (int n = 0; n < 3; ++n) box.Step();
+    const auto before = stats(box.Cur.As<float>());
+    box.Step(); // interval four: both stored levels are projected
+    const auto cur = stats(box.Cur.As<float>()), prev = stats(box.Prev.As<float>());
+    std::printf("[implicit] zero-mean projection on a 16 x 15 x 14 yawed room, every 4 steps\n");
+    std::printf("  mean before interval %.3e; after: current %.3e, previous %.3e; outside max %.3e | %.1fs\n", before.first, cur.first, prev.first, std::max(cur.second, prev.second), Now() - t0);
+    AtLeast("mean projection waits for its interval", std::abs(before.first), 1e-6);
+    AtMost("mean projection current residual", std::abs(cur.first), 2e-7);
+    AtMost("mean projection previous residual", std::abs(prev.first), 2e-7);
+    AtMost("mean projection preserves outside zeros", std::max(cur.second, prev.second), 0.);
+}
+
+// Checks the Sec. IV drop-ghost wall against a host step and its exact energy balance.
 void ImplicitWallRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int soak) {
     const double t0 = Now();
     ImplicitBox box(scheme, nx, ny, nz, true);
@@ -1824,10 +1193,8 @@ void ImplicitWallRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
     std::printf("  one step against the same step in double on the host: worst %.2e, %.2e of the level\n", worst, worst / scale);
     std::printf("  the constant field through both Laplacians: worst %.2e, which is the null space the energy needs\n", ImplicitNullResidual(box));
 
-    // The energy the scheme conserves, sampled rather than accumulated: it is a function of
-    // the two levels alone, so nothing about it depends on how often it is read.
     const double e0 = ImplicitEnergy(box, box.Cur.As<float>(), box.Prev.As<float>());
-    const int every = std::max(1, soak / 160); // the readback synchronises, so sample it
+    const int every = std::max(1, soak / 160);
     double drift = 0.;
     for (int i = 0; i < soak; ++i) {
         box.Step();
@@ -1837,22 +1204,7 @@ void ImplicitWallRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
     std::printf("  %d steps: worst energy drift %.2e of E0 | %.1fs\n", soak, drift, Now() - t0);
 }
 
-// The implicit scheme in a rigid box, against Morse & Ingard. This is the rung that says
-// whether the scheme is a room solver rather than a dispersion instrument, and it is available
-// without any reference implementation: a rigid box has analytic eigenfrequencies at any grid
-// spacing, so nothing about it needs a golden.
-//
-// Drop-ghost is a full-cell finite-volume termination (Hamilton, DAFx 2014): the wall lies on
-// the cell face, half a cell beyond the outermost node, so a room of N nodes is N*h wide and
-// the node at index i sits at (i + 1/2)h from the wall. The product cosine sampled there is
-// therefore the mode's trial vector, but — unlike under the image — it is not an exact
-// discrete eigenvector: the two differ at wall-crossing diagonal offsets. So the frequency is
-// read as the Rayleigh quotient <K v, v> / <M v, v> of that trial vector, which is what the
-// generalised eigenvalue is stationary about, rather than as one step of the recurrence.
-//
-// What that measures is where the wall effectively sits. Fitting one isotropic offset across
-// the modes leaves a residual that is the 27-point stencil's own boundary layer, and shrinks
-// with the grid rather than with the mode.
+// Fits the drop-ghost wall offset from rigid-box Rayleigh quotients against Morse & Ingard.
 void ImplicitModeRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int count) {
     const double t0 = Now();
     const double h = 0.0326857142857142, c = 343.2;
@@ -1870,7 +1222,6 @@ void ImplicitModeRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
         for (int b = 0; b <= 5; ++b)
             for (int d = 0; d <= 5; ++d)
                 if (a + b + d) modes.push_back({{a, b, d}, 0.});
-    // Ordered by the frequency the nominal wall gives, which is the order the fit reports in.
     auto nominal = [&](const Mode &p, double off) {
         double q = 0.;
         for (int a = 0; a < 3; ++a) q += std::pow(p.m[a] / ((n[a] + off) * h), 2.);
@@ -1900,10 +1251,8 @@ void ImplicitModeRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
         mode.Measured = std::acos(1. - .5 * num / den) / (2. * std::numbers::pi * ts);
     }
 
-    // The offset the modes agree on, and what is left after it. A scan rather than a solve:
-    // the residual is not quadratic in the offset and the grid it is scanned on is finer than
-    // anything the number is quoted to.
-    auto residual = [&](double off) {
+    // Fit one isotropic wall offset across all modes.
+    auto const residual = [&](double off) {
         double worst = 0.;
         for (const auto &mode : modes) worst = std::max(worst, std::abs(mode.Measured / nominal(mode, off) - 1.));
         return worst;
@@ -1926,20 +1275,11 @@ void ImplicitModeRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
     std::printf("  the modes fit a wall at (N + %.3f) h, worst %.3f %% left | %.1fs\n", best, 100. * best_res, Now() - t0);
 }
 
-// The amplitude decay a seeded mode shows, in nepers a step, read off the energy rather than
-// off a node: E goes as amplitude squared, so the slope of log E is -2 alpha T, and there is no
-// sinusoid to fit.
-//
-// The window is bounded by decay rather than by step count, and this is the whole difficulty
-// of the measurement. The seed's own error excites modes it is not, and with a
-// frequency-dependent wall those absorb at their own rate rather than at this one's — so the
-// longer the run, the more of the survivors and the less of the mode being measured is in the
-// slope. Ten decibels of it, which is the early-decay window a room's T10 is read over and for
-// the same reason. The first fifth goes because a mode started from rest settles first.
+// Fits amplitude decay from the first 10 dB of energy after discarding the settling fifth.
 template<typename F> double ImplicitDecay(ImplicitBox &box, F &&mode, int steps) {
     box.Seed(mode, mode);
     std::vector<double> logs, at;
-    const int every = std::max(1, steps / 200); // each sample reads back and re-sums the energy
+    const int every = std::max(1, steps / 200);
     for (int i = 0; i < steps; ++i) {
         box.Step();
         if ((i + 1) % every) continue;
@@ -1947,28 +1287,13 @@ template<typename F> double ImplicitDecay(ImplicitBox &box, F &&mode, int steps)
         if (!(e > 0.) || !std::isfinite(e)) break;
         logs.push_back(std::log(e));
         at.push_back(double(i + 1));
-        if (logs.front() - logs.back() > std::numbers::ln10) break; // ten decibels of energy
+        if (logs.front() - logs.back() > std::numbers::ln10) break;
     }
     return -.5 * ImplicitSlope(at, logs, logs.size() / 5);
 }
 
-// The paper's admittance wall: a real gamma, reaching the node through the beta its own ghost
-// set gives it. Nothing in the kernels changes for it — see ImplicitBox's constructor — so what
-// this rung checks is the two numbers the host now computes, beta and G.
-//
-// Three readings, in the order they would fail. beta on a grid-aligned flat wall is 1 exactly
-// or the paper's two alpha_r readings have been crossed. The energy balance is then exact:
-// with a wall that absorbs, what is conserved is E plus the running loss, and that is a
-// machine-precision statement the way conservation was for the rigid wall. And the decay is
-// the physics — the discrete room against the analytic one.
-//
-// The analytic side is a box with the same gamma on all six walls. For an axial mode the
-// pressure is antinodal at the two walls it runs into and uniform across the four it does not,
-// so the modal amplitude decay is alpha = c gamma (2/Lx + 1/Ly + 1/Lz), the slab's 2 gamma c/L
-// with the side walls added. It does not depend on the mode index, which is what makes it
-// readable off the energy: the modes the seed's own error also excites decay at the same rate,
-// so contamination moves the amplitude and leaves the slope alone. E goes as amplitude
-// squared, so the slope of log E is -2 alpha T.
+// Checks beta, energy balance, and axial decay for the paper's real-admittance wall. Analytic
+// amplitude decay is c*gamma*(2/Lx + 1/Ly + 1/Lz).
 void ImplicitAbsorbRung(const ImplicitScheme &scheme, int nx, int ny, int nz, double gamma, int steps) {
     const double t0 = Now();
     ImplicitBox box(scheme, nx, ny, nz, true, 0., {gamma});
@@ -1978,8 +1303,6 @@ void ImplicitAbsorbRung(const ImplicitScheme &scheme, int nx, int ny, int nz, do
     std::printf("[implicit] %s admittance wall on a %d x %d x %d room, gamma %.3f, lambda %.4f, %d distinct terms\n", scheme.Name, nx, ny, nz, gamma, box.Lambda, box.Codes);
     std::printf("  beta on a flat face %.9f, which is 1 exactly when the wiring is right\n", ImplicitWallSample(shape, 0, ny / 2, nz / 2, nex, k, true));
 
-    // The balance leg is the short one: D spans two steps, so every step has to be counted and
-    // both levels read back.
     ImplicitSeedNoise(box, 12345);
     const int balance = std::min(steps, 2000);
     std::vector<float> behind(box.Prev.As<float>(), box.Prev.As<float>() + box.Nodes);
@@ -2005,25 +1328,7 @@ void ImplicitAbsorbRung(const ImplicitScheme &scheme, int nx, int ny, int nz, do
     std::printf("  | %.1fs\n", Now() - t0);
 }
 
-// The same room, stepped, with its walls off the grid — which is the experiment the whole
-// staircase compensation exists for.
-//
-// A yawed box is a box: its modes are still (c/2) sqrt(sum (m_a/L_a)^2) at its own side
-// lengths, and an axial mode still decays at c gamma (2/Lx + 1/Ly + 1/Lz). Nothing analytic
-// about it changes when it is turned off the grid. What changes is that every wall is now a
-// staircase, so the two readings separate:
-//
-//  - **the frequencies**, which staircasing should leave alone. Bilbao & Hamilton 2017 is
-//    explicit that mode frequencies converge with h and decay times do not, and that is the
-//    reason the compensation is load-bearing rather than a refinement.
-//  - **the decay**, which staircasing biases because the staircased surface is larger than the
-//    one it stands for. The rung runs it twice: once with beta reading the surface's normal,
-//    and once with it reading the staircase's own, which is what an implementation that never
-//    looked at the mesh would do.
-//
-// Frequencies are the Rayleigh quotient of the true room's continuous mode sampled at the
-// nodes it keeps, the same variational reading the grid-aligned room uses. Decay is read off
-// the energy.
+// Compares fitted modes and decay for a yawed box with and without staircase compensation.
 void ImplicitYawedRung(const ImplicitScheme &scheme, int n, double angle, double gamma, int count, int steps) {
     const double t0 = Now();
     const double h = 0.0326857142857142, c = 343.2;
@@ -2036,7 +1341,6 @@ void ImplicitYawedRung(const ImplicitScheme &scheme, int n, double angle, double
     std::printf("[implicit] %s a box yawed %.1f degrees inside a %d^3 array, %.3f x %.3f x %.3f m, gamma %.3f\n", scheme.Name, angle * 180. / std::numbers::pi, n, cells[0] * h, cells[1] * h, cells[2] * h, gamma);
     std::printf("  %zu nodes of the array are the room (%.1f%%), %d of them wall, over %d distinct terms\n", box.InsideNodes, 100. * double(box.InsideNodes) / double(box.Room), box.WallNodes, box.Codes);
 
-    // The room's own modes, in the order the true box gives them.
     struct Mode {
         int M[3];
         double F;
@@ -2078,18 +1382,13 @@ void ImplicitYawedRung(const ImplicitScheme &scheme, int n, double angle, double
         measured.push_back(std::acos(1. - .5 * num / den) / (2. * std::numbers::pi * ts));
     }
 
-    // Which room the modes say this is. The shape's own extents are not it: the inside test
-    // keeps a node when it is half a cell in from the surface, and against a centre placed a
-    // fraction of a cell off the grid that leaves the outermost node somewhere between half a
-    // cell and a cell and a half from the wall — an ambiguity the size of the errors being
-    // read. So the same fit the grid-aligned room uses, one offset in cells across all three
-    // sides, and what is left after it is the staircase's own contribution.
+    // Fit the wall offset before attributing the remaining error to staircasing.
     auto analytic = [&](const Mode &mode, double off) {
         double q = 0.;
         for (int a = 0; a < 3; ++a) q += std::pow(mode.M[a] / ((cells[a] + off) * h), 2.);
         return .5 * c * std::sqrt(q);
     };
-    auto residual = [&](double off) {
+    auto const residual = [&](double off) {
         double worst = 0.;
         for (size_t i = 0; i < modes.size(); ++i) worst = std::max(worst, std::abs(measured[i] / analytic(modes[i], off) - 1.));
         return worst;
@@ -2109,15 +1408,12 @@ void ImplicitYawedRung(const ImplicitScheme &scheme, int n, double angle, double
     }
     std::printf("  the modes fit a room %+.3f cells on the shape's extents, worst %.3f %% left against %.3f %% nominal\n", best, 100. * best_res, 100. * residual(0.));
 
-    // And the decay, compensated against not, at the room the modes just fitted — so what the
-    // ratio carries is absorption and not where the wall is. Modes along the room's own long
-    // axis, seeded in its own coordinates.
     ImplicitBox raw(scheme, n, n, n, true, 0., {gamma}, ImplicitShape::Slanted, angle, false);
     const double fitted[3]{cells[0] + best, cells[1] + best, cells[2] + best};
     const double exact = gamma * box.Lambda * (2. / fitted[2] + 1. / fitted[0] + 1. / fitted[1]);
     std::printf("  %-6s %14s %8s %14s %8s   (analytic %.6e)\n", "mode", "compensated", "ratio", "staircased", "ratio", exact);
     for (int m = 1; m <= 4; ++m) {
-        auto mode = [&](int ix, int iy, int iz) {
+        auto const mode = [&](int ix, int iy, int iz) {
             const double p[3]{ix - shape.Cen[0], iy - shape.Cen[1], iz - shape.Cen[2]};
             double q[3];
             shape.Local(p, q);
@@ -2129,10 +1425,7 @@ void ImplicitYawedRung(const ImplicitScheme &scheme, int n, double angle, double
     std::printf("  | %.1fs\n", Now() - t0);
 }
 
-// The wall's discrete admittance at a frequency. The trapezoid rule maps s to
-// i(2/Ts)tan(w Ts/2), so this is the continuous admittance at the warped frequency — which at a
-// room's modes against a 12 kHz step rate is the continuous one to a part in ten thousand, but
-// the warp is what the wall actually realises and it costs nothing to say so.
+// Trapezoidal-rule admittance at s = i(2/Ts)tan(w Ts/2).
 std::complex<double> ImplicitAdmittance(const ImplicitWall &wall, double f) {
     const std::complex<double> s{0., 2. / wall.Ts * std::tan(std::numbers::pi * f * wall.Ts)};
     std::complex<double> y{0., 0.};
@@ -2142,17 +1435,8 @@ std::complex<double> ImplicitAdmittance(const ImplicitWall &wall, double f) {
     return y;
 }
 
-// What the LRC wall holds, and what left it over the step just taken.
-//
-// Multiplying the branch relation by mu(vh) telescopes it: Dh vh^2 + Fh gh^2 is stored and
-// 2 Eh mu(vh)^2 leaves a step. So what a room with frequency-dependent walls conserves is the
-// interior energy plus (lambda/2) beta sum_m [Dh vh^2 + Fh gh^2] at every wall node, plus
-// everything dissipated so far. That identity — a boundary energy with branch storage over a
-// 27-point operator — is the one the 2017 analysis leaves at nearest-neighbour cells and the
-// 2025 analysis leaves out, and it is what this rung reads.
-//
-// beta comes back out of the node's own Psi rather than being recomputed: Psi is lambda beta
-// over the interior diagonal, and those are the numbers actually in force.
+// LRC stored and dissipated energy. Recover beta from the uploaded Psi so accounting uses the
+// coefficients in force.
 struct ImplicitWallState {
     double Stored, Loss;
 };
@@ -2177,30 +1461,16 @@ ImplicitWallState ImplicitWallEnergy(const ImplicitBox &box, std::vector<float> 
     return out;
 }
 
-// Frequency-dependent walls: the scheme's walls as every scene here actually carries them, a
-// set of parallel LRC branches rather than a real admittance.
-//
-// Three readings, in the order they would fail.
-//
-//  - A branch that is pure resistance *is* a real admittance: D = F = 0 leaves b = gamma, and
-//    the history term identically zero. So the two paths have to agree to the last bit, and
-//    that is the check that the branch algebra is wired to the same place gamma was.
-//  - The energy identity above, which is the machine-precision statement for a wall that both
-//    stores and dissipates.
-//  - And the physics: with a resonant branch the wall's Re{Y} varies across the room's own
-//    modes, and each mode has to decay at c Re{Y(f)} (2/Lx + 1/Ly + 1/Lz). A wall that only
-//    happened to absorb the right *average* amount would fail this.
+// Checks pure-resistance equivalence, LRC energy balance, and mode-dependent resonant decay.
 void ImplicitLrcRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int steps) {
     const double t0 = Now();
     const double h = 0.0326857142857142, c = 343.2;
     const double lambda = std::min(scheme.Lambda, ImplicitCourantLimit(scheme)), ts = lambda * h / c;
     const double side[3]{nx + ImplicitWallOffset, ny + ImplicitWallOffset, nz + ImplicitWallOffset};
-    // alpha = Re{Y} * this, in nepers a step: the same room the real-admittance rung measures.
     const double geometry = lambda * (2. / side[0] + 1. / side[1] + 1. / side[2]);
 
     std::printf("[implicit] %s LRC walls on a %d x %d x %d room, lambda %.4f, %.1f kHz step rate\n", scheme.Name, nx, ny, nz, lambda, 1e-3 / ts);
 
-    // One branch of pure resistance, against the real admittance it is.
     const double gamma = .05;
     ImplicitBox real(scheme, nx, ny, nz, true, 0., {gamma});
     ImplicitBox same(scheme, nx, ny, nz, true, 0., ImplicitWall{0., ts, {0., 1. / gamma, 0.}});
@@ -2218,14 +1488,11 @@ void ImplicitLrcRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int s
     }
     std::printf("  a branch of pure resistance against the gamma = %.2f it equals, 64 steps: worst %.2e of the level\n", gamma, worst / scale);
 
-    // A resonance and a resistive floor, so Re{Y} varies across the room's own modes rather
-    // than sitting at one number the decay could match by accident.
     const double f0 = 200., d = .02, e = d * 2. * std::numbers::pi * f0, f = d * std::pow(2. * std::numbers::pi * f0, 2.);
     const ImplicitWall material{0., ts, {d, e, f, 0., 100., 0.}};
     ImplicitBox box(scheme, nx, ny, nz, true, 0., material);
     std::printf("  %d branches, a resonance at %.0f Hz beside a resistive floor, %d wall nodes\n", material.Branches(), f0, box.P.Nw);
 
-    // The energy the wall stores and dissipates, beside the interior's.
     ImplicitSeedNoise(box, 12345);
     std::vector<float> before(size_t(material.Branches()) * size_t(box.P.Nw), 0.f);
     const double e0 = ImplicitEnergy(box, box.Cur.As<float>(), box.Prev.As<float>());
@@ -2250,375 +1517,24 @@ void ImplicitLrcRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int s
     std::printf("  | %.1fs\n", Now() - t0);
 }
 
-// --- Voxelising a mesh ----------------------------------------------------------------------
-//
-// What the boundary asks of a room's geometry is two things a node: which of its 26 legs cross
-// the surface, and the true outward normal of the surface it is nearest. The shapes above
-// answer both in closed form; a mesh answers the first with a segment query against a triangle
-// hierarchy and the second with a closest-point query against the same one.
-//
-// That is what the reference voxeliser does with its own ray march, and the two differences are
-// the whole of why it cannot be reused: it marches six legs where a 27-point stencil needs
-// twenty-six, and it finds the nearest triangle a boundary node belongs to and then does not
-// export it. Its ray march is parameterised by the stencil, but the half-leg length its hit
-// test compares against is a scalar, and a 27-point stencil has three leg lengths.
-//
-// Triangles are wound so their normals point out of the room.
-struct ImplicitMesh {
-    ImplicitMesh(Eigen::MatrixXd v, Eigen::MatrixXi f) : V(std::move(v)), F(std::move(f)) {
-        Tree.Init(V, F);
-        Normals.resize(F.rows(), 3);
-        for (int t = 0; t < F.rows(); ++t) {
-            const Eigen::RowVector3d a = V.row(F(t, 0)), u = Eigen::RowVector3d(V.row(F(t, 1))) - a, v = Eigen::RowVector3d(V.row(F(t, 2))) - a;
-            const Eigen::RowVector3d n{u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
-            Normals.row(t) = n.normalized();
-        }
-    }
-
-    bool Blocked(int ix, int iy, int iz, int dx, int dy, int dz) const {
-        const Eigen::RowVector3d a{double(ix), double(iy), double(iz)};
-        double t = 0.;
-        return Tree.Crossing(a, a + Eigen::RowVector3d{double(dx), double(dy), double(dz)}, t) >= 0;
-    }
-
-    void Normal(int ix, int iy, int iz, double n[3]) const {
-        int t = -1;
-        Eigen::RowVector3d closest;
-        Tree.ClosestPoint(Eigen::RowVector3d{double(ix), double(iy), double(iz)}, t, closest);
-        for (int a = 0; a < 3; ++a) n[a] = t < 0 ? 0. : Normals(t, a);
-    }
-
-    Eigen::MatrixXd V;
-    Eigen::MatrixXi F;
-    Eigen::MatrixXd Normals;
-    AabbTree<double> Tree;
+struct ImplicitVoxelisedScene {
+    ImplicitModel Model;
+    ImplicitVoxels Voxels;
+    double Seconds;
 };
 
-// The kept counts and beta at a node, from a mesh rather than from a closed form. The same sum
-// ImplicitWallSample computes, over the legs the mesh says are cut.
-double ImplicitMeshSample(const ImplicitMesh &mesh, int ix, int iy, int iz, const double nex[3], int k[3]) {
-    double n[3];
-    mesh.Normal(ix, iy, iz, n);
-    k[0] = k[1] = k[2] = 0;
-    double beta = 0.;
-    for (int dx = -1; dx <= 1; ++dx)
-        for (int dy = -1; dy <= 1; ++dy)
-            for (int dz = -1; dz <= 1; ++dz) {
-                const int r = dx * dx + dy * dy + dz * dz;
-                if (!r) continue;
-                if (!mesh.Blocked(ix, iy, iz, dx, dy, dz)) {
-                    ++k[r - 1];
-                    continue;
-                }
-                beta += nex[r - 1] * (n[0] * dx + n[1] * dy + n[2] * dz);
-            }
-    return beta;
-}
-
-// The twelve triangles of a yawed box, in the cells its shape is defined over and wound
-// outward, so the mesh and the closed form stand for the same room.
-ImplicitMesh ImplicitBoxMesh(const ImplicitShape &shape) {
-    Eigen::MatrixXd v(8, 3);
-    for (int corner = 0; corner < 8; ++corner) {
-        const double q[3]{(corner & 1 ? 1. : -1.) * shape.Ext[0], (corner & 2 ? 1. : -1.) * shape.Ext[1], (corner & 4 ? 1. : -1.) * shape.Ext[2]};
-        v(corner, 0) = shape.Cen[0] + shape.Cos * q[0] - shape.Sin * q[1];
-        v(corner, 1) = shape.Cen[1] + shape.Sin * q[0] + shape.Cos * q[1];
-        v(corner, 2) = shape.Cen[2] + q[2];
-    }
-    // Corner bit 0 is +x, bit 1 is +y, bit 2 is +z, so each face is the four corners agreeing
-    // on one bit. Listed going round, and emitted reversed, which is what winds them outward.
-    static constexpr int Faces[6][4]{{0, 2, 6, 4}, {1, 5, 7, 3}, {0, 4, 5, 1}, {2, 3, 7, 6}, {0, 1, 3, 2}, {4, 6, 7, 5}};
-    Eigen::MatrixXi f(12, 3);
-    for (int face = 0; face < 6; ++face) {
-        f.row(2 * face) << Faces[face][0], Faces[face][2], Faces[face][1];
-        f.row(2 * face + 1) << Faces[face][0], Faces[face][3], Faces[face][2];
-    }
-    return {std::move(v), std::move(f)};
-}
-
-// A room's own model, as the reference exports it: triangles grouped by the material they
-// carry, in metres. Read into cell coordinates over a grid of the given spacing, with a margin
-// of halo the stencil can reach into.
-//
-// The winding is not to be trusted — a model marks triangles one- or two-sided and nothing
-// makes a two-sided one face out of the room — so the normals here are raw, and every wall node
-// orients its own against the ghost set it turns out to have.
-struct ImplicitModel {
-    std::vector<std::string> Materials;
-    std::vector<int> Mat; // a material index a triangle
-    Eigen::MatrixXd V;
-    Eigen::MatrixXi F;
-    Eigen::RowVector3d Source; // a point known to be inside the room, to start a fill from
-    int N[3]{0, 0, 0};
-};
-
-ImplicitModel ImplicitLoadModel(const std::string &path, double h, int margin) {
-    std::ifstream stream{path};
-    if (!stream) throw std::runtime_error("Failed to read room model: " + path);
-    nlohmann::json model;
-    stream >> model;
-
-    ImplicitModel out;
-    std::vector<std::array<double, 3>> pts;
-    std::vector<std::array<int, 3>> tris;
-    for (const auto &entry : model["mats_hash"].items()) {
-        const int base = int(pts.size()), mat = int(out.Materials.size());
-        out.Materials.push_back(entry.key());
-        for (const auto &p : entry.value()["pts"]) pts.push_back({p[0], p[1], p[2]});
-        for (const auto &t : entry.value()["tris"]) {
-            tris.push_back({base + int(t[0]), base + int(t[1]), base + int(t[2])});
-            out.Mat.push_back(mat);
-        }
-    }
-    if (tris.empty()) throw std::runtime_error("Room model carries no triangles: " + path);
-
-    // Into cells, with the room's own bounding box put at the margin.
-    double lo[3]{1e30, 1e30, 1e30}, hi[3]{-1e30, -1e30, -1e30};
-    for (const auto &p : pts)
-        for (int a = 0; a < 3; ++a) {
-            lo[a] = std::min(lo[a], p[a]);
-            hi[a] = std::max(hi[a], p[a]);
-        }
-    out.V.resize(Eigen::Index(pts.size()), 3);
-    for (size_t i = 0; i < pts.size(); ++i)
-        for (int a = 0; a < 3; ++a) out.V(Eigen::Index(i), a) = (pts[i][size_t(a)] - lo[a]) / h + margin;
-    out.F.resize(Eigen::Index(tris.size()), 3);
-    for (size_t i = 0; i < tris.size(); ++i)
-        for (int a = 0; a < 3; ++a) out.F(Eigen::Index(i), a) = tris[i][size_t(a)];
-    for (int a = 0; a < 3; ++a) out.N[a] = int(std::ceil((hi[a] - lo[a]) / h)) + 2 * margin + 1;
-
-    const auto &source = model["sources"][0]["xyz"];
-    for (int a = 0; a < 3; ++a) out.Source[a] = (double(source[a]) - lo[a]) / h + margin;
-    return out;
-}
-
-// The voxeliser against the geometry it stands for, leg by leg.
-//
-// The closed form's own inside test insets by half a cell, because that is where the full cell
-// puts its wall. A mesh has no such convention — a leg is cut when it crosses the surface, full
-// stop, which is what the reference does too — so the truth this checks against is the exact
-// segment-against-the-box test rather than the shape's `Inside`: in the box's own coordinates
-// the segment meets it iff the parameter interval survives all three slabs, and it crosses the
-// *surface* iff it meets the box without lying wholly within it.
-void ImplicitVoxelRung(const ImplicitScheme &scheme, const ImplicitShape &shape) {
+ImplicitVoxelisedScene LoadImplicitVoxelisedScene(const std::string &path, double h) {
     const double t0 = Now();
-    const ImplicitMesh mesh = ImplicitBoxMesh(shape);
-    const double nex[3]{ImplicitNex(scheme, 0), ImplicitNex(scheme, 1), ImplicitNex(scheme, 2)};
-
-    auto local = [&](double x, double y, double z, double q[3]) {
-        const double p[3]{x - shape.Cen[0], y - shape.Cen[1], z - shape.Cen[2]};
-        shape.Local(p, q);
-    };
-    auto within = [&](const double q[3]) {
-        return std::abs(q[0]) <= shape.Ext[0] && std::abs(q[1]) <= shape.Ext[1] && std::abs(q[2]) <= shape.Ext[2];
-    };
-    auto crosses = [&](int ix, int iy, int iz, int dx, int dy, int dz) {
-        double q0[3], q1[3];
-        local(ix, iy, iz, q0);
-        local(ix + dx, iy + dy, iz + dz, q1);
-        if (within(q0) && within(q1)) return false; // wholly inside a convex box
-        double lo = 0., hi = 1.;
-        for (int a = 0; a < 3; ++a) {
-            const double d = q1[a] - q0[a];
-            if (std::abs(d) < 1e-15) {
-                if (std::abs(q0[a]) > shape.Ext[a]) return false;
-                continue;
-            }
-            double t0a = (-shape.Ext[a] - q0[a]) / d, t1a = (shape.Ext[a] - q0[a]) / d;
-            if (t0a > t1a) std::swap(t0a, t1a);
-            lo = std::max(lo, t0a);
-            hi = std::min(hi, t1a);
-            if (lo > hi) return false;
-        }
-        return true;
-    };
-
-    size_t legs = 0, wrong_leg = 0, nodes = 0, wrong_normal = 0, wrong_count = 0, inset = 0;
-    double worst_beta = 0.;
-    for (int ix = 0; ix < shape.N[0]; ++ix) {
-        for (int iy = 0; iy < shape.N[1]; ++iy) {
-            for (int iz = 0; iz < shape.N[2]; ++iz) {
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            if (!(dx || dy || dz)) continue;
-                            ++legs;
-                            wrong_leg += size_t(mesh.Blocked(ix, iy, iz, dx, dy, dz) != crosses(ix, iy, iz, dx, dy, dz));
-                        }
-                // The closed form's ghost set under the crossing rule the mesh uses, rather
-                // than under its own inside test — so what is compared is the geometry, and
-                // the conventions are counted separately below.
-                double na[3];
-                shape.Normal(ix, iy, iz, na);
-                int ka[3]{0, 0, 0}, km[3];
-                double a = 0.;
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int r = dx * dx + dy * dy + dz * dz;
-                            if (!r) continue;
-                            if (crosses(ix, iy, iz, dx, dy, dz)) a += nex[r - 1] * (na[0] * dx + na[1] * dy + na[2] * dz);
-                            else ++ka[r - 1];
-                        }
-                double q[3];
-                local(ix, iy, iz, q);
-                inset += size_t(within(q) != shape.Inside(ix, iy, iz));
-                if (ka[0] == 6 && ka[1] == 12 && ka[2] == 8) continue;
-                ++nodes;
-                const double m = ImplicitMeshSample(mesh, ix, iy, iz, nex, km);
-                double nm[3];
-                mesh.Normal(ix, iy, iz, nm);
-                double dot = 0.;
-                for (int c = 0; c < 3; ++c) dot += na[c] * nm[c];
-                wrong_normal += size_t(dot < 1. - 1e-9);
-                wrong_count += size_t(ka[0] != km[0] || ka[1] != km[1] || ka[2] != km[2]);
-                worst_beta = std::max(worst_beta, std::abs(a - m));
-            }
-        }
-    }
-    std::printf("[implicit] %s voxelising a %.1f degree box mesh over a %d^3 grid, %d triangles\n", scheme.Name, std::atan2(shape.Sin, shape.Cos) * 180. / std::numbers::pi, shape.N[0], int(mesh.F.rows()));
-    std::printf("  %zu legs against the exact segment test: %zu disagree\n", legs, wrong_leg);
-    std::printf("  %zu wall nodes: %zu with kept counts off the closed form's, %zu with a normal off it, worst beta difference %.2e\n", nodes, wrong_count, wrong_normal, worst_beta);
-    // The one thing the two do not share. A mesh cuts a leg where the surface is, and the
-    // closed form keeps a node only when it is half a cell in from the surface, which is where
-    // the full cell puts its wall. Those differ over a half-cell band, and that band is why the
-    // yawed room's modes have to fit an offset rather than being read at the shape's extents.
-    std::printf("  %zu nodes the half-cell inset keeps and the crossing rule does not, or the other way | %.1fs\n", inset, Now() - t0);
-}
-
-// A real room, voxelised, and everything about it the boundary would have to carry.
-//
-// Nothing here steps. The point is the three questions a box and a sphere could only approximate
-// — whether beta stays nonnegative where the geometry is a room rather than a shape, how many
-// distinct terms a real staircase with real materials produces against the 65,535 a ushort code
-// indexes, and how much of the bounding box is outside — asked of the room the solver actually
-// ships.
-//
-// Inside and outside come from a flood fill over the legs the mesh does not cut, started at the
-// scene's own source. That is the only reading that survives a model built from surfaces: a
-// partition of no thickness has no inside, but it does cut the legs that cross it, and the fill
-// stops there. Fill over the six axis legs rather than all 26, because a diagonal leg can slip
-// between two surfaces that share an edge.
-//
-// The winding of a model's triangles says nothing about which side the room is on — they are
-// marked one- and two-sided and nothing orients them — so each wall node turns its own normal
-// to agree with the ghost set it has.
-// Voxelising a loaded model: every leg of every node against the mesh, a flood fill from the
-// scene's own source, and at each node the wall touches the true outward normal and the
-// material of the nearest triangle.
-//
-// The winding of a model's triangles says nothing about which side the room is on — they are
-// marked one- and two-sided and nothing orients them — so each wall node turns its normal to
-// agree with the ghost set it turns out to have.
-ImplicitVoxels ImplicitVoxelise(const ImplicitModel &model, const ImplicitMesh &mesh) {
-    ImplicitVoxels vox;
-    std::copy_n(model.N, 3, vox.N);
-    const int nx = vox.N[0], ny = vox.N[1], nz = vox.N[2];
-    const size_t nodes = size_t(nx) * size_t(ny) * size_t(nz);
-    vox.Blocked.assign(nodes, 0);
-    vox.Filled.assign(nodes, 0);
-    vox.Normals.assign(3 * nodes, 0.f);
-    vox.Mat.assign(nodes, -1);
-
-    // Every leg of every node, which is the expensive part and the only part that is.
-    ParallelFor(size_t(nx), 1, [&](size_t sx) {
-        const int ix = int(sx);
-        for (int iy = 0; iy < ny; ++iy)
-            for (int iz = 0; iz < nz; ++iz) {
-                uint32_t mask = 0;
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            if (!(dx || dy || dz)) continue;
-                            if (mesh.Blocked(ix, iy, iz, dx, dy, dz)) mask |= 1u << ImplicitLegBit(dx, dy, dz);
-                        }
-                vox.Blocked[vox.At(ix, iy, iz)] = mask;
-            }
-    });
-
-    // Symmetrise. The two ends of a leg test the same segment, so they agree except where a
-    // triangle falls on an endpoint and the arithmetic tips one way from one side. Drop-ghost
-    // is stable because it is exactly symmetric, and one disagreeing leg in a room is enough
-    // to take that away, so a leg either end calls cut is cut.
-    const std::vector<uint32_t> raw = vox.Blocked;
-    ParallelFor(size_t(nx), 1, [&](size_t sx) {
-        const int ix = int(sx);
-        for (int iy = 0; iy < ny; ++iy)
-            for (int iz = 0; iz < nz; ++iz) {
-                uint32_t mask = raw[vox.At(ix, iy, iz)];
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                            if ((!dx && !dy && !dz) || jx < 0 || jy < 0 || jz < 0 || jx >= nx || jy >= ny || jz >= nz) continue;
-                            if (raw[vox.At(jx, jy, jz)] & (1u << ImplicitLegBit(-dx, -dy, -dz))) mask |= 1u << ImplicitLegBit(dx, dy, dz);
-                        }
-                vox.Blocked[vox.At(ix, iy, iz)] = mask;
-            }
-    });
-
-    // The room, as the set of nodes an uncut leg can reach from the scene's own source. Over
-    // all twenty-six, not six: two nodes joined by a leg the surface does not cut are
-    // acoustically joined, and the passes drop a ghost by reading the zero the far node is
-    // held at — so what is held at zero has to be exactly what no uncut leg reaches. A
-    // six-legged fill leaves nodes it cannot reach diagonally adjacent to nodes it can, which
-    // is a Dirichlet condition at those legs and an operator that is no longer symmetric.
-    std::vector<size_t> queue;
-    const int seed[3]{int(std::lround(model.Source[0])), int(std::lround(model.Source[1])), int(std::lround(model.Source[2]))};
-    queue.push_back(vox.At(seed[0], seed[1], seed[2]));
-    vox.Filled[queue.front()] = 1;
-    for (size_t head = 0; head < queue.size(); ++head) {
-        const size_t i = queue[head];
-        const int iz = int(i % size_t(nz)), iy = int((i / size_t(nz)) % size_t(ny)), ix = int(i / (size_t(nz) * size_t(ny)));
-        for (int dx = -1; dx <= 1; ++dx)
-            for (int dy = -1; dy <= 1; ++dy)
-                for (int dz = -1; dz <= 1; ++dz) {
-                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                    if ((!dx && !dy && !dz) || jx < 0 || jy < 0 || jz < 0 || jx >= nx || jy >= ny || jz >= nz) continue;
-                    if (vox.Blocked[i] & (1u << ImplicitLegBit(dx, dy, dz))) continue;
-                    const size_t j = vox.At(jx, jy, jz);
-                    if (vox.Filled[j]) continue;
-                    vox.Filled[j] = 1;
-                    queue.push_back(j);
-                }
-    }
-
-    ParallelFor(size_t(nx), 1, [&](size_t sx) {
-        const int ix = int(sx);
-        for (int iy = 0; iy < ny; ++iy)
-            for (int iz = 0; iz < nz; ++iz) {
-                const size_t i = vox.At(ix, iy, iz);
-                if (!vox.Blocked[i]) continue;
-                int tri = -1;
-                Eigen::RowVector3d closest;
-                mesh.Tree.ClosestPoint(Eigen::RowVector3d{double(ix), double(iy), double(iz)}, tri, closest);
-                if (tri < 0) continue;
-                double n[3], stair[3]{0., 0., 0.};
-                for (int a = 0; a < 3; ++a) n[a] = mesh.Normals(tri, a);
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int r = dx * dx + dy * dy + dz * dz;
-                            if (!r || !(vox.Blocked[i] & (1u << ImplicitLegBit(dx, dy, dz)))) continue;
-                            const double len = std::sqrt(double(r));
-                            stair[0] += dx / len;
-                            stair[1] += dy / len;
-                            stair[2] += dz / len;
-                        }
-                const double align = n[0] * stair[0] + n[1] * stair[1] + n[2] * stair[2];
-                for (int a = 0; a < 3; ++a) vox.Normals[3 * i + size_t(a)] = float(align < 0. ? -n[a] : n[a]);
-                vox.Mat[i] = int8_t(model.Mat[size_t(tri)]);
-            }
-    });
-    return vox;
-}
-
-void ImplicitSceneRung(const ImplicitScheme &scheme, const std::string &path, double h, double gamma) {
-    const double t0 = Now();
-    const ImplicitModel model = ImplicitLoadModel(path, h, 2);
+    ImplicitModel model = ImplicitLoadModel(path, h, 2);
     const ImplicitMesh mesh(model.V, model.F);
-    const ImplicitVoxels vox = ImplicitVoxelise(model, mesh);
-    const double voxelised = Now() - t0;
+    ImplicitVoxels voxels = ImplicitVoxelise(model, mesh);
+    return {std::move(model), std::move(voxels), Now() - t0};
+}
+
+void ImplicitSceneRung(const ImplicitScheme &scheme, const std::string &path, double h, double gamma, const ImplicitVoxelisedScene &scene) {
+    const double t0 = Now();
+    const ImplicitModel &model = scene.Model;
+    const ImplicitVoxels &vox = scene.Voxels;
     const int nx = vox.N[0], ny = vox.N[1], nz = vox.N[2];
     const size_t nodes = size_t(nx) * size_t(ny) * size_t(nz);
     const ImplicitShape shape(vox);
@@ -2642,33 +1558,25 @@ void ImplicitSceneRung(const ImplicitScheme &scheme, const std::string &path, do
                 const size_t i = vox.At(ix, iy, iz);
                 room += size_t(vox.Filled[i] != 0);
                 if (!vox.Filled[i] || !vox.Blocked[i]) continue;
-                int k[3];
-                // Raw, so the clamp ImplicitWallSample applies can be counted rather than hidden.
+                int k[3]{0, 0, 0};
                 double n[3], beta = 0.;
                 shape.Normal(ix, iy, iz, n);
-                shape.Counts(ix, iy, iz, k);
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int r = dx * dx + dy * dy + dz * dz;
-                            if (r && shape.Blocked(ix, iy, iz, dx, dy, dz)) beta += nex[r - 1] * (n[0] * dx + n[1] * dy + n[2] * dz);
-                        }
-                // Legs the surface cuts between two nodes that are *both* in the room, which a
-                // thin partition makes and a box cannot. The passes drop a ghost by reading
-                // the zero the far node is held at, and there is no zero to read here.
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                            if ((!dx && !dy && !dz) || jx < 0 || jy < 0 || jz < 0 || jx >= nx || jy >= ny || jz >= nz) continue;
-                            if (shape.Blocked(ix, iy, iz, dx, dy, dz) && vox.Filled[vox.At(jx, jy, jz)]) ++interior_cut;
-                        }
+                for (const auto &leg : ImplicitLegs) {
+                    if (!shape.Blocked(ix, iy, iz, leg.Dx, leg.Dy, leg.Dz)) {
+                        ++k[leg.Class];
+                        continue;
+                    }
+                    beta += nex[leg.Class] * (n[0] * leg.Dx + n[1] * leg.Dy + n[2] * leg.Dz);
+                    // Count cut legs whose opposite endpoint is also live.
+                    const int jx = ix + leg.Dx, jy = iy + leg.Dy, jz = iz + leg.Dz;
+                    if (jx >= 0 && jy >= 0 && jz >= 0 && jx < nx && jy < ny && jz < nz && vox.Filled[vox.At(jx, jy, jz)]) ++interior_cut;
+                }
                 if (k[0] < 6) ++axis_wall;
                 lo = std::min(lo, beta);
                 hi = std::max(hi, beta);
                 if (beta < 0.) {
                     ++negative;
-                    clamped -= beta; // what going rigid there costs, against the total below
+                    clamped -= beta;
                     beta = 0.;
                 }
                 mean += beta;
@@ -2679,9 +1587,8 @@ void ImplicitSceneRung(const ImplicitScheme &scheme, const std::string &path, do
     }
     mean /= double(std::max<size_t>(wall.size(), 1));
 
-    // The distinct terms, exactly and with beta quantised — and with the material in the key,
-    // because a scene has several and each gives the same geometry a different diagonal.
-    auto distinct = [&](int bits) {
+    // Material participates in the term key because it changes the wall diagonal.
+    auto const distinct = [&](int bits) {
         const double step = bits && hi > 0. ? hi / double((1 << bits) - 1) : 0.;
         std::vector<std::array<float, 4>> t;
         t.reserve(wall.size());
@@ -2696,34 +1603,20 @@ void ImplicitSceneRung(const ImplicitScheme &scheme, const std::string &path, do
         return size_t(std::unique(t.begin(), t.end()) - t.begin());
     };
 
-    std::printf("[implicit] %s voxelising %s at %.0f mm: %d x %d x %d, %.3fM nodes, %d triangles over %zu materials | %.1fs\n", scheme.Name, std::filesystem::path{path}.parent_path().filename().string().c_str(), 1e3 * h, nx, ny, nz, double(nodes) / 1e6, int(model.F.rows()), model.Materials.size(), voxelised);
+    std::printf("[implicit] %s voxelising %s at %.0f mm: %d x %d x %d, %.3fM nodes, %d triangles over %zu materials | %.1fs\n", scheme.Name, std::filesystem::path{path}.parent_path().filename().string().c_str(), 1e3 * h, nx, ny, nz, double(nodes) / 1e6, int(model.F.rows()), model.Materials.size(), scene.Seconds);
     std::printf("  the fill reaches %.3fM nodes, %.1f%% of the box — the other %.1f%% is outside, ended by the block's word\n", double(room) / 1e6, 100. * double(room) / double(nodes), 100. * (1. - double(room) / double(nodes)));
     std::printf("  wall nodes %zu over 26 directions, %zu over the 6 a reference voxeliser marks (%.1f%% of them)\n", wall.size(), axis_wall, 100. * double(axis_wall) / double(std::max<size_t>(wall.size(), 1)));
     std::printf("  beta %.4f to %.4f, mean %.4f (a flat wall is 1) — %zu came out negative and went rigid, %.4f%% of the wall's absorption\n", lo, hi, mean, negative, 100. * clamped / (total + clamped));
-    std::printf("  distinct terms %zu exact, %zu with beta to 8 bits, against the 65535 a ushort code indexes\n", distinct(0), distinct(8));
-    std::printf("  %zu cut legs join two nodes that are both in the room, which no zero across the wall can drop | %.1fs\n", interior_cut, Now() - t0);
+    std::printf("  distinct terms %zu exact, %zu with beta to 8 bits (the production code keeps exact uint indices)\n", distinct(0), distinct(8));
+    std::printf("  %zu cut legs join two nodes that are both in the room, which no zero across the wall can drop | %.1fs\n", interior_cut, scene.Seconds + Now() - t0);
 }
 
-// And the room, stepped. This is the whole path end to end: a model the solver ships, voxelised
-// over the 26 legs the stencil needs, into the same box every rung above measures — the
-// geometry reaches the kernels as a code a node and they do not know it came from a mesh.
-//
-// Two readings and a cost. The operator against the same step taken on the host in double is
-// the check that a room's geometry does not break what a shape's did not; the energy is the
-// machine-precision statement a rigid wall of any shape has to satisfy; and the step's time
-// says what the room costs against the same passes without the geometry.
-void ImplicitRoomRung(const ImplicitScheme &scheme, const std::string &path, double h, int steps, int reps) {
+// End-to-end mesh-room operator, stability, energy, and timing check.
+void ImplicitRoomRung(const ImplicitScheme &scheme, const std::string &path, double h, int steps, int reps, const ImplicitVoxels &vox) {
     const double t0 = Now();
-    const ImplicitModel model = ImplicitLoadModel(path, h, 2);
-    const ImplicitMesh mesh(model.V, model.F);
-    const ImplicitVoxels vox = ImplicitVoxelise(model, mesh);
     ImplicitBox box(scheme, vox.N[0], vox.N[1], vox.N[2], true, 0., {}, ImplicitShape::Voxels, 0., true, &vox);
     std::printf("[implicit] %s stepping %s at %.0f mm: %.3fM nodes, %zu of them room, %d wall, %d distinct terms\n", scheme.Name, std::filesystem::path{path}.parent_path().filename().string().c_str(), 1e3 * h, double(box.Room) / 1e6, box.InsideNodes, box.WallNodes, box.Codes);
 
-    // The kernels against the same step taken on the host in double. They agree, and on this
-    // room that says less than it does on a box: both carry the same wrong operator, because
-    // both drop a ghost by reading the zero across the wall and this room has cut legs with a
-    // live node on the far side. See the note under the sweep.
     ImplicitSeedNoise(box, 12345);
     const std::vector<float> un(box.Cur.As<float>(), box.Cur.As<float>() + box.Nodes);
     const std::vector<float> up(box.Prev.As<float>(), box.Prev.As<float>() + box.Nodes);
@@ -2736,29 +1629,21 @@ void ImplicitRoomRung(const ImplicitScheme &scheme, const std::string &path, dou
         scale = std::max(scale, std::abs(reference[i]));
     }
     std::printf("  one step against the same step in double on the host: worst %.2e, %.2e of the level\n", worst, worst / scale);
-    // The check the host reference cannot make, because it shares the ghost rule the kernels use.
     std::printf("  the constant field through both Laplacians: worst %.2e, which is the null space the energy needs\n", ImplicitNullResidual(box));
 
-    // Whether the geometry is one this path can carry at all: a leg the surface cuts between
-    // two nodes that are both in the room has no zero on its far side to be dropped by.
     size_t interior_cut = 0;
     for (int ix = 0; ix < vox.N[0]; ++ix)
         for (int iy = 0; iy < vox.N[1]; ++iy)
             for (int iz = 0; iz < vox.N[2]; ++iz) {
                 const size_t i = vox.At(ix, iy, iz);
                 if (!vox.Filled[i] || !vox.Blocked[i]) continue;
-                for (int dx = -1; dx <= 1; ++dx)
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                            if ((!dx && !dy && !dz) || jx < 0 || jy < 0 || jz < 0 || jx >= vox.N[0] || jy >= vox.N[1] || jz >= vox.N[2]) continue;
-                            if ((vox.Blocked[i] & (1u << ImplicitLegBit(dx, dy, dz))) && vox.Filled[vox.At(jx, jy, jz)]) ++interior_cut;
-                        }
+                for (const auto &leg : ImplicitLegs) {
+                    const int jx = ix + leg.Dx, jy = iy + leg.Dy, jz = iz + leg.Dz;
+                    if (jx < 0 || jy < 0 || jz < 0 || jx >= vox.N[0] || jy >= vox.N[1] || jz >= vox.N[2]) continue;
+                    if ((vox.Blocked[i] & (1u << leg.Bit)) && vox.Filled[vox.At(jx, jy, jz)]) ++interior_cut;
+                }
             }
 
-    // What Courant number the room holds at, and whether its energy is conserved — the same two
-    // readings a box gets, now that the mask makes the operator the one on paper. The interior
-    // cut count is what a code alone could not have carried.
     const double free_limit = std::min(scheme.Lambda, ImplicitCourantLimit(scheme));
     std::printf("  %zu cut legs join two nodes both in the room, which only the mask can drop\n", interior_cut);
     std::printf("  %-10s %14s %22s\n", "lambda", "energy drift", "growth, dB per 1000");
@@ -2788,15 +1673,7 @@ void ImplicitRoomRung(const ImplicitScheme &scheme, const std::string &path, dou
     }
     if (holds > 0.) std::printf("  largest holding: lambda %.4f, %.0f%% of the free-space limit\n", holds, 100. * holds / free_limit);
 
-    auto &ctx = MetalContext::Get();
-    auto measure = [&](bool wall) {
-        for (int round = 0; round < 2; ++round) {
-            for (int i = 0; i < reps; ++i) box.Step(wall);
-            ctx.Sync();
-            if (round == 0) ctx.TakeBatchGpuSeconds();
-        }
-        return ctx.TakeBatchGpuSeconds() / reps;
-    };
+    auto const measure = [&](bool wall) { return TimeGpu(reps, [&] { box.Step(wall); }); };
     double walled = 1e30, bare = 1e30;
     for (int round = 0; round < 3; ++round) {
         walled = std::min(walled, measure(true));
@@ -2805,25 +1682,338 @@ void ImplicitRoomRung(const ImplicitScheme &scheme, const std::string &path, dou
     std::printf("  a step %.4f ms against %.4f without the geometry (+%.1f%%), %.1f ps a node-step | %.1fs\n", 1e3 * walled, 1e3 * bare, 100. * (walled / bare - 1.), 1e12 * walled / double(box.Room), Now() - t0);
 }
 
-// What the wall looks like on geometry that is not the array, which is the one thing a box
-// cannot show. Nothing here steps: all of it is a property of the voxelisation, and the shapes
-// answer the inside test and the true normal in closed form.
-//
-// Three numbers the next build item rests on.
-//
-//  - **beta where the surface is slanted or curved.** It is provably nonnegative for a planar
-//    boundary, because the ghost set is then exactly the outward half-space. Sharp convex
-//    edges and thin fins are the cases that could break it, and a staircased sphere carries
-//    every orientation at once. A negative beta is not cosmetic: G rides on A's diagonal, so a
-//    negative one takes the wall out of the energy framework that makes it stable.
-//  - **how many distinct boundary terms a staircase produces.** RoomImplicitTerm is reached by
-//    a byte a node, so 255 is the ceiling, and a rectangular room's four says nothing about a
-//    real one. The terms split as Cn from the kept counts alone and Cp, Fd from those and
-//    G = (lambda/2) beta gamma, so what is reported is both: the classes the counts give, which
-//    is what a rigid wall needs, and the triples once a continuous beta is in them.
-//  - **how much of the bounding box is outside the room.** The block's outside word ends
-//    those nodes after one broadcast read a block, but the buffers are still the box's size,
-//    and an implicit step is eight passes where an explicit one is a single pass.
+// Direct-DFT band magnitudes using one rotation recurrence per bin.
+std::vector<double> RenderBandDb(const std::vector<double> &x, double srate, double f0, double df, int bins) {
+    std::vector<double> db(size_t(bins), 0.);
+    for (int k = 0; k < bins; ++k) {
+        const double w = 2. * std::numbers::pi * (f0 + df * k) / srate;
+        const double cr = std::cos(w), ci = -std::sin(w);
+        double pr = 1., pj = 0., re = 0., im = 0.;
+        for (const double v : x) {
+            re += v * pr;
+            im += v * pj;
+            const double nr = pr * cr - pj * ci;
+            pj = pr * ci + pj * cr;
+            pr = nr;
+        }
+        db[size_t(k)] = 10. * std::log10(re * re + im * im + 1e-300);
+    }
+    return db;
+}
+
+// Third-octave smoothing reduces sensitivity to sub-cell source and receiver shifts.
+std::vector<double> RenderSmoothDb(const std::vector<double> &db, double f0, double df) {
+    const double half = std::pow(2., 1. / 6.);
+    const int bins = int(db.size());
+    std::vector<double> out(db.size());
+    for (int k = 0; k < bins; ++k) {
+        const double f = f0 + df * k;
+        const int klo = std::max(0, int(std::ceil((f / half - f0) / df)));
+        const int khi = std::min(bins - 1, int(std::floor((f * half - f0) / df)));
+        double power = 0.;
+        for (int j = klo; j <= khi; ++j) power += std::pow(10., db[size_t(j)] / 10.);
+        out[size_t(k)] = 10. * std::log10(power / double(khi - klo + 1));
+    }
+    return out;
+}
+
+// Band-limited Schroeder T30 with raised-cosine edges to avoid brick-wall ringing.
+double RenderBandT30(const std::vector<double> &x, double srate) {
+    constexpr double Df = .5;
+    const int bins = int((450. - 30.) / Df) + 1;
+    std::vector<double> y(x.size(), 0.);
+    for (int k = 0; k < bins; ++k) {
+        const double f = 30. + Df * k;
+        double taper = 1.;
+        if (f < 60.) taper = .5 - .5 * std::cos(std::numbers::pi * (f - 30.) / 30.);
+        else if (f > 350.) taper = .5 + .5 * std::cos(std::numbers::pi * (f - 350.) / 100.);
+        const double w = 2. * std::numbers::pi * f / srate;
+        const double cr = std::cos(w), ci = -std::sin(w);
+        double pr = 1., pj = 0., re = 0., im = 0.;
+        for (const double v : x) {
+            re += v * pr;
+            im += v * pj;
+            const double nr = pr * cr - pj * ci;
+            pj = pr * ci + pj * cr;
+            pr = nr;
+        }
+        pr = 1.;
+        pj = 0.;
+        for (double &v : y) {
+            v += taper * (re * pr + im * pj);
+            const double nr = pr * cr - pj * ci;
+            pj = pr * ci + pj * cr;
+            pr = nr;
+        }
+    }
+    std::vector<double> tail(y.size() + 1, 0.);
+    for (size_t n = y.size(); n > 0; --n) tail[n - 1] = tail[n] + y[n - 1] * y[n - 1];
+    double t5 = -1., t35 = -1.;
+    for (size_t n = 0; n < y.size(); ++n) {
+        const double db = 10. * std::log10(tail[n] / tail[0] + 1e-300);
+        if (t5 < 0. && db < -5.) t5 = double(n) / srate;
+        if (db < -35.) {
+            t35 = double(n) / srate;
+            break;
+        }
+    }
+    return t5 >= 0. && t35 >= 0. ? 2. * (t35 - t5) : 0.;
+}
+
+// Builds an outward-wound rotated box and maps one local point into node coordinates.
+ImplicitModel ImplicitRotatedBox(const double dims[3], const double rot[3][3], double h, int margin, const double local[3], double node[3]) {
+    ImplicitModel model;
+    model.Materials = {"wall"};
+    model.Mat.assign(12, 0);
+    Eigen::MatrixXd v(8, 3);
+    for (int corner = 0; corner < 8; ++corner)
+        for (int a = 0; a < 3; ++a) {
+            double x = 0.;
+            for (int b = 0; b < 3; ++b) x += rot[a][b] * (corner >> b & 1 ? .5 : -.5) * dims[b];
+            v(corner, a) = x;
+        }
+    for (int a = 0; a < 3; ++a) {
+        double lo = 1e30, hi = -1e30, world = 0.;
+        for (int corner = 0; corner < 8; ++corner) {
+            lo = std::min(lo, v(corner, a));
+            hi = std::max(hi, v(corner, a));
+        }
+        for (int corner = 0; corner < 8; ++corner) v(corner, a) = (v(corner, a) - lo) / h + margin;
+        model.N[a] = int(std::ceil((hi - lo) / h)) + 2 * margin + 1;
+        model.Source[a] = -lo / h + margin;
+        for (int b = 0; b < 3; ++b) world += rot[a][b] * local[b];
+        node[a] = (world - lo) / h + margin;
+    }
+    model.V = std::move(v);
+    model.F = ImplicitBoxFaces();
+    return model;
+}
+
+// Measures the R111 render's marginal line after resetting both means at the end of the pulse.
+void ImplicitMarginalRung(const ImplicitScheme &base, int cap) {
+    const double t0 = Now(), h = .08, c0 = 343.2, gamma = .05;
+    const double dims[3]{4. * std::sqrt(5.), 4. * std::numbers::sqrt3, 4.};
+    const double lambda = .95 * std::min(base.Lambda, ImplicitCourantLimit(base));
+    const double ts = lambda * h / c0;
+    int steps = int(std::lround(2. / ts));
+    if (cap > 0) steps = std::min(steps, cap);
+    if (steps < 512) throw std::runtime_error("--marginal needs at least 512 steps");
+    const int reset = 256, sample_every = 32;
+
+    const double s2 = 1. / std::numbers::sqrt2, s3 = 1. / std::numbers::sqrt3, q = std::numbers::sqrt2 / std::numbers::sqrt3;
+    const double r110[3][3]{{s2, -s2, 0.}, {s2, s2, 0.}, {0., 0., 1.}};
+    const double ry[3][3]{{s3, 0., q}, {0., 1., 0.}, {-q, 0., s3}};
+    double r111[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            r111[i][j] = 0.;
+            for (int k = 0; k < 3; ++k) r111[i][j] += r110[i][k] * ry[k][j];
+        }
+    const double rcv_local[3]{.5 * dims[0] - .5, .5 * dims[1] - .5, .5 * dims[2] - .5};
+    double rcv[3];
+    const ImplicitModel model = ImplicitRotatedBox(dims, r111, h, 2, rcv_local, rcv);
+    const ImplicitMesh mesh(model.V, model.F);
+    const ImplicitVoxels vox = ImplicitVoxelise(model, mesh);
+
+    const double sigma = 1.06e-3, pulse_t0 = 6. * sigma;
+    std::vector<float> sig(size_t(steps), 0.f);
+    for (int n = 0; n < steps; ++n) {
+        const double t = n * ts;
+        sig[size_t(n)] = float(-(t - pulse_t0) / sigma * std::exp(-(t - pulse_t0) * (t - pulse_t0) / (2. * sigma * sigma)));
+    }
+
+    struct Result {
+        int Sweeps, Every;
+        double Growth, MaxMean, FinalMean, T30;
+        std::vector<double> Ir, Db;
+    };
+    constexpr double F0 = 30., F1 = 400., Df = .5;
+    constexpr int Bins = int((F1 - F0) / Df) + 1;
+    const auto run = [&](int sweeps, int every) {
+        const double leg_t0 = Now();
+        ImplicitScheme scheme = base;
+        scheme.Sweeps = sweeps;
+        ImplicitBox box(scheme, vox.N[0], vox.N[1], vox.N[2], true, lambda, {gamma}, ImplicitShape::Voxels, 0., true, &vox);
+        const int sn[3]{int(std::lround(model.Source[0])), int(std::lround(model.Source[1])), int(std::lround(model.Source[2]))};
+        const int rn[3]{int(std::lround(rcv[0])), int(std::lround(rcv[1])), int(std::lround(rcv[2]))};
+        box.SetIo({int(box.Index(sn[0], sn[1], sn[2]))}, sig, {int(box.Index(rn[0], rn[1], rn[2]))}, steps);
+        std::vector<double> at, magnitude;
+        for (int n = 0; n < steps; ++n) {
+            box.StepIo(n);
+            if (n + 1 == reset) box.SetMeanProjection(every ? every : steps + 1);
+            if (n + 1 < reset || (n + 1 - reset) % sample_every) continue;
+            const double m = std::max(std::abs(box.MeanLevel(box.Cur)), std::abs(box.MeanLevel(box.Prev)));
+            if (m > 0. && std::isfinite(m)) {
+                at.push_back((n + 1 - reset) * ts);
+                magnitude.push_back(m);
+            }
+        }
+
+        // Four-readback maxima suppress beating between the two marginal lines.
+        std::vector<double> envelope_t, envelope_log;
+        constexpr size_t Window = 4;
+        for (size_t first = 0; first < magnitude.size(); first += Window) {
+            const size_t last = std::min(first + Window, magnitude.size());
+            double peak = 0.;
+            for (size_t i = first; i < last; ++i) peak = std::max(peak, magnitude[i]);
+            if (peak > 0.) {
+                envelope_t.push_back(at[last - 1]);
+                envelope_log.push_back(std::log(peak));
+            }
+        }
+        const double growth = every ? 0. : 20. * ImplicitSlope(envelope_t, envelope_log, envelope_log.size() / 3) / std::numbers::ln10;
+        const float *out = box.Out.As<float>();
+        Result result{sweeps, every, growth, magnitude.empty() ? 0. : *std::max_element(magnitude.begin(), magnitude.end()), magnitude.empty() ? 0. : magnitude.back(), 0., std::vector<double>(out, out + steps), {}};
+        result.T30 = RenderBandT30(result.Ir, 1. / ts);
+        result.Db = RenderSmoothDb(RenderBandDb(result.Ir, 1. / ts, F0, Df, Bins), F0, Df);
+        const std::string projection = every ? std::to_string(every) : "off";
+        std::printf("  P %-2d project %-4s  growth %+8.3f dB/s  max mean %.3e  final %.3e  T30 %.3f s | %.1fs\n", sweeps, projection.c_str(), growth, result.MaxMean, result.FinalMean, result.T30, Now() - leg_t0);
+        std::fflush(stdout);
+        return result;
+    };
+
+    std::printf("[implicit marginal] R111 %.1fM-node room at %.0f mm, %d steps (%.3f s), source cleared and means reset at step %d\n", double(size_t(vox.N[0]) * vox.N[1] * vox.N[2]) / 1e6, 1e3 * h, steps, steps * ts, reset);
+    std::vector<Result> sweeps;
+    for (const int p : {7, 6, 8, 9, 10}) sweeps.push_back(run(p, 0));
+    const Result &baseline = sweeps.front();
+    std::printf("  projection cadence against P 7 unprojected receiver:\n");
+    for (const int every : {1024, 256, 64}) {
+        const Result projected = run(base.Sweeps, every);
+        double gain = 0.;
+        for (int k = 0; k < Bins; ++k) gain += projected.Db[size_t(k)] - baseline.Db[size_t(k)];
+        gain /= double(Bins);
+        double mean = 0., worst = 0.;
+        for (int k = 0; k < Bins; ++k) {
+            const double d = std::abs(projected.Db[size_t(k)] - baseline.Db[size_t(k)] - gain);
+            mean += d;
+            worst = std::max(worst, d);
+        }
+        std::printf("    every %-4d  T30 %+7.3f%%  spectrum mean %.4f dB, worst %.4f dB\n", every, 100. * (projected.T30 / baseline.T30 - 1.), mean / double(Bins), worst);
+    }
+    std::printf("  | %.1fs\n", Now() - t0);
+}
+
+// Reproduces Smits & Bilbao Fig. 5 at R100, R110, and R111 orientations, comparing compensated
+// and raw staircase decay against the validated grid-aligned explicit solver.
+void ImplicitRenderRung(const ImplicitScheme &scheme, double h, double seconds, double gamma, int cap, int project_every) {
+    const double t0 = Now();
+    const double dims[3]{4. * std::sqrt(5.), 4. * std::numbers::sqrt3, 4.};
+    const double lambda = .95 * std::min(scheme.Lambda, ImplicitCourantLimit(scheme));
+    const double c0 = 343.2;
+    const double ts = lambda * h / c0;
+    int steps = int(std::lround(seconds / ts));
+    if (cap > 0) steps = std::min(steps, cap);
+    const double length = steps * ts;
+
+    constexpr double F0 = 30., F1 = 400., Df = .5;
+    constexpr int Bins = int((F1 - F0) / Df) + 1;
+    const double sigma = 1.06e-3, t0s = 6. * sigma;
+    const auto pulse = [&](double t) { return -(t - t0s) / sigma * std::exp(-(t - t0s) * (t - t0s) / (2. * sigma * sigma)); };
+
+    const std::string project_desc = project_every ? "every " + std::to_string(project_every) + " steps" : "off";
+    std::printf("[implicit render] %s the rotated room of Smits & Bilbao 2025 Fig. 5: %.3f x %.3f x %.3f m at %.0f mm, gamma %.3f, %.2f s to a corner receiver, mean projection %s\n", scheme.Name, dims[0], dims[1], dims[2], 1e3 * h, gamma, length, project_desc.c_str());
+    std::fflush(stdout);
+    std::filesystem::create_directories("room");
+    nlohmann::json meta = nlohmann::json::array();
+    const std::string project_tag = project_every ? "-p" + std::to_string(project_every) : "";
+    const auto write_ir = [&](const std::string &name, const std::vector<double> &ir, double srate) {
+        const std::string file = "room/implicit-render" + project_tag + "-" + name + ".bin";
+        std::ofstream{file, std::ofstream::binary}.write(reinterpret_cast<const char *>(ir.data()), std::streamsize(ir.size() * sizeof(double)));
+        meta.push_back({{"name", name}, {"file", file}, {"srate", srate}, {"samples", ir.size()}});
+    };
+
+    int cells[3];
+    for (int a = 0; a < 3; ++a) cells[a] = int(std::lround(dims[a] / h));
+    const double ref_ts = (0.999 / std::numbers::sqrt3) * h / c0;
+    const int ref_steps = int(std::lround(length / ref_ts));
+    Box box;
+    RoomScene scene = SealedBox(cells, 2, ref_steps, box);
+    scene.H = h;
+    scene.Ts = scene.L * h / scene.C;
+    scene.Srate = 1. / scene.Ts;
+    scene.MatBranches.assign(1, 1);
+    scene.MatDef = {0., 1. / gamma, 0.};
+    for (size_t i = 0; i < scene.BnIxyz.size(); ++i) {
+        const int idx = scene.BnIxyz[i];
+        const int iz = idx % scene.Nz, iy = (idx / scene.Nz) % scene.Ny, ix = idx / (scene.Nz * scene.Ny);
+        if (ix < box.X0 || ix > box.X1 || iy < box.Y0 || iy > box.Y1 || iz < box.Z0 || iz > box.Z1) continue;
+        scene.MatBn[i] = 0;
+        scene.SafBn[i] = 6. - double(std::popcount(uint32_t(scene.AdjBn[i])));
+        ++scene.NumLossy;
+    }
+    const int off = int(std::lround(.5 / h));
+    scene.InIxyz = {int(NodeIndex(scene, box.X0 + (cells[0] - 1) / 2, box.Y0 + (cells[1] - 1) / 2, box.Z0 + (cells[2] - 1) / 2))};
+    scene.InSigs.assign(size_t(ref_steps), 0.);
+    for (int n = 0; n < ref_steps; ++n) scene.InSigs[size_t(n)] = pulse(n * scene.Ts);
+    scene.NumReceivers = 1;
+    scene.CornersPerReceiver = 1;
+    scene.OutIxyz = {int(NodeIndex(scene, box.X1 - off, box.Y1 - off, box.Z1 - off))};
+    scene.OutAlpha = {1.};
+    auto const ref = RenderRoomScene(scene, ref_steps);
+    const double ref_t30 = RenderBandT30(ref, scene.Srate);
+    const auto ref_db = RenderSmoothDb(RenderBandDb(ref, scene.Srate, F0, Df, Bins), F0, Df);
+    write_ir("slf-r100", ref, scene.Srate);
+    std::printf("  SLF reference %d x %d x %d, %d steps at %.0f Hz: T30 %.3f s over %.0f-%.0f Hz | %.1fs\n", scene.Nx, scene.Ny, scene.Nz, ref_steps, scene.Srate, ref_t30, F0, F1, Now() - t0);
+    std::fflush(stdout);
+
+    const double s2 = 1. / std::numbers::sqrt2, s3 = 1. / std::numbers::sqrt3, q = std::numbers::sqrt2 / std::numbers::sqrt3;
+    const double eye[3][3]{{1., 0., 0.}, {0., 1., 0.}, {0., 0., 1.}};
+    const double r110[3][3]{{s2, -s2, 0.}, {s2, s2, 0.}, {0., 0., 1.}};
+    const double ry[3][3]{{s3, 0., q}, {0., 1., 0.}, {-q, 0., s3}};
+    double r111[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            r111[i][j] = 0.;
+            for (int k = 0; k < 3; ++k) r111[i][j] += r110[i][k] * ry[k][j];
+        }
+
+    struct Leg {
+        const char *Name;
+        const double (*Rot)[3];
+        bool Comp;
+    };
+    const Leg legs[]{{"r100", eye, true}, {"r110", r110, true}, {"r111", r111, true}, {"r110-raw", r110, false}, {"r111-raw", r111, false}};
+    std::printf("  %-9s %9s %9s %8s %9s %10s %10s\n", "leg", "nodes", "wall", "T30 s", "vs ref", "mean dB", "worst dB");
+    for (const Leg &leg : legs) {
+        const double t1 = Now();
+        const double rcv_local[3]{.5 * dims[0] - .5, .5 * dims[1] - .5, .5 * dims[2] - .5};
+        double rcv[3];
+        const ImplicitModel model = ImplicitRotatedBox(dims, leg.Rot, h, 2, rcv_local, rcv);
+        const ImplicitMesh mesh(model.V, model.F);
+        const ImplicitVoxels vox = ImplicitVoxelise(model, mesh);
+        ImplicitBox ib(scheme, vox.N[0], vox.N[1], vox.N[2], true, lambda, {gamma}, ImplicitShape::Voxels, 0., leg.Comp, &vox);
+        const int sn[3]{int(std::lround(model.Source[0])), int(std::lround(model.Source[1])), int(std::lround(model.Source[2]))};
+        const int rn[3]{int(std::lround(rcv[0])), int(std::lround(rcv[1])), int(std::lround(rcv[2]))};
+        if (!ib.Shape.Inside(sn[0], sn[1], sn[2]) || !ib.Shape.Inside(rn[0], rn[1], rn[2])) throw std::runtime_error("render source or receiver landed outside the room");
+        std::vector<float> sig(size_t(steps), 0.f);
+        for (int n = 0; n < steps; ++n) sig[size_t(n)] = float(pulse(n * ts));
+        ib.SetIo({int(ib.Index(sn[0], sn[1], sn[2]))}, sig, {int(ib.Index(rn[0], rn[1], rn[2]))}, steps);
+        if (project_every) ib.SetMeanProjection(project_every);
+        for (int n = 0; n < steps; ++n) ib.StepIo(n);
+        const float *out = ib.Out.As<float>();
+        const std::vector<double> ir(out, out + steps);
+        const double t30 = RenderBandT30(ir, 1. / ts);
+        const auto db = RenderSmoothDb(RenderBandDb(ir, 1. / ts, F0, Df, Bins), F0, Df);
+        double gain = 0.;
+        for (int k = 0; k < Bins; ++k) gain += db[size_t(k)] - ref_db[size_t(k)];
+        gain /= double(Bins);
+        double mean = 0., worst = 0.;
+        for (int k = 0; k < Bins; ++k) {
+            const double d = std::abs(db[size_t(k)] - ref_db[size_t(k)] - gain);
+            mean += d;
+            worst = std::max(worst, d);
+        }
+        mean /= double(Bins);
+        write_ir(leg.Name, ir, 1. / ts);
+        std::printf("  %-9s %8.1fM %9d %8.3f %+8.1f%% %10.2f %10.2f | %.1fs\n", leg.Name, double(ib.Room) / 1e6, ib.WallNodes, t30, 100. * (t30 / ref_t30 - 1.), mean, worst, Now() - t1);
+        std::fflush(stdout);
+    }
+    const std::string meta_file = "room/implicit-render" + project_tag + ".json";
+    std::ofstream{meta_file} << meta.dump() << '\n';
+    std::printf("  wrote room/implicit-render%s-*.bin (float64) and %s | %.1fs\n", project_tag.c_str(), meta_file.c_str(), Now() - t0);
+}
+
+// Surveys beta, exact term counts, and outside volume on closed-form geometries.
 void ImplicitGeometryRung(const ImplicitScheme &scheme, const ImplicitShape &shape, double gamma) {
     const double t0 = Now();
     const double nex[3]{ImplicitNex(scheme, 0), ImplicitNex(scheme, 1), ImplicitNex(scheme, 2)};
@@ -2846,8 +2036,8 @@ void ImplicitGeometryRung(const ImplicitScheme &scheme, const ImplicitShape &sha
                 ++inside;
                 int k[3];
                 const double beta = ImplicitWallSample(shape, ix, iy, iz, nex, k, true);
-                if (k[0] == 6 && k[1] == 12 && k[2] == 8) continue; // ordinary air
-                if (k[0] < 6) ++axis_wall; // and in the reference voxeliser's boundary set too
+                if (k[0] == 6 && k[1] == 12 && k[2] == 8) continue;
+                if (k[0] < 6) ++axis_wall;
                 lo = std::min(lo, beta);
                 hi = std::max(hi, beta);
                 mean += beta;
@@ -2859,9 +2049,7 @@ void ImplicitGeometryRung(const ImplicitScheme &scheme, const ImplicitShape &sha
     const size_t nodes = size_t(shape.N[0]) * shape.N[1] * shape.N[2];
     mean /= double(std::max<size_t>(wall.size(), 1));
 
-    // The distinct terms, exactly and with beta rounded to `bits`. A byte a node can index 255
-    // of them, so the second number is what says whether quantising beta is a way to keep it.
-    auto distinct = [&](int bits) {
+    auto const distinct = [&](int bits) {
         const double step = bits && hi > 0. ? hi / double((1 << bits) - 1) : 0.;
         std::vector<std::array<float, 3>> t;
         t.reserve(wall.size());
@@ -2889,16 +2077,7 @@ void ImplicitGeometryRung(const ImplicitScheme &scheme, const ImplicitShape &sha
     std::printf("  | %.1fs\n", Now() - t0);
 }
 
-// What Courant number the wall actually holds at, beside the free-space one the scheme is
-// published with.
-//
-// The paper's stability analysis covers the periodic operator, which is symmetric. So is the
-// drop-ghost wall: an offset that crosses the wall is dropped from both of the nodes it would
-// have joined, and the diagonal each loses is the count it dropped. (The Neumann image is not
-// — a wall-crossing diagonal offset maps onto a node that does not map back — and it grows at
-// every Courant number this sweep tries.) The energy bound the wall inherits from that
-// symmetry is E >= 0 iff 1 + Lim + (lambda^2/4) Lex > 0, which is a matrix condition on the
-// walled operator rather than the free-space limit, so what it comes to is measured here.
+// Measures the walled Courant limit from both the energy pencil and noise growth.
 void ImplicitBoxCourantRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int soak) {
     const double t0 = Now();
     const double free_limit = std::min(scheme.Lambda, ImplicitCourantLimit(scheme));
@@ -2912,15 +2091,9 @@ void ImplicitBoxCourantRung(const ImplicitScheme &scheme, int nx, int ny, int nz
         ImplicitBox box(scheme, nx, ny, nz, true, lambda);
         ImplicitSeedNoise(box, 12345);
 
-        // A growth *rate*, not a verdict on one soak length. An unstable wall here grows slowly
-        // enough that a short run reads clean — at the published Courant number mode (0,1,1) is
-        // still within 4% of exact after 20,000 steps and reaches 1e6 by 80,000 — so asking
-        // "did the envelope move" mostly measures how long the run was. Fitting log(envelope)
-        // against step index gives a number that means the same thing at any soak length, and
-        // that a short run reports as small and positive rather than as stable.
         const double e0 = ImplicitEnergy(box, box.Cur.As<float>(), box.Prev.As<float>());
         std::vector<double> logs, at;
-        const int every = std::max(1, soak / 160); // the readback synchronises, so sample it
+        const int every = std::max(1, soak / 160);
         double m = 0.;
         for (int i = 0; i < soak; ++i) {
             box.Step();
@@ -2932,20 +2105,10 @@ void ImplicitBoxCourantRung(const ImplicitScheme &scheme, int nx, int ny, int nz
             at.push_back(double(i + 1));
             m = 0.;
         }
-        const double rate = ImplicitSlope(at, logs); // infinite if the run left the floats behind
-        // dB per thousand steps, which is the scale a room render is judged at: over the
-        // full-bandwidth scene's 77,078 steps +0.01 becomes +0.8 dB and +0.5 becomes 385.
-        // Against 0.02 rather than zero: the legs below the limit scatter by about +-0.012 at
-        // this soak length, which is the fit's own resolution and not motion in the envelope.
-        // Over the full-bandwidth scene's 77,078 steps 0.02 dB per thousand is 1.5 dB.
+        const double rate = ImplicitSlope(at, logs);
         const double db_per_k = 1000. * rate * 20. / std::numbers::ln10;
         const bool held = db_per_k < 0.02;
         if (held && lambda > best) best = lambda;
-        // The energy beside the envelope, because the two separate the two ways this can fail.
-        // The scheme conserves E whatever lambda is; what a lambda past the limit costs is E's
-        // positivity, and an indefinite E is conserved while the amplitude it no longer bounds
-        // grows. So conserved-and-growing is the Courant failure and drifting is a broken
-        // operator, and neither reads as the other.
         const double drift = std::abs(ImplicitEnergy(box, box.Cur.As<float>(), box.Prev.As<float>()) - e0) / std::abs(e0);
         std::printf("  lambda %.4f (%.0f%% of free space)  growth %+8.4f dB per 1000 steps, energy drift %.1e  %s\n", lambda, 100. * scale, db_per_k, drift, held ? "holds" : "GROWS");
     }
@@ -2953,36 +2116,19 @@ void ImplicitBoxCourantRung(const ImplicitScheme &scheme, int nx, int ny, int nz
     else std::printf("  nothing held: the wall is unstable at every Courant number tried | %.1fs\n", Now() - t0);
 }
 
-// What a step of the implicit scheme costs, against the traffic it cannot avoid. A sweep and
-// the plain stream move the same twelve bytes a node, so the stream is the box's ceiling and
-// the sweep's share of it says whether the scheme reaches the memory system the way the
-// explicit ones do.
+// Compares implicit passes and a whole step with matching traffic ceilings.
 void ImplicitCostRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int reps, bool rigid = false) {
     ImplicitBox box(scheme, nx, ny, nz, rigid);
     auto &ctx = MetalContext::Get();
-    // GPU seconds `once` takes, after a discarded warm-up round of the same length — the GPU's
-    // clock ramp reads the first rounds of any microbenchmark several times too slow.
-    auto measure = [&](auto &&once) {
-        for (int round = 0; round < 2; ++round) {
-            for (int i = 0; i < reps; ++i) once();
-            ctx.Sync();
-            if (round == 0) ctx.TakeBatchGpuSeconds();
-        }
-        return ctx.TakeBatchGpuSeconds() / reps;
-    };
-    auto time = [&](MTL::ComputePipelineState *pso, std::initializer_list<GpuSlice> buffers) {
-        return measure([&] { ctx.Dispatch(pso, box.Tiles, box.Threads, buffers, &box.P, sizeof box.P); });
+    auto const time = [&](MTL::ComputePipelineState *pso, std::initializer_list<GpuSlice> buffers) {
+        return TimeGpu(reps, [&] { ctx.Dispatch(pso, box.Tiles, box.Threads, buffers, &box.P, sizeof box.P); });
     };
     const double stream = time(box.Stream, {&box.Tmp, &box.Cur, &box.Bp});
     const double sweep = time(box.Jacobi, {&box.Tmp, &box.Cur, &box.Bp});
     const double rhs = time(box.Rhs, {&box.Bp, &box.Cur, &box.Prev});
     const double gb = 12. * double(box.Room) / 1e9;
 
-    // A whole step, encoded the way it runs, so the dispatch cost of a short pass is in it,
-    // beside the same step with the wall left out. Alternated and taken at their best, because
-    // the two are read against one another and the GPU's clock drifts over a rung by more than
-    // the difference between them.
-    auto whole = [&](bool wall) { return measure([&] { box.Step(wall); }); };
+    auto const whole = [&](bool wall) { return TimeGpu(reps, [&] { box.Step(wall); }); };
     double step = 1e30, bare = 1e30;
     for (int round = 0; round < (rigid ? 3 : 1); ++round) {
         step = std::min(step, whole(true));
@@ -2995,28 +2141,28 @@ void ImplicitCostRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int 
     std::printf("  Jacobi sweep      %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * sweep, gb / sweep, 100. * stream / sweep);
     std::printf("  right-hand side   %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * rhs, gb / rhs, 100. * stream / rhs);
     if (rigid) {
-        const double walled_sweep = measure([&] { ctx.Dispatch(box.JacobiFused, box.Tiles, box.Threads, {&box.Tmp, &box.Cur, &box.Bp, &box.Blocks, &box.Code, &box.Terms, &box.Keep}, &box.P, sizeof box.P); });
+        const double walled_sweep = TimeGpu(reps, [&] { ctx.Dispatch(box.JacobiFused, box.Tiles, box.Threads, {&box.Tmp, &box.Cur, &box.Bp, &box.Blocks, &box.Code, &box.Terms, &box.Keep}, &box.P, sizeof box.P); });
         const size_t nblocks = (box.Nodes + RoomBnBlock - 1) / RoomBnBlock;
         const double geom_mb = (12. * double(nblocks) + 6. * double(box.WallNodes)) / 1e6;
         std::printf("  Jacobi sweep, walled %8.4f ms  %6.0f GB/s  against three words a block of 32, %.1f%% more traffic\n", 1e3 * walled_sweep, gb / walled_sweep, 100. * (12. / double(RoomBnBlock)) / 12.);
         std::printf("  wall: %d nodes (%.2f%% of the room), %d distinct terms, %.1f MB of blocks and rows\n", box.WallNodes, 100. * double(box.WallNodes) / double(box.Room), box.Codes, geom_mb);
         std::printf("  the wall costs %.1f%% of a step (%.4f ms against %.4f without it)\n", 100. * (step / bare - 1.), 1e3 * step, 1e3 * bare);
     }
-    // The step's own rate, not its share of the isolated stream. At a few megabytes a pass
-    // that stream is latency-bound and swings by a factor of three run to run, while the step
-    // — eight passes alternating between buffers rather than chaining on one — is steady.
     std::printf("  a whole step      %8.4f ms  %6.0f GB/s over %d passes  |  %.1f ps/node-step\n", 1e3 * step, double(scheme.Sweeps + 1) * gb / step, scheme.Sweeps + 1, 1e12 * step / double(box.Room));
 }
 
-// How much of the memory system a step reaches. The interior update and a plain two-level
-// stream over the same box move the same twelve bytes a node-step, so the stream is the grid's
-// own ceiling under the conditions of the moment and the update's share of it is the roofline
-// statement.
-// A grid of nothing but air, for asking how a scheme streams at a size no scene here reaches.
-// Every wall is the absorbing shell, so there are no boundary nodes to build and none of the
-// O(volume) surface search SealedBox does — which is what makes a 10^9-node grid constructible
-// in the time it takes to allocate it. The spacing is a real one so the coefficients are, but
-// nothing about this grid is a room: it is the interior update's streaming behaviour alone.
+// Measures the pair projection and its cadence-amortized step overhead.
+void ImplicitProjectionCostRung(const ImplicitScheme &scheme, int nx, int ny, int nz, int reps) {
+    ImplicitBox box(scheme, nx, ny, nz, true, 0., {.05});
+    box.SetMeanProjection(1 << 28);
+    const double step = TimeGpu(reps, [&] { box.Step(); });
+    const double pair = TimeGpu(reps, [&] { box.ProjectPair(); });
+    std::printf("[implicit projection cost] %s %d x %d x %d, %.3fM nodes\n", scheme.Name, nx, ny, nz, double(box.Room) / 1e6);
+    std::printf("  whole step %.4f ms; project both levels %.4f ms (%.2f steps)\n", 1e3 * step, 1e3 * pair, pair / step);
+    for (const int every : {64, 256, 1024}) std::printf("  every %-4d  amortized step overhead %.3f%%\n", every, 100. * pair / (step * every));
+}
+
+// Boundary-free grid for large-footprint streaming measurements.
 RoomScene AirGrid(int nx, int ny, int nz, bool fcc) {
     RoomScene scene;
     scene.Fcc = fcc;
@@ -3044,8 +2190,6 @@ void RooflineRung(const RoomScene &scene, const std::string &label, int reps) {
     std::printf("  two-level stream  %8.4f ms  %6.0f GB/s\n", 1e3 * band.Stream, gb / band.Stream);
     std::printf("  interior update   %8.4f ms  %6.0f GB/s  %.0f%% of the stream\n", 1e3 * band.Update, gb / band.Update, 100. * band.Stream / band.Update);
 
-    // The boundary pass against its own ceiling, not the grid pass's: it gathers and scatters
-    // over a subset of the nodes across eight streams, and a dense stream is not its roof.
     const auto lossy = gpu.LossyRoofline(reps);
     if (lossy.Bytes > 0.) {
         const double lgb = lossy.Bytes / 1e9;
@@ -3057,9 +2201,9 @@ void RooflineRung(const RoomScene &scene, const std::string &label, int reps) {
 }
 } // namespace
 
-int main(int argc, char **argv) {
-    bool modes = false, energy = false, tube = false, balance = false, soak = false, golden = false, gate = false, any = false, fcc = false, roofline = false, implicit = false;
-    int repeat = 4, count = 16, steps = 0, reports = 10, length = 2000;
+int main(int argc, char *const *argv) {
+    bool modes = false, energy = false, tube = false, balance = false, soak = false, golden = false, gate = false, any = false, fcc = false, roofline = false, implicit = false, projection = false, marginal = false, projection_cost = false, render = false;
+    int repeat = 4, count = 16, steps = 0, reports = 10, length = 2000, project_every = 1024;
     int cells[3] = {0, 0, 0};
     std::string config_file, gen_dir;
     for (int a = 1; a < argc; ++a) {
@@ -3074,12 +2218,23 @@ int main(int argc, char **argv) {
         else if (arg == "--gate") gate = any = true;
         else if (arg == "--roofline") roofline = any = true;
         else if (arg == "--implicit") implicit = any = true;
+        else if (arg == "--projection") projection = any = true;
+        else if (arg == "--marginal") marginal = any = true;
+        else if (arg == "--projection-cost") projection_cost = any = true;
+        else if (arg == "--render") render = any = true;
+        else if (arg == "--no-project") project_every = 0;
         else if (arg == "--repeat" && a + 1 < argc) repeat = std::atoi(argv[++a]);
         else if (arg == "--count" && a + 1 < argc) count = std::atoi(argv[++a]);
         else if (arg == "--steps" && a + 1 < argc) steps = std::atoi(argv[++a]);
         else if (arg == "--reports" && a + 1 < argc) reports = std::atoi(argv[++a]);
         else if (arg == "--length" && a + 1 < argc) length = std::atoi(argv[++a]);
-        else if (arg == "--scene" && a + 1 < argc) config_file = argv[++a];
+        else if (arg == "--project-every" && a + 1 < argc) {
+            project_every = std::atoi(argv[++a]);
+            if (project_every < 1) {
+                std::printf("--project-every needs a positive step interval\n");
+                return 1;
+            }
+        } else if (arg == "--scene" && a + 1 < argc) config_file = argv[++a];
         else if (arg == "--gen" && a + 1 < argc) gen_dir = argv[++a];
         else if (arg == "--cells" && a + 1 < argc) {
             // One extent, or three separated by commas: --cells 1024 or --cells 1200,700,700
@@ -3111,44 +2266,36 @@ int main(int argc, char **argv) {
     }
     if (implicit) {
         for (const auto &s : {Implicit2Pct, Implicit1Pct, ImplicitHalfPct}) ImplicitRung(s, count == 16 ? 96 : count, steps ? steps : 2000);
-        // Two footprints, because the ceiling is a property of the footprint. The first is
-        // RoomChurch's own 21.0 x 13.7 x 7.4 m room at the 1% scheme's grid step of 183 mm,
-        // from the 2.68 points per wavelength measured above at 700 Hz. The second is large
-        // enough to be served by DRAM rather than cache, where a full-bandwidth room sits.
         ImplicitWallRung(Implicit1Pct, 40, 33, 28, steps ? steps : 20000);
         ImplicitModeRung(Implicit1Pct, 40, 33, 28, count == 16 ? 16 : count);
         ImplicitAbsorbRung(Implicit1Pct, 40, 33, 28, 0.05, steps ? steps : 2000);
         ImplicitYawedRung(Implicit1Pct, 96, 0.4, 0.05, count == 16 ? 12 : count, steps ? steps : 2000);
         ImplicitLrcRung(Implicit1Pct, 40, 33, 28, steps ? steps : 2000);
         for (const double angle : {0., 0.4}) ImplicitVoxelRung(Implicit1Pct, ImplicitShape(ImplicitShape::Slanted, 48, 48, 48, angle));
-        // The church at the 1% scheme's own grid step, which is the room the whole comparison
-        // is drawn against. PFFDTD_DIR matches the convention script/ConvertRoomScene uses.
         for (const char *model : {"CTK_Church", "Musikverein_ConcertHall"}) {
             const std::string root = std::getenv("PFFDTD_DIR") ? std::getenv("PFFDTD_DIR") : "../../pffdtd";
             const std::string path = root + "/data/models/" + model + "/model_export.json";
             if (std::filesystem::exists(path)) {
-                ImplicitSceneRung(Implicit1Pct, path, .183, .05);
-                ImplicitRoomRung(Implicit1Pct, path, .183, steps ? steps : 4000, repeat == 4 ? 100 : repeat);
+                const auto scene = LoadImplicitVoxelisedScene(path, .183);
+                ImplicitSceneRung(Implicit1Pct, path, .183, .05, scene);
+                ImplicitRoomRung(Implicit1Pct, path, .183, steps ? steps : 4000, repeat == 4 ? 100 : repeat, scene.Voxels);
             } else std::printf("[implicit] no model at %s, skipping the voxeliser survey\n", path.c_str());
         }
-        // What a wall that is not grid-aligned does to beta and to the term count, on the two
-        // shapes the staircase-compensation paper validates against. The yaw is deliberately
-        // not a nice fraction of a right angle, so no wall lands on the grid.
-        // The column is the one of the four whose wall is convex into the room, which is where
-        // beta could go negative — a box and a sphere are concave from the inside everywhere.
         for (const auto &shape : {ImplicitShape(ImplicitShape::Array, 96, 96, 96), ImplicitShape(ImplicitShape::Slanted, 96, 96, 96, 0.4), ImplicitShape(ImplicitShape::Sphere, 96, 96, 96), ImplicitShape(ImplicitShape::Obstacle, 96, 96, 96)})
             ImplicitGeometryRung(Implicit1Pct, shape, 0.05);
         ImplicitBoxCourantRung(Implicit1Pct, 40, 33, 28, steps ? steps : 40000);
         ImplicitCostRung(Implicit1Pct, 116, 76, 41, repeat == 4 ? 200 : repeat);
         ImplicitCostRung(Implicit1Pct, 384, 384, 384, repeat == 4 ? 20 : repeat);
-        // The same two footprints walled, with the room two nodes smaller on each axis so the
-        // array it sits in is the periodic box above: a halo moves the strides, and a stride
-        // is not what a wall costs.
         ImplicitCostRung(Implicit1Pct, 114, 74, 39, repeat == 4 ? 200 : repeat, true);
         ImplicitCostRung(Implicit1Pct, 382, 382, 382, repeat == 4 ? 20 : repeat, true);
     }
-    // The gate ignores every sweep flag above: a threshold belongs to the configuration it
-    // was recorded at, and the sweeps exist to leave that configuration.
+    if (projection) ImplicitProjectionRung(Implicit1Pct);
+    if (marginal) ImplicitMarginalRung(Implicit1Pct, steps);
+    if (projection_cost) {
+        ImplicitProjectionCostRung(Implicit1Pct, 114, 74, 39, repeat == 4 ? 200 : repeat);
+        ImplicitProjectionCostRung(Implicit1Pct, 382, 382, 382, repeat == 4 ? 20 : repeat);
+    }
+    if (render) ImplicitRenderRung(Implicit1Pct, .02, 2., .05, steps, project_every);
     if (gate) {
         ModeRung("../Scenes/RoomShoebox/config.json", 4, 16, true, .035, 3e-5);
         EnergyRung(100000, 10, true, false);

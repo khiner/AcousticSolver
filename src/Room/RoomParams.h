@@ -20,29 +20,14 @@ enum : int { RoomFccNeighbours = 12 };
 // node sets at most six of the eight bits, so all-ones is free to mean ordinary air.
 enum : int { RoomAirAdj = 0xFF };
 
-// Nodes a block of the FCC scheme's boundary lookup covers. A power of two, so a node's block
-// and its bit in that block are a shift and a mask.
 enum : int { RoomBnBlock = 32 };
 
-// One block of that lookup. Twelve adjacency bits do not fit in a byte, so the FCC scheme
-// cannot afford the Cartesian one's grid-wide array — it keeps the masks packed in boundary
-// order and reaches a node's row by rank: Occupied says which of the block's nodes are
-// boundary nodes, Rank counts the ones ahead of the block, and the bits below a node in
-// Occupied count the rest. Two words a block is 0.25 bytes a node against the two bytes a
-// grid-wide array of shorts would cost. See RoomAirFcc.
+// FCC adjacency masks are packed in boundary order and reached by rank within each block.
 struct RoomBnBlockEntry {
     unsigned int Occupied, Rank;
 };
 
-// One block of the implicit scheme's boundary lookup, the same rank construction as
-// RoomBnBlockEntry with one word more. Only 7-9% of a real room's nodes are wall, but the
-// masked passes read six bytes a node grid-wide for what the wall alone needs — a uint of
-// kept legs and a ushort into the term table. Here those ride in wall order and a node
-// reaches its row by rank, and what stays grid-wide is three words a block of 32: which of
-// the block's nodes are wall, which are outside the room, and how many wall rows precede the
-// block. Outside is its own word rather than a term-table entry because it is what the other
-// two classes are told apart against: an outside node is held at rest and reads nothing, an
-// air node keeps all 26 legs and needs no mask at all. See RoomImplicitRhsWall.
+// Wall masks and term indices are packed in wall order; Outside distinguishes held-zero nodes.
 struct RoomImplicitBlockEntry {
     unsigned int Wall, Outside, Rank;
 };
@@ -100,48 +85,26 @@ struct RoomImplicitParams {
     float Q1, Q2, Q3;
 };
 
-// What a boundary node needs beyond the uniform coefficients above, under the drop-ghost
-// boundary of Smits & Bilbao 2025 Sec IV.
-//
-// Dropping a ghost neighbour costs the node both that neighbour's term and that neighbour's
-// share of the diagonal, and the grid's zero halo already supplies the first: a term the sum
-// should not have is a read of a node that holds zero. What it cannot supply is the second.
-// Writing K_r for the neighbours of class r the node keeps, the implicit operator's diagonal
-// at the node is d = 1 - (Q1 K_1 + Q2 K_2 + Q3 K_3)*d0 rather than the interior's d0, and
-// every coefficient above was divided through by d0.
-//
-// So a boundary node's step is the uniform one plus three corrections. After the right-hand
-// side: bp += Cn u^n + Cp u^(n-1), the two diagonal terms' error. After each Jacobi sweep:
-// x *= Fd = d0/d, which is all a sweep's diagonal needs because the sweep's whole expression
-// is one division by it.
-//
-// Every node's three numbers are a function of its kept counts and its G alone, and a room
-// has far fewer distinct triples than nodes, so a wall node carries a ushort into a table of
-// these — packed in wall order and reached by rank through RoomImplicitBlockEntry, so the
-// corrections ride inside the uniform passes rather than in scattered passes of their own,
-// which for a sweep that runs P times a step is what keeps them affordable. Ordinary air is
-// {0, 0, 1} and a node outside the room is {0, 0, 0}, but neither reaches the table: both are
-// classes of the block words, and the passes special-case them — air takes the uniform step
-// and outside is held at the rest the halo's zeros rely on.
+// Projection excludes the halo and bounding-box nodes outside a voxelized room.
+struct RoomImplicitReduceParams {
+    int Count;
+};
+struct RoomImplicitProjectParams {
+    int Nx, Ny, Nz;
+    float InvInside;
+};
+
+// Drop-ghost correction: Cn/Cp repair the RHS diagonal and Fd = d0/d repairs each sweep.
+// Wall nodes index deduplicated triples; air and outside are encoded by the block masks.
 struct RoomImplicitTerm {
     float Cn, Cp, Fd;
 };
 
-// A wall node whose material is a set of parallel LRC branches rather than a real admittance.
-//
-// Bilbao & Hamilton 2017's appendix gives the recursion, and against the implicit scheme it
-// comes to two things and no more. The branches' summed discrete admittance is one nonnegative
-// scalar on the *diagonal*, which is where RoomImplicitTerm's Fd and Cp already put a real
-// gamma — so nothing off-diagonal changes and the Jacobi sweeps never see the wall. And the
-// branch history is a term on the right-hand side, which is all the memory the wall has.
-//
-// That split is what makes frequency-dependent walls affordable here: the sweeps run P times a
-// step and stay uniform, while the two passes that know about the wall run once each, over the
-// wall alone. It is the same shape the explicit path's RoomLossy already pays.
+// LRC branches contribute a diagonal admittance and a once-per-step RHS history term.
 struct RoomImplicitWall {
-    int Ixyz; // the node on the grid
-    int Mat; // the material it carries
-    float Psi; // lambda * beta / d0, what the branch history is scaled by on the right-hand side
+    int Ixyz;
+    int Mat;
+    float Psi; // lambda * beta / d0
 };
 
 // The closed node box the discrete energy sums over (inclusive bounds), and the coefficients

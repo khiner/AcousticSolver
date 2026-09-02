@@ -51,10 +51,12 @@ using namespace metal;
 
 // Each stencil's neighbour offsets as coordinate steps, in its adjacency mask's bit order.
 constant int3 RoomCartSteps[RoomNumNeighbours] = {
-    int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1)};
+    int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1)
+};
 constant int3 RoomFccSteps[RoomFccNeighbours] = {
     int3(1, 1, 0), int3(-1, -1, 0), int3(0, 1, 1), int3(0, -1, -1), int3(1, 0, 1), int3(-1, 0, -1),
-    int3(1, -1, 0), int3(-1, 1, 0), int3(0, 1, -1), int3(0, -1, 1), int3(1, 0, -1), int3(-1, 0, 1)};
+    int3(1, -1, 0), int3(-1, 1, 0), int3(0, 1, -1), int3(0, -1, 1), int3(1, 0, -1), int3(-1, 0, 1)
+};
 
 // The six axis steps from a node, as index offsets, with a step that would leave the grid
 // replaced by its mirror image about the first interior layer. `fold_y` marks the FCC grid,
@@ -118,8 +120,7 @@ inline float RoomAbsorb(float updated, float previous, float l, int q) {
 // The two are not symmetric about the absorbing shell: the interior update runs first and the
 // shell then mixes what it produced with the level it overwrote, while a boundary node has the
 // shell applied to that level before its own stencil consumes it.
-kernel void RoomAir(device float *u0, device const float *u1, device const uchar *adj_grid,
-                    constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
+kernel void RoomAir(device float *u0, device const float *u1, device const uchar *adj_grid, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= g.Nx - 1 || iy >= g.Ny - 1 || iz >= g.Nz - 1) return;
     const int3 pos = int3(ix, iy, iz), n = int3(g.Nx, g.Ny, g.Nz);
@@ -149,19 +150,9 @@ kernel void RoomAir(device float *u0, device const float *u1, device const uchar
 // of A1 = 2 - 12*Sl2 with A2 = l^2/4, summed in the reference's own order, which is the order
 // the goldens carry.
 //
-// The rigid boundary is folded in here as it is on the Cartesian grid, but it cannot reach its
-// adjacency the same way: twelve neighbours do not fit in a byte, so a grid-wide FCC array
-// would cost two bytes a node against the Cartesian one's seven eighths of one, and on a grid
-// whose levels stream at 658 GB/s that is more traffic than a second pass over the boundary
-// nodes costs. Fusing it that way measured 1.069x, slower.
-//
-// What the fold needs instead is the packed list's row for a node, from the node's position
-// alone. RoomBnBlockEntry is that: one occupancy word and one running count a block of 32
-// nodes, so the row is the block's count plus the occupied nodes below this one in the block,
-// and the whole lookup is a quarter of a byte a node rather than two. A node off the boundary
-// pays one broadcast load a block for it and nothing else.
-kernel void RoomAirFcc(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks,
-                       device const ushort *adj_bn, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
+// Twelve FCC adjacency bits would require two bytes per node. Pack boundary rows instead and
+// recover each row from block rank plus the occupied bits below its slot.
+kernel void RoomAirFcc(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks, device const ushort *adj_bn, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= g.Nx - 1 || iy >= g.Ny - 1 || iz >= g.Nz - 1) return;
     const int3 pos = int3(ix, iy, iz), n = int3(g.Nx, g.Ny, g.Nz);
@@ -182,8 +173,7 @@ kernel void RoomAirFcc(device float *u0, device const float *u1, device const Ro
         u0[ii] = RoomAbsorb(partial, previous, g.L, q);
         return;
     }
-    // A boundary node's update is the interior one with the neighbours its mask drops removed
-    // from both the sum and the diagonal, over the level the shell has already absorbed.
+    // Dropped neighbors leave both the sum and diagonal.
     const uint adj = adj_bn[block.Rank + popcount(block.Occupied & ((1u << slot) - 1u))];
     const float b1 = 2.f - g.Sl2 * float(popcount(adj));
     float partial = b1 * u1[ii] - RoomAbsorb(previous, previous, g.L, q);
@@ -193,28 +183,14 @@ kernel void RoomAirFcc(device float *u0, device const float *u1, device const Ro
     u0[ii] = partial;
 }
 
-// The frequency-dependent boundary's traffic with none of its work, and the reason it needs
-// its own ceiling rather than being read against RoomStream's: this pass is a gather and a
-// scatter over a scattered subset of nodes, across eight streams instead of two, so a dense
-// two-level stream is not a roof it could ever reach. What it moves a lossy node is the node's
-// own scalars, a read-modify-write of u0 at a grid index, and the LRC state of every branch
-// its material carries — which is 176 of those bytes at the eleven branches every scene here
-// uses. Same nodes, same buffers, same trip count, same threadgroup shape.
-//
-// Like RoomStream it destroys what it touches. See RoomGpu::LossyRoofline.
-kernel void RoomLossyStream(device float *u0, device float *u0b, device const float *u2b,
-                            device float *vh1, device float *gh1, device const int *bnl_ixyz,
-                            device const float *ssaf_bnl, device const char *mat_bnl,
-                            device const int *mat_mb, constant RoomGridParams &g,
-                            uint nb [[thread_position_in_grid]]) {
+// Destructive traffic ceiling for the scattered eight-stream lossy pass.
+kernel void RoomLossyStream(device float *u0, device float *u0b, device const float *u2b, device float *vh1, device float *gh1, device const int *bnl_ixyz, device const float *ssaf_bnl, device const char *mat_bnl, device const int *mat_mb, constant RoomGridParams &g, uint nb [[thread_position_in_grid]]) {
     if (int(nb) >= g.Nbl) return;
     const int k = int(mat_bnl[nb]);
     const int ii = bnl_ixyz[nb];
     float acc = ssaf_bnl[nb] + u2b[nb] + u0[ii];
     const int mb = mat_mb[k];
-    // Two loops over the branches, loading into registers and storing back, because that is
-    // the shape the real pass has — one loop doing both would serialise each load against the
-    // store before it and measure a dependency the pass does not carry.
+    // Separate load and store loops match the real pass without introducing a false dependency.
     float vint[RoomMaxBranches], gint[RoomMaxBranches];
     for (int m = 0; m < mb; ++m) {
         const int nbm = m * g.Nbl + int(nb);
@@ -235,8 +211,7 @@ kernel void RoomLossyStream(device float *u0, device float *u0b, device const fl
 // read-modify-write of the level being computed, the twelve bytes a node-step no form of the
 // scheme avoids. Over the same box with the same threadgroup shape, so it is this grid's own
 // bandwidth ceiling. See RoomGpu::Roofline.
-kernel void RoomStream(device float *u0, device const float *u1, constant RoomGridParams &g,
-                       uint3 t [[thread_position_in_grid]]) {
+kernel void RoomStream(device float *u0, device const float *u1, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= g.Nx - 1 || iy >= g.Ny - 1 || iz >= g.Nz - 1) return;
     const int ii = ix * g.Nz * g.Ny + iy * g.Nz + iz;
@@ -262,12 +237,7 @@ kernel void RoomStream(device float *u0, device const float *u1, constant RoomGr
 // u2b is the node's own value two steps back, held in a three-deep ring beside the two
 // interior levels, because the grid at that level has already been overwritten. See
 // RoomGpu::RunSteps for the rotation.
-kernel void RoomLossy(device float *u0, device float *u0b, device const float *u2b,
-                      device float *vh1, device float *gh1, device const int *bnl_ixyz,
-                      device const float *ssaf_bnl, device const char *mat_bnl,
-                      device const int *mat_mb, device const float *mat_beta,
-                      device const RoomMatQuad *mat_quads, constant RoomGridParams &g,
-                      uint nb [[thread_position_in_grid]]) {
+kernel void RoomLossy(device float *u0, device float *u0b, device const float *u2b, device float *vh1, device float *gh1, device const int *bnl_ixyz, device const float *ssaf_bnl, device const char *mat_bnl, device const int *mat_mb, device const float *mat_beta, device const RoomMatQuad *mat_quads, constant RoomGridParams &g, uint nb [[thread_position_in_grid]]) {
     if (int(nb) >= g.Nbl) return;
     const int k = int(mat_bnl[nb]);
     const float ssaf = ssaf_bnl[nb];
@@ -304,9 +274,7 @@ kernel void RoomLossy(device float *u0, device float *u0b, device const float *u
 // unrelated scatters in one dispatch, because at this size a step's cost is dispatches and not
 // work: the first Nr threads sample and the rest inject. Nothing this step writes u1, and
 // source corners are distinct nodes, so neither scatter can race.
-kernel void RoomIo(device float *u0, device float *out, device const float *u1, device const int *out_ixyz,
-                   device const float *in_sigs, device const int *in_ixyz, constant RoomGridParams &g,
-                   constant RoomStepParams &s, uint i [[thread_position_in_grid]]) {
+kernel void RoomIo(device float *u0, device float *out, device const float *u1, device const int *out_ixyz, device const float *in_sigs, device const int *in_ixyz, constant RoomGridParams &g, constant RoomStepParams &s, uint i [[thread_position_in_grid]]) {
     if (int(i) < g.Nr) {
         out[s.Step * g.Nr + int(i)] = u1[out_ixyz[i]];
         return;
@@ -332,9 +300,7 @@ kernel void RoomIo(device float *u0, device float *out, device const float *u1, 
 //
 // The FCC stencil's twelve offsets come in plus/minus pairs like the Cartesian six, so the
 // update operator is symmetric either way and the two stencils share the whole expression.
-inline float RoomEnergyPartial(device const float *unew, device const float *uold, int3 pos,
-                               constant RoomGridParams &g, constant RoomEnergyParams &e,
-                               constant int3 *steps, int count) {
+inline float RoomEnergyPartial(device const float *unew, device const float *uold, int3 pos, constant RoomGridParams &g, constant RoomEnergyParams &e, constant int3 *steps, int count) {
     const int nzny = g.Nz * g.Ny;
     const int ii = pos.x * nzny + pos.y * g.Nz + pos.z;
     const float a = unew[ii], b = uold[ii];
@@ -351,16 +317,14 @@ inline float RoomEnergyPartial(device const float *unew, device const float *uol
     return (a - b) * (a - b) + e.A2 * 0.5f * grad + e.Diag * float(k) * a * b;
 }
 
-kernel void RoomEnergy(device float *out, device const float *unew, device const float *uold,
-                       constant RoomGridParams &g, constant RoomEnergyParams &e, uint i [[thread_position_in_grid]]) {
+kernel void RoomEnergy(device float *out, device const float *unew, device const float *uold, constant RoomGridParams &g, constant RoomEnergyParams &e, uint i [[thread_position_in_grid]]) {
     const int ny = e.Y1 - e.Y0 + 1, nz = e.Z1 - e.Z0 + 1;
     if (int(i) >= (e.X1 - e.X0 + 1) * ny * nz) return;
     const int3 pos = int3(e.X0 + int(i) / (nz * ny), e.Y0 + (int(i) / nz) % ny, e.Z0 + int(i) % nz);
     out[i] = RoomEnergyPartial(unew, uold, pos, g, e, RoomCartSteps, RoomNumNeighbours);
 }
 
-kernel void RoomEnergyFcc(device float *out, device const float *unew, device const float *uold,
-                          constant RoomGridParams &g, constant RoomEnergyParams &e, uint i [[thread_position_in_grid]]) {
+kernel void RoomEnergyFcc(device float *out, device const float *unew, device const float *uold, constant RoomGridParams &g, constant RoomEnergyParams &e, uint i [[thread_position_in_grid]]) {
     const int ny = e.Y1 - e.Y0 + 1, nz = e.Z1 - e.Z0 + 1;
     if (int(i) >= (e.X1 - e.X0 + 1) * ny * nz) return;
     const int3 pos = int3(e.X0 + int(i) / (nz * ny), e.Y0 + (int(i) / nz) % ny, e.Z0 + int(i) % nz);
@@ -383,8 +347,7 @@ kernel void RoomEnergyFcc(device float *out, device const float *unew, device co
 // Laplacians are built from: over the 6 face neighbours, the 12 edge neighbours and the 8
 // corner neighbours. The periodic wrap is what keeps a plane wave an exact discrete
 // eigenvector, which is what makes the dispersion measurable to machine precision.
-static inline void RoomImplicitSums(device const float *u, int ix, int iy, int iz,
-                                    constant RoomImplicitParams &p, thread float3 &s) {
+static inline void RoomImplicitSums(device const float *u, int ix, int iy, int iz, constant RoomImplicitParams &p, thread float3 &s) {
     const int nzny = p.Nz * p.Ny;
     const int xm = (ix == 0 ? p.Nx - 1 : ix - 1) * nzny, x0 = ix * nzny, xp = (ix == p.Nx - 1 ? 0 : ix + 1) * nzny;
     const int ym = (iy == 0 ? p.Ny - 1 : iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy == p.Ny - 1 ? 0 : iy + 1) * p.Nz;
@@ -399,8 +362,7 @@ static inline void RoomImplicitSums(device const float *u, int ix, int iy, int i
 }
 
 // The Jacobi iteration's constant vector, from the two levels behind it.
-kernel void RoomImplicitRhs(device float *bp, device const float *un, device const float *up,
-                            constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+kernel void RoomImplicitRhs(device float *bp, device const float *un, device const float *up, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
     if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
@@ -412,8 +374,7 @@ kernel void RoomImplicitRhs(device float *bp, device const float *un, device con
 }
 
 // One Jacobi sweep, whose traffic is the same whatever the iteration index.
-kernel void RoomImplicitJacobi(device float *xn, device const float *x, device const float *bp,
-                               constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+kernel void RoomImplicitJacobi(device float *xn, device const float *x, device const float *bp, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
     if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
@@ -422,22 +383,9 @@ kernel void RoomImplicitJacobi(device float *xn, device const float *x, device c
     xn[ii] = bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z);
 }
 
-// The same three sums with a wall rather than a periodic wrap, under the boundary condition
-// of Smits & Bilbao 2025 Sec IV: every neighbour that lies outside the room is dropped from
-// the sum, and its share of the diagonal is dropped with it.
-//
-// The grid carries a one-node halo that nothing ever writes, so it holds zero for the whole
-// run and the first half needs no mask at all — a term the sum should not have is a read of a
-// node that holds zero. The second half is what RoomImplicitTerm carries, because the uniform
-// coefficients are already divided through by the interior diagonal.
-//
-// This is not the Neumann image, which is what a step reflected back to the node one layer in
-// would give. The image maps a wall-crossing diagonal offset onto a node that does not map
-// back, so the 27-point operator it builds is asymmetric and grows at every Courant number
-// tried. Drop-ghost is exactly symmetric, and puts the wall half a cell outside the outermost
-// node rather than on it.
-static inline void RoomImplicitSumsWall(device const float *u, int ix, int iy, int iz,
-                                        constant RoomImplicitParams &p, thread float3 &s) {
+// Smits & Bilbao Sec. IV drop-ghost sums. A held-zero halo removes ghost values while
+// RoomImplicitTerm repairs their diagonal contributions, preserving operator symmetry.
+static inline void RoomImplicitSumsWall(device const float *u, int ix, int iy, int iz, constant RoomImplicitParams &p, thread float3 &s) {
     const int nzny = p.Nz * p.Ny;
     const int xm = (ix - 1) * nzny, x0 = ix * nzny, xp = (ix + 1) * nzny;
     const int ym = (iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy + 1) * p.Nz;
@@ -451,22 +399,10 @@ static inline void RoomImplicitSumsWall(device const float *u, int ix, int iy, i
         u[xp + ym + zm] + u[xp + ym + zp] + u[xp + yp + zm] + u[xp + yp + zp];
 }
 
-// The three sums with the legs the surface cuts left out of them.
-//
-// A pass cannot drop a ghost by reading the zero across the wall, because a room's own surfaces
-// are thinner than a cell in places and then the node across one of them is a room node with a
-// live value. So the mask rides beside the code, one bit a leg, and the sum keeps what it says
-// to keep. A box does not need this — every leg it cuts points at a node held at zero — which
-// is why it was worth finding out what a room costs rather than assuming.
-//
-// The bit order is the raster order of the 26 offsets with the centre skipped, which is the
-// order the host builds the mask in — see ImplicitLegBit. Unrolled over the same nine
-// precomputed offsets as RoomImplicitSumsWall rather than looping over an offset table: a
-// table leg costs two integer multiplies of index arithmetic, and every inside node runs this
-// body, so those multiplies were most of what the mask cost where the grid is cache-resident.
+// Thin surfaces can have live room nodes on both sides, so masked sums explicitly remove cut
+// legs. Bit order matches ImplicitLegBit; unrolling avoids per-leg index arithmetic.
 #define ROOM_KEPT(b) float((keep >> (b)) & 1u)
-static inline void RoomImplicitSumsMasked(device const float *u, int ix, int iy, int iz, uint keep,
-                                          constant RoomImplicitParams &p, thread float3 &s) {
+static inline void RoomImplicitSumsMasked(device const float *u, int ix, int iy, int iz, uint keep, constant RoomImplicitParams &p, thread float3 &s) {
     const int nzny = p.Nz * p.Ny;
     const int xm = (ix - 1) * nzny, x0 = ix * nzny, xp = (ix + 1) * nzny;
     const int ym = (iy - 1) * p.Nz, y0 = iy * p.Nz, yp = (iy + 1) * p.Nz;
@@ -488,32 +424,15 @@ static inline void RoomImplicitSumsMasked(device const float *u, int ix, int iy,
 }
 #undef ROOM_KEPT
 
-// The walled passes run over the array's interior rather than the whole array, and reach the
-// wall's data — a uint of kept legs and a ushort into the term table — by rank through
-// RoomImplicitBlockEntry rather than carrying it grid-wide, because only 7-9% of a real
-// room's swept nodes are wall and six bytes a node on a twelve-byte pass was the geometry's
-// whole cost. What every node pays is three words a block of 32, which say which of its
-// classes the node is: outside the room, where it is held at the rest the sums rely on and
-// reads nothing else; ordinary air, whose mask is all ones and whose terms are the identity;
-// or wall, where the packed row carries what its geometry gives it.
-//
-// Air is a constant mask rather than a branch to a maskless body. Wall nodes sit on surfaces
-// that cross nearly every 32-node run at a small footprint, so a branched pass runs most SIMD
-// groups down both sum bodies — measured at nearly double the step where the grid is
-// cache-resident and traffic is not the cost — and carrying two unrolled 26-leg bodies costs
-// registers even where the vote is uniform. One body, with the mask a multiply a leg, is
-// cheaper than choosing between two.
-kernel void RoomImplicitRhsWall(device float *bp, device const float *un, device const float *up,
-                                device const RoomImplicitBlockEntry *blocks,
-                                device const ushort *code, device const RoomImplicitTerm *terms,
-                                device const uint *keep, constant RoomImplicitParams &p,
-                                uint3 t [[thread_position_in_grid]]) {
+// Block rank reaches sparse wall masks and terms. Outside nodes remain zero; air uses the
+// all-ones mask. One masked sum body avoids SIMD divergence at wall-crossing groups.
+kernel void RoomImplicitRhsWall(device float *bp, device const float *un, device const float *up, device const RoomImplicitBlockEntry *blocks, device const uint *code, device const RoomImplicitTerm *terms, device const uint *keep, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     const RoomImplicitBlockEntry blk = blocks[ii / RoomBnBlock];
     const uint slot = uint(ii % RoomBnBlock);
-    if ((blk.Outside >> slot) & 1u) return; // held at rest, and no sweep reads its bp
+    if ((blk.Outside >> slot) & 1u) return;
     uint k = 0x3FFFFFFu;
     RoomImplicitTerm w{0.f, 0.f, 1.f};
     if ((blk.Wall >> slot) & 1u) {
@@ -528,20 +447,14 @@ kernel void RoomImplicitRhsWall(device float *bp, device const float *un, device
         (p.Q1 * sp.x + p.Q2 * sp.y + p.Q3 * sp.z + (1.f - w.Cp) * up[ii]);
 }
 
-kernel void RoomImplicitJacobiWall(device float *xn, device const float *x, device const float *bp,
-                                   device const RoomImplicitBlockEntry *blocks,
-                                   device const ushort *code, device const RoomImplicitTerm *terms,
-                                   device const uint *keep, constant RoomImplicitParams &p,
-                                   uint3 t [[thread_position_in_grid]]) {
+kernel void RoomImplicitJacobiWall(device float *xn, device const float *x, device const float *bp, device const RoomImplicitBlockEntry *blocks, device const uint *code, device const RoomImplicitTerm *terms, device const uint *keep, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     const RoomImplicitBlockEntry blk = blocks[ii / RoomBnBlock];
     const uint slot = uint(ii % RoomBnBlock);
     if ((blk.Outside >> slot) & 1u) {
-        // Written rather than skipped, so the outside holds its rest whatever the scratch
-        // buffer held — the soaks sample the whole array and the energy sums the room box,
-        // and neither can tell a stale float outside the room from growth inside it.
+        // Scratch buffers may contain stale values outside the room.
         xn[ii] = 0.f;
         return;
     }
@@ -557,12 +470,8 @@ kernel void RoomImplicitJacobiWall(device float *xn, device const float *x, devi
     xn[ii] = (bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z)) * fd;
 }
 
-// The same two passes without the byte, which is the ceiling the walled step is read against:
-// what the wall costs is the difference between a step encoded over these and one encoded over
-// the two above. They step nothing meaningful on their own — the diagonal they leave at the
-// interior's value is wrong at every node the wall touches.
-kernel void RoomImplicitRhsNoWall(device float *bp, device const float *un, device const float *up,
-                                  constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+// Wall-free timing baseline; it is not a physically valid walled step.
+kernel void RoomImplicitRhsNoWall(device float *bp, device const float *un, device const float *up, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
@@ -573,8 +482,7 @@ kernel void RoomImplicitRhsNoWall(device float *bp, device const float *un, devi
         (p.Q1 * sp.x + p.Q2 * sp.y + p.Q3 * sp.z + up[ii]);
 }
 
-kernel void RoomImplicitJacobiNoWall(device float *xn, device const float *x, device const float *bp,
-                                     constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+kernel void RoomImplicitJacobiNoWall(device float *xn, device const float *x, device const float *bp, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
@@ -583,12 +491,8 @@ kernel void RoomImplicitJacobiNoWall(device float *xn, device const float *x, de
     xn[ii] = bp[ii] - (p.Q1 * s.x + p.Q2 * s.y + p.Q3 * s.z);
 }
 
-// Source and receiver for the implicit stepper. Receivers read the level behind, the way
-// RoomIo does, and the source adds into the level just solved before the rotation.
-kernel void RoomImplicitIo(device float *un, device float *out, device const float *up,
-                           device const int *out_ixyz, device const float *in_sigs,
-                           device const int *in_ixyz, constant RoomImplicitParams &p,
-                           constant RoomStepParams &st, uint i [[thread_position_in_grid]]) {
+// Receivers read the previous level; sources add to the newly solved level.
+kernel void RoomImplicitIo(device float *un, device float *out, device const float *up, device const int *out_ixyz, device const float *in_sigs, device const int *in_ixyz, constant RoomImplicitParams &p, constant RoomStepParams &st, uint i [[thread_position_in_grid]]) {
     if (int(i) < p.Nr) {
         out[int(i) * p.Nt + st.Step] = up[out_ixyz[i]];
         return;
@@ -598,42 +502,59 @@ kernel void RoomImplicitIo(device float *un, device float *out, device const flo
     un[in_ixyz[k]] += in_sigs[k * p.Nt + st.Step];
 }
 
+// Reproducible recursive reduction for optional temporal-DC projection.
+constant uint RoomImplicitReduceThreads = 256;
+constant uint RoomImplicitReduceValues = 4;
+kernel void RoomImplicitReduce(device const float *x [[buffer(0)]], device float *out [[buffer(1)]], constant RoomImplicitReduceParams &p [[buffer(2)]], uint group [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float partial[RoomImplicitReduceThreads];
+    const uint first = (group * RoomImplicitReduceThreads + lid) * RoomImplicitReduceValues;
+    float sum = 0.f;
+    for (uint k = 0; k < RoomImplicitReduceValues; ++k) {
+        const uint i = first + k;
+        if (i < uint(p.Count)) sum += x[i];
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = RoomImplicitReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) out[group] = partial[0];
+}
+
+// Preserve the held-zero halo and outside nodes required by masked stencil reads.
+kernel void RoomImplicitProject(device float *x [[buffer(0)]], device const float *sum [[buffer(1)]], device const RoomImplicitBlockEntry *blocks [[buffer(2)]], constant RoomImplicitProjectParams &p [[buffer(3)]], uint3 t [[thread_position_in_grid]]) {
+    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
+    if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
+    const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
+    const RoomImplicitBlockEntry blk = blocks[ii / RoomBnBlock];
+    if ((blk.Outside >> uint(ii % RoomBnBlock)) & 1u) return;
+    x[ii] -= sum[0] * p.InvInside;
+}
+
 // The traffic a sweep cannot avoid, with none of its work: the twelve bytes of two reads and
 // a write both kernels above move a node, over the same buffers and the same box.
-kernel void RoomImplicitStream(device float *xn, device const float *x, device const float *bp,
-                               constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+kernel void RoomImplicitStream(device float *xn, device const float *x, device const float *bp, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x), iy = int(t.y), ix = int(t.z);
     if (ix >= p.Nx || iy >= p.Ny || iz >= p.Nz) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     xn[ii] = bp[ii] - p.Q1 * x[ii];
 }
 
-// The same over the room of a walled grid, which is the ceiling the walled passes are read
-// against: a smaller box inside a larger array reaches DRAM differently from the whole array.
-kernel void RoomImplicitStreamWall(device float *xn, device const float *x, device const float *bp,
-                                   constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
+// Timing ceiling over the walled grid's physical-room footprint.
+kernel void RoomImplicitStreamWall(device float *xn, device const float *x, device const float *bp, constant RoomImplicitParams &p, uint3 t [[thread_position_in_grid]]) {
     const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
     if (ix >= p.Nx - 1 || iy >= p.Ny - 1 || iz >= p.Nz - 1) return;
     const int ii = ix * p.Nz * p.Ny + iy * p.Nz + iz;
     xn[ii] = bp[ii] - p.Q1 * x[ii];
 }
 
-// The frequency-dependent wall's two passes, which the sweeps between them never see.
-//
-// A wall of parallel LRC branches, each an admittance 1/(D s + E + F/s) discretised by the
-// trapezoid rule, carries a velocity vh and its running integral gh a branch a node. Written
-// out, the branch relation is
+// LRC branches use the trapezoidal recursion
 //
 //   Dh (vh^n - vh^(n-1)) + Eh mu(vh) + Fh mu(gh) = mu(delta u)
 //
-// with mu the two-point average — Dh, Eh and Fh being D/Ts, E and F*Ts, and RoomMatQuad
-// holding what falls out of solving it for vh^n. The node's own equation then takes
-// lambda*beta*sum_m mu(vh_m), whose half depends on the level being solved for and rides on
-// the diagonal, and whose other half is this:
-kernel void RoomImplicitWallRhs(device float *bp, device const float *vh1, device const float *gh1,
-                                device const RoomImplicitWall *wall, device const int *mat_mb,
-                                device const RoomMatQuad *mat_quads, constant RoomImplicitParams &p,
-                                uint nb [[thread_position_in_grid]]) {
+// with the unknown half of lambda*beta*sum(mu(vh)) on the diagonal and history on the RHS.
+kernel void RoomImplicitWallRhs(device float *bp, device const float *vh1, device const float *gh1, device const RoomImplicitWall *wall, device const int *mat_mb, device const RoomMatQuad *mat_quads, constant RoomImplicitParams &p, uint nb [[thread_position_in_grid]]) {
     if (int(nb) >= p.Nw) return;
     const RoomImplicitWall w = wall[nb];
     float psi = 0.f;
@@ -645,14 +566,8 @@ kernel void RoomImplicitWallRhs(device float *bp, device const float *vh1, devic
     bp[w.Ixyz] -= w.Psi * psi;
 }
 
-// And the branch step, node-local, once the solve has produced the level it needs. `ub` is the
-// node's own value two levels back, which the grid no longer holds by now — one float a wall
-// node against the explicit path's three-deep ring, because the implicit step keeps both
-// levels behind it rather than overwriting one.
-kernel void RoomImplicitWallStep(device const float *un, device const float *up, device float *ub,
-                                 device float *vh1, device float *gh1, device const RoomImplicitWall *wall,
-                                 device const int *mat_mb, device const RoomMatQuad *mat_quads,
-                                 constant RoomImplicitParams &p, uint nb [[thread_position_in_grid]]) {
+// `ub` retains the wall node's value two levels back for the branch update.
+kernel void RoomImplicitWallStep(device const float *un, device const float *up, device float *ub, device float *vh1, device float *gh1, device const RoomImplicitWall *wall, device const int *mat_mb, device const RoomMatQuad *mat_quads, constant RoomImplicitParams &p, uint nb [[thread_position_in_grid]]) {
     if (int(nb) >= p.Nw) return;
     const RoomImplicitWall w = wall[nb];
     const float du = un[w.Ixyz] - ub[nb];

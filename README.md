@@ -99,9 +99,16 @@ The explicit solver consumes converted [PFFDTD](https://github.com/bsxfun/pffdtd
 `script/ConvertRoomScene` writes the scene configuration and binary boundary, material, source, and receiver data under `Scenes/`.
 The repository includes Cartesian and FCC shoebox and church scenes, a Cartesian concert hall, and a production-resolution FCC shoebox.
 
+The optimized 27-point implicit scheme from [Smits & Bilbao 2025](https://doi.org/10.1121/10.0036229) runs directly from a PFFDTD `model_export.json`.
+It voxelizes all 26 stencil legs, preserves mesh normals and materials, and applies the paper's staircase-compensated real-admittance boundary.
+Its defaults reproduce the published Fig. 6 numerical configuration; zero-mean projection for long fp32 records is available separately and remains off by default.
+
 ```
 build/AcousticSolver --room ../Scenes/RoomChurch/config.json
 build/AcousticSolver --room --seconds 0.2 ../Scenes/RoomChurch/config.json
+build/AcousticSolver --implicit-room path/to/model_export.json
+build/AcousticSolver --implicit-room --h 0.02 --seconds 0.1 path/to/model_export.json
+build/RoomTest --implicit
 script/ValidateRoom
 script/ConvertRoomScene RoomChurch
 script/RunRoomReference RoomChurch
@@ -109,6 +116,7 @@ script/RenderRoomWavs
 ```
 
 `script/ValidateRoom` runs the analytic, energy, stability, CUDA-golden, and Metal-determinism gates for the explicit schemes.
+`RoomTest --implicit` covers dispersion, boundaries, voxelization, stability, and projection for the implicit scheme.
 [VALIDATION.md](VALIDATION.md) records the methods, thresholds, and detailed results.
 
 Raw differentiated-pressure receiver rows are written to `build/room/<output>.bin`, with the sample rate in the adjacent JSON file.

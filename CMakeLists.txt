@@ -38,6 +38,7 @@ set(RADIATION_SOURCES
 # the scene loader and the Metal stepper. Shared by the scene runner and its harness.
 set(ROOM_SOURCES
     src/Room/RoomGpu.cpp
+    src/Room/RoomImplicitScene.cpp
     src/Room/RoomScene.cpp)
 
 # Kernels are compiled at runtime from these sources (KernelParams.h + Kernels.metal, and

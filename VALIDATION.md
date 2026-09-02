@@ -1229,9 +1229,46 @@ Edge nodes are 6% of the wall on the 40 × 33 × 28 room, which is the right siz
 
 **It is not integrated, and what is left is the voxeliser and the absence of a truth to check against.**
 
-- **Nothing renders yet.** Both rooms step, hold at the full Courant number and conserve energy, but every rung seeds a field directly — there are no sources, no receiver corners and no impulse response. That, a `RoomScene` that carries 26-direction data, and the scene's own materials rather than a synthetic wall, are what stand between this and a room the solver can be asked for.
+- **The first render exists** — `RoomTest --render`, the section below — with single-node sources and receivers through `RoomImplicitIo`. A `RoomScene` that carries 26-direction data and the scene's own materials rather than a synthetic wall are what still stand between this and a room the solver can be asked for.
 - **There is no golden at that grid step.** Every gate in `script/ValidateRoom` is an SNR against PFFDTD's own output on the *same* voxelized input. At 183 mm the discrete problem is a different one, so there is no CUDA golden, no fp64 truth, and no bit-identity argument — the validation apparatus of the whole solver does not transfer.
 - **2.68 points per wavelength is the geometry as well as the field.** The pairing above equalises interior dispersion and nothing else, the same caveat the Cartesian-against-FCC verdict carries, but three times as coarse. The paper compensates the absorption bias staircasing causes, and demonstrates it on a rotated rectangular room; nothing in it claims a complex room is the same room at 183 mm as at 47.
+
+### The first render: the paper's rotated room
+
+`RoomTest --render` reproduces the paper's one quantitative rendered result (Sec VII C, Fig. 5): the 4√5 × 4√3 × 4 m room with absorbing walls at h = 2 cm, a 2 s impulse response from the room's centre to a corner receiver 50 cm from each wall, at R100 (grid-aligned), R110 (four walls on the grid-plane diagonals) and R111 (the room's z axis on the cube diagonal), against the same room rendered grid-aligned by the explicit Cartesian (SLF) path — where staircase error does not exist and which the golden ladder validates.
+The paper does not state γ for the figure; 0.05 is what its energy and complex-geometry examples use, and what runs here.
+The metrics were fixed before the first run: T30 of the band-limited Schroeder integral over 30–400 Hz, and the third-octave-smoothed spectral deviation against the reference after one fitted gain.
+
+**The spectral overlay reproduces at the paper's own resolution.**
+At 2 cm the compensated rotations sit on the SLF reference to a **mean 0.45–0.82 dB, worst 1.60 dB** over 30–400 Hz — Fig. 5(a).
+
+**The absorption claim reproduces at 2 cm** once the implicit room's marginal DC line is projected every 1024 steps:
+
+| T30 vs the SLF reference | R100 | R110 | R111 |
+|---|---|---|---|
+| compensated | −0.2% | −0.5% | +0.2% |
+| A_ij = 1 | — | −21.1% | **−33.0%** |
+
+R111 lands inside the companion paper's −18% to −42%; R110 is milder because its two z walls never staircase.
+R100 uncompensated is R100 compensated, because β is exactly 1 on a grid-aligned wall.
+
+**What the render turned up that no soak could: the implicit scheme's marginal lines grow.**
+The admittance wall couples to `u^(n+1) − u^(n−1)`, which vanishes at z = ±1 — the boundary is transparent at DC and at the temporal Nyquist by construction, and the modes there are marginal.
+The explicit path holds them exactly.
+The implicit path solves its step with a fixed number of Jacobi sweeps, and the finite-precision solve nudges the marginal roots off the circle: the initial 2 cm render exposed **about +12 dB/s** near DC, seeded by the source's DC if it has any and by fp32 round-off if it does not.
+Every soak in this ladder removes its seed's mean, which is why none of them ever saw it.
+Three consequences, all measured:
+
+- A bare Kronecker delta (the paper's stated Fig. 5 source) is unusable here: its DC grows from 3e-5 to 4e-4 of the level over a 2 s record. The render injects the paper's Fig. 6 source instead — a differentiated Gaussian, peaking near 150 Hz and gone by 1 kHz, sampled from the same continuous pulse by both schemes.
+- More Jacobi sweeps do not close it. In the focused R111 instrument at 8 cm, after the source and both means are cleared at step 256, P = 6 through 10 all grow at +0.738–0.740 dB/s, finish at 1.855–1.856e-4, and report the same broken 3.881 s T30. This reset, resolution, and measurement window differ from the initial 2 cm characterization above; the result establishes sweep-count independence rather than replacing that rate.
+- Periodically removing the spatial mean closes the line. Cadences 64, 256, and 1024 all restore the focused instrument's T30 to 0.573–0.574 s; at 1024 the final mean is 2.75e-13 and the 30–400 Hz receiver spectrum moves by 0.065 dB mean, 0.751 dB worst after fitted gain. The full 2 cm, 59,504-step reference render and five 43,008-step implicit legs then give the table above: compensated T30 is within 0.5% of the SLF reference, and the raw-wall bias is inside the companion paper's range.
+- One projection recursively reduces and subtracts the mean from both stored levels; projecting only one would itself create mean velocity. `RoomTest --projection` checks its interval scheduling and that halo/outside zeros remain zero. Two repeated cost runs put a pair projection at 0.17–0.19 ordinary steps: amortized every 1024 steps, **0.016–0.019%** at both 0.329M and 55.743M-node footprints. `RoomTest --render` therefore uses 1024 by default; `--project-every N` changes the cadence and `--no-project` reproduces the failure.
+
+This closure is accepted only for the real-admittance wall used by the render. An LRC wall carries an additional scattered time level and branch state; projection is rejected there until that history is transformed consistently.
+
+One more instrument lesson, paid for twice: a brick-wall band-limit rings a sinc across the whole record and floors the Schroeder integral at −31 dB — read as a decay that stalls, when what stalled was the filter. `RenderBandT30` tapers its band edges (raised-cosine over 30–60 and 350–450 Hz) for that reason.
+
+The projected IRs land in `room/implicit-render-p1024-*.bin` (float64, rates in `implicit-render-p1024.json`) — the first output of this path a person can listen to.
 
 ## A room at full bandwidth
 

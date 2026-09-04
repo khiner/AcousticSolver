@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "immersed_error",
+    "solid_cell_error"
+  ],
+  "dtype": "float64 little-endian",
+  "paper": "Bilbao 2022, Figure 10",
+  "shape": [
+    1,
+    2
+  ]
+}

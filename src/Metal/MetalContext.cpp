@@ -54,6 +54,12 @@ MTL::Library *CompileLibrary(MTL::Device *device, const std::string &source) {
     if (!library) throw std::runtime_error(std::format("MSL compilation failed:\n{}", error ? error->localizedDescription()->utf8String() : "unknown error"));
     return library;
 }
+
+void EnsureLibrary(MTL::Library *&library, MTL::Device *device, const char *profile_name, const char *directory, const char *params, const char *kernels) {
+    if (library) return;
+    const profile::Scope scope{profile_name};
+    library = CompileLibrary(device, ReadFile(std::string{directory} + "/" + params) + ReadFile(std::string{directory} + "/" + kernels));
+}
 } // namespace
 
 MetalContext &MetalContext::Get() {
@@ -104,21 +110,22 @@ MTL::ComputePipelineState *MetalContext::RadiationPipeline(const char *name, int
     // cache, so one process can hold several levels and dispatch them side by side.
     const std::string key = std::string{"rad/"} + name + (floor_probe ? "#probe" + std::to_string(floor_probe) : "");
     if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
-    if (!RadiationLib) {
-        const profile::Scope scope{"startup/msl_compile_radiation"};
-        RadiationLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationParams.h") + ReadFile(std::string{ACOUSTIC_RADIATION_MSL_DIR} + "/RadiationKernels.metal"));
-    }
+    EnsureLibrary(RadiationLib, Device, "startup/msl_compile_radiation", ACOUSTIC_RADIATION_MSL_DIR, "RadiationParams.h", "RadiationKernels.metal");
     return Pipelines[key] = MakePipeline(Device, RadiationLib, name, &floor_probe, MTL::DataTypeInt, RadFloorProbeFcIndex);
 }
 
 MTL::ComputePipelineState *MetalContext::RoomPipeline(const char *name) {
     const std::string key = std::string{"room/"} + name;
     if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
-    if (!RoomLib) {
-        const profile::Scope scope{"startup/msl_compile_room"};
-        RoomLib = CompileLibrary(Device, ReadFile(std::string{ACOUSTIC_ROOM_MSL_DIR} + "/RoomParams.h") + ReadFile(std::string{ACOUSTIC_ROOM_MSL_DIR} + "/RoomKernels.metal"));
-    }
+    EnsureLibrary(RoomLib, Device, "startup/msl_compile_room", ACOUSTIC_ROOM_MSL_DIR, "RoomParams.h", "RoomKernels.metal");
     return Pipelines[key] = MakePipeline(Device, RoomLib, name);
+}
+
+MTL::ComputePipelineState *MetalContext::ImmersedPipeline(const char *name) {
+    const std::string key = std::string{"immersed/"} + name;
+    if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    EnsureLibrary(ImmersedLib, Device, "startup/msl_compile_immersed", ACOUSTIC_IMMERSED_MSL_DIR, "ImmersedParams.h", "ImmersedKernels.metal");
+    return Pipelines[key] = MakePipeline(Device, ImmersedLib, name);
 }
 
 MTL::ComputePipelineState *MetalContext::Pipeline(const char *name, bool apply_faces) {

@@ -1,0 +1,35 @@
+{
+  "grid": {
+    "extent": [1.4, 1.4, 1.4],
+    "sample_rate": 25000,
+    "courant": 0.5754
+  },
+  "medium": {
+    "c": 344,
+    "rho": 1.18
+  },
+  "pml_width": 8,
+  "interpolation_order": 5,
+  "surfaces": [
+    {
+      "type": "sphere",
+      "center": [0, 0, 0],
+      "radius": 0.25,
+      "patch_size": 0.03,
+      "zv": "rigid",
+      "yp": 0
+    }
+  ],
+  "source": {
+    "position": [0, 0, 0.4],
+    "f60": 4000,
+    "umax": 0.001
+  },
+  "receivers": [
+    [0, 0, 0.3],
+    [0.3, 0, 0],
+    [0, 0, -0.3]
+  ],
+  "seconds": 0.0045,
+  "output": "ImmersedSphere"
+}

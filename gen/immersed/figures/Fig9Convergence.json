@@ -1,0 +1,14 @@
+{
+  "columns": [
+    "sample_rate_hz",
+    "time_step_seconds",
+    "courant",
+    "receiver_c_error"
+  ],
+  "dtype": "float64 little-endian",
+  "paper": "Bilbao 2023, Figure 9",
+  "shape": [
+    14,
+    4
+  ]
+}

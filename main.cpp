@@ -1,8 +1,7 @@
 // Ported from WaveBlender (c) 2024 Kangrui Xue (main.cpp) — Metal port.
-// Parses a JSON config file and runs the simulation.
-
 #include "WaveBlender.h"
 
+#include "ImmersedScene.h"
 #include "Profile.h"
 #include "RadiationScene.h"
 #include "RoomImplicitScene.h"
@@ -17,7 +16,6 @@ void Run(const std::string &config_file) {
     json config;
     config_stream >> config;
 
-    // Parse global simulation parameters
     SimParams params;
     params.Nx = config["Nx"];
     params.Ny = config["Ny"];
@@ -36,7 +34,6 @@ void Run(const std::string &config_file) {
 
     WaveBlender solver{params};
 
-    // Parse object parameters
     {
         const profile::Scope load_scope{"startup/scene_load"};
         for (const auto &object_config : config["objects"]) {
@@ -66,7 +63,6 @@ void Run(const std::string &config_file) {
         }
     }
 
-    // Parse listener parameters
     for (const auto &listener_config : config["listeners"]) {
         solver.AddListener(listener_config["format"], listener_config["position"], listener_config["output"]);
     }
@@ -76,25 +72,26 @@ void Run(const std::string &config_file) {
 }
 } // namespace
 
-// Usage: ./AcousticSolver [--radiation | --room | --implicit-room] [options] [scene file]
+// Usage: ./AcousticSolver [--radiation | --room | --implicit-room | --immersed] [options] [scene file]
 // Implicit defaults reproduce Smits & Bilbao Fig. 6; mean projection is opt-in.
 int main(int argc, char *argv[]) {
-    bool radiation = false, room = false, implicit_room = false;
+    bool radiation = false, room = false, implicit_room = false, immersed = false;
     double seconds = 0.;
     RoomImplicitSceneOptions implicit_options;
-    std::string config_file;
+    std::string config_file, immersed_output;
     for (int a = 1; a < argc; ++a) {
         const std::string arg = argv[a];
         if (arg == "--radiation") radiation = true;
         else if (arg == "--room") room = true;
         else if (arg == "--implicit-room") implicit_room = true;
+        else if (arg == "--immersed") immersed = true;
         else if (arg == "--seconds" && a + 1 < argc) seconds = std::stod(argv[++a]);
         else if (arg == "--h" && a + 1 < argc) implicit_options.H = std::stod(argv[++a]);
         else if (arg == "--dt" && a + 1 < argc) implicit_options.TimeStep = std::stod(argv[++a]);
         else if (arg == "--gamma" && a + 1 < argc) implicit_options.Gamma = std::stod(argv[++a]);
         else if (arg == "--peak-hz" && a + 1 < argc) implicit_options.PeakHz = std::stod(argv[++a]);
         else if (arg == "--project-every" && a + 1 < argc) implicit_options.ProjectionEvery = std::stoi(argv[++a]);
-        else if (arg == "--output" && a + 1 < argc) implicit_options.Output = argv[++a];
+        else if (arg == "--output" && a + 1 < argc) immersed_output = implicit_options.Output = argv[++a];
         else if (arg == "--material-gamma" && a + 1 < argc) {
             const std::string value = argv[++a];
             const size_t equals = value.find('=');
@@ -104,12 +101,14 @@ int main(int argc, char *argv[]) {
     }
     if (config_file.empty()) {
         if (implicit_room) throw std::runtime_error("--implicit-room needs a model_export.json");
+        if (immersed) throw std::runtime_error("--immersed needs a scene.json");
         config_file = room ? "../Scenes/RoomShoebox/config.json" : "../Scenes/CupPhone/config.json";
     }
     if (implicit_room) {
         if (seconds > 0.) implicit_options.Seconds = seconds;
         RunImplicitRoomScene(config_file, implicit_options);
-    } else if (room) RunRoomScene(config_file, seconds);
+    } else if (immersed) immersed::RunScene(config_file, seconds, immersed_output);
+    else if (room) RunRoomScene(config_file, seconds);
     else if (radiation) RunRadiationScene(config_file, seconds);
     else Run(config_file);
     return 0;

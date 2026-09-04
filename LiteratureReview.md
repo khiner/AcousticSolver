@@ -63,6 +63,22 @@ second-order FDTD for far-field transport, with no ghost cells, no rasterization
 problem. Implemented in `src/Radiation/`, with its monopole validation ladder in the `RadiationTest`
 target. No public reference implementation exists.
 
+## Immersed impedance surfaces and barriers
+
+`src/Immersed/` uses interpolation and spreading to couple non-grid-aligned surfaces to the staggered FDTD pressure and velocity fields. It supports rigid, pressure-release, passive impedance or admittance surfaces, and transmitting barriers. `ImmersedTest` provides the analytic and regression checks.
+
+- **Bilbao. "Immersed boundary methods in wave-based virtual acoustics." JASA 151(3), 2022.**
+  https://doi.org/10.1121/10.0009768 — establishes the Cartesian-grid interpolation/spreading construction, the benefit over staircasing, and the discrete energy balance for passive surface impedances.
+- **Bilbao. "Modeling impedance boundary conditions and acoustic barriers using the immersed boundary method: The one-dimensional case." JASA 153(4), 2023.**
+  https://doi.org/10.1121/10.0017763 — derives the dual mass and momentum forcing, impedance/admittance pairing, trapezoidal immittance recursion, reflection and transmission coefficients, and first-order barrier leakage.
+- **Bilbao. "Modeling impedance boundary conditions and acoustic barriers using the immersed boundary method: The three-dimensional case." JASA 154(2), 2023.**
+  https://doi.org/10.1121/10.0020635 — lifts the method to flat surface patches on a staggered 3D grid and reduces each implicit update to a static patch-space system. The Metal implementation uses those two Woodbury solves directly.
+- **Peskin. "The immersed boundary method." Acta Numerica 11, 2002.**
+  https://doi.org/10.1017/S0962492902000077 — the Eulerian/Lagrangian delta framework and the matched interpolation/spreading identities behind the coupling. **Mittal & Iaccarino 2005** surveys the larger method family: https://doi.org/10.1146/annurev.fluid.37.061903.175743.
+- **Koay. "Analytically exact spiral scheme for generating uniformly distributed points on the unit sphere." Journal of Computational Science 2(1), 2011.**
+  https://doi.org/10.1016/j.jocs.2010.12.003 — the paper's sphere-sampling reference. This implementation uses a deterministic equal-area golden-angle spiral instead and records that departure in [VALIDATION.md](VALIDATION.md).
+- **Hao, Kotapati, Pérot, Mann. "Numerical studies of acoustic diffraction by rigid bodies." AIAA/CEAS Aeroacoustics, 2016**, and **Ahrens. _Analytic Methods of Sound Field Synthesis_, 2012** — the spherical point-source expansion and Fourier convention used by `ImmersedExact`. The implementation independently fixes the convention by reducing the expansion to the free-space monopole and checking rigid and pressure-release boundary residuals.
+
 ## The Bilbao room-acoustics lineage
 
 **Goal: room impulse responses at full audio bandwidth** — a closed room on a regular grid, energy
@@ -129,13 +145,6 @@ Modern upgrades:
 - **Hamilton & Bilbao 2017** (high-order accuracy in space and time) — cited in the FDTD section
   below for its dispersion analysis and validation protocol.
 
-Irregular geometry without staircasing — the immersed-boundary line, the treatment closest in spirit
-to WaveBlender's blended domains: **Bilbao 2022** (cited below) plus the impedance-barrier pair,
-**Bilbao 2023, "…acoustic barriers using the IBM: The one-dimensional case," JASA 153(4)**
-doi:10.1121/10.0017763 and **"The three-dimensional case," JASA 154(2)** doi:10.1121/10.0020635 —
-immersed surfaces with tunable impedance and transmittance. Applied downstream by **Wu, Mohapatra,
-Fels, Interspeech 2024** (vocal-tract FDTD with immersed boundaries).
-
 Air absorption:
 
 - **Hamilton & Bilbao. "Time-domain modelling of wave-based room acoustics including viscothermal and
@@ -194,11 +203,7 @@ covered by the thesis, the 2019 passivity paper, and the 2021 JASA-EL letter.
 - **Oskooi, Zhang, Avniel, Johnson 2008**, *Opt. Express* 16(15).
   https://math.mit.edu/~stevenj/papers/OskooiZh08.pdf — how to measure PML reflection numerically.
 - **Mittal et al. 2008**, *JCP* 227(10). https://pubmed.ncbi.nlm.nih.gov/20216919/ — the canonical ghost-cell +
-  fresh-cell paper. Survey: **Mittal & Iaccarino 2005**,
-  https://www.annualreviews.org/content/journals/10.1146/annurev.fluid.37.061903.175743 (2023 follow-up:
-  `annurev-fluid-120720-022129`).
-- **Bilbao 2022**, "Immersed boundary methods in wave-based virtual acoustics," *JASA* 151(3), 1627.
-  https://pubs.aip.org/asa/jasa/article/151/3/1627/2838190 — the acoustics-native immersed-boundary reference.
+  fresh-cell paper.
 - **Morse & Ingard 1968**, *Theoretical Acoustics* — free-space Green's function and rigid-box eigenmodes
   `f = (c/2)·√((l/Lx)² + (m/Ly)² + (n/Lz)²)`. **Pierce 2019**, *Acoustics* 3rd ed., ch. 4 — pulsating-sphere
   radiation at finite `ka`. **Schneider, Wagner, Broschat 1998**, *JASA* 103(1),

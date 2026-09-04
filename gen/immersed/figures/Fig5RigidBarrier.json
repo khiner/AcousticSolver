@@ -1,0 +1,13 @@
+{
+  "columns": [
+    "angle_degrees",
+    "image_error",
+    "prediffraction_leakage"
+  ],
+  "dtype": "float64 little-endian",
+  "paper": "Bilbao 2023, Figure 5",
+  "shape": [
+    3,
+    3
+  ]
+}

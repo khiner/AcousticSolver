@@ -1374,3 +1374,89 @@ What that leaves is one to two seconds of impulse response per scene, which is w
 T20 rather than T30 because the last 15 dB of a Schroeder curve over a record this short is mostly the truncation, and the tail share is the check on that.
 The two shoeboxes are the case the tail share is there to catch: their walls are all rigid, so they do not decay at all and their apparent T20 is the record ending — which is why the two schemes disagree about it and neither number means anything.
 The church and the hall are within a quarter second of each other, the church slightly the longer of the two, and the FCC church's six receivers span the Cartesian church's range.
+
+# Immersed-boundary solver
+
+`src/Immersed/` implements the dual-forcing impedance and barrier method of Bilbao's 2023 one- and three-dimensional papers on the staggered pressure/velocity scheme. Product-form Lagrange deltas interpolate and spread with the same weights. Each velocity and pressure update applies a precomputed Woodbury inverse in patch space, while passive rational immittances advance as bilinear-transformed biquads. The outer grid uses the same eight-cell split-field PML family as the other FDTD paths.
+
+The analytic ladder is the correctness authority because no reference implementation is available. Committed renderer bytes under `gen/immersed/` are a deterministic change detector, not an independent physics reference.
+
+## The ladder
+
+`build/ImmersedTest --gate` runs the bounded configuration below. Longer 20,000-step energy and 40,000-step noise modes remain available under their individual flags.
+
+| rung | measure | result | gate |
+|---|---|---:|---:|
+| bilinear filters | worst relative frequency-response error across constants, `a+bs+c/s`, and its reciprocal | 3.401e-13 | at most 1e-12 |
+| 1D barrier | fitted reflection / transmission for `zv=10`, targets 0.909091 / 0.090909 | 0.908128 / 0.091872 | coefficient error at most 0.005 |
+| 1D leakage | fitted order under timestep refinement | 1.048 | 0.8–1.2 |
+| free field | Gaussian monopole at three off-grid receivers | 40.33 dB SNR | at least 15 dB |
+| null operators | zero state with finite, rigid, and release surfaces / nonzero constant pressure with passive and rigid surfaces | exact / exact | exact |
+| host reference | complete 12-step reactive patch, host double versus Metal fp32 | 1.926e-7 relative | at most 2e-6 |
+| limiting projections | rigid interpolated normal velocity / release interpolated pressure | 6.756e-14 / 1.882e-11 | 1e-10 / 1e-7 |
+| exact sphere series | free-space reduction / rigid derivative residual / release pressure residual | 1.497e-11 / 3.026e-16 / 2.372e-16 | 1e-10 / 1e-12 / 1e-12 |
+| lossless energy | host double / Metal fp32 drift over 2,000 steps | 7.332e-15 / 4.389e-7 | 1e-12 / 1e-4 |
+| near-CFL noise | worst positive fitted rate across six rigid, resonant, and transmitting legs | +0.0073 dB per 1,000 steps | at most +0.05 |
+| sphere | Eq. 34 errors at the nine boundary/receiver combinations | 0.0243–0.4645 | per-case recorded ceilings |
+| convergence subset | receiver-C error at 10 / 20 / 40 kHz | 0.883261 / 0.340868 / 0.120455 | below 1.0 / 0.4 / 0.16 and decreasing by at least 2x |
+| interpolants | receiver-C error, linear / cubic / quintic | 0.3008 / 0.2525 / 0.2441 | quintic < cubic < linear |
+| staircasing | receiver-C error, immersed / solid cells | 0.2441 / 0.7468 | immersed at least 1.25x better |
+| rigid square | image-solution error at 0 / 30 / 45 degrees | 0.0263 / 0.0294 / 0.0387 | at most 0.06 |
+| rigid square leakage | prediffraction far/near peak at 0 / 30 / 45 degrees | 0.0085 / 0.0123 / 0.0191 | at most 0.03 |
+| transmitting square | fitted complex transfer below 2.5 kHz for `zv=1`, target 0.5 | 0.5232 + 0.0302i | complex error at most 0.06 |
+
+The full 20,000-step lossless sphere drifts by 1.703e-14 in host double and 3.647e-6 on Metal. The bounded gate shortens that rung and each noise-soak leg so the complete gate remains an interactive check.
+
+## The reproduced figures
+
+Receiver traces for the two bounded renderer scenes are committed beside their metadata under `gen/immersed/`. The float64 tables under `gen/immersed/figures/` are generated directly by the analytic harness; they contain the full convergence sweep and 50 kHz sphere and barrier measurements. The table reports those metrics rather than judging plots by eye.
+
+| paper result | configuration | measured result |
+|---|---|---|
+| Bilbao 2023 Fig. 8 | 0.25 m sphere, source at `(0,0,0.4)`, receivers A/B/C, 50 kHz | rigid 0.0149 / 0.0339 / 0.0861, release 0.0082 / 0.0226 / 0.0858, resistive 0.0094 / 0.0245 / 0.0488 Eq. 34 error |
+| Bilbao 2023 Fig. 9 | rigid sphere, receiver C, 10–75 kHz in 5 kHz steps | error falls from 0.883261 to 0.048104, full-sweep slope 1.466, gate-subset slope 1.437 |
+| Bilbao 2023 Fig. 5 | 1 m rigid square at 50 kHz before edge diffraction | image error 0.0120 / 0.0228 / 0.0345 at 0/30/45 degrees |
+| Bilbao 2023 Fig. 6 | `zv=1`, `yp=0` transmitting square at 50 kHz | fitted transfer below 2.5 kHz is 0.5278 + 0.0274i, complex error 0.0391 from the 0.5 limit |
+| Bilbao 2022 Fig. 10 | rigid sphere, receiver C | immersed error 0.2441, staircased solid-cell error 0.7468 |
+| Bilbao 2022 Fig. 12 | lossless `b=0.0005`, `c=500` sphere | 1.703e-14 host drift over 20,000 steps |
+
+## Departures from the papers, and why
+
+- The finite computational domain ends in an eight-cell Liu–Tao split PML instead of the papers' first-order absorbing condition. The free-field rung measures the complete source, grid, receiver, and PML chain at 40.33 dB SNR.
+- Sphere centroids use a deterministic equal-area golden-angle spiral with exact total area and exact radial normals. This preserves the equal-area property used by the 3D paper but is not Koay's analytically exact spiral construction.
+- Rigid and pressure-release immittances use their exact patch-space projections. Large finite constants lose useful fp32 precision and make the limiting constraint depend on an arbitrary number.
+- The Gaussian width is `sqrt(12 ln 10)/(2 pi f60)`. This makes the spectral amplitude reach 1e-6 at `f60`; the one-dimensional paper's printed expression differs by a factor of two from that stated bandwidth condition.
+- The sphere series selects at least 100 modes and increases with the largest radial argument rather than fixing 150 modes. Its free-field reduction and boundary residuals set the accuracy directly.
+- The committed scenes run at 25 kHz and use patch widths of 0.03 m for the sphere and 0.04 m for the square. They keep the deterministic gate under a minute while the on-demand harness owns refinement and longer stability checks.
+- The analytic figure harness fixes the paper's 2.2 m physical span and chooses an integer number of grid intervals, so its Courant number varies slightly around 0.5754 as resolution changes.
+- The 10–75 kHz sweep fits order 1.466 and its 10/20/40 kHz subset fits 1.437. The paper describes Figure 9 qualitatively as first-order but does not publish a fitted slope or tabulated values, so the tables preserve the measured curve without imposing a 0.8–1.2 fit gate.
+
+## Scope
+
+The solver covers static exterior surfaces and finite barriers. JSON scenes accept spheres, subdivided squares, and triangle meshes loaded through `RadiationMesh`; each patch carries a rational `a+bs+c/s` impedance and an independent admittance, including reciprocal, rigid, and pressure-release forms. Moving surfaces are outside this implementation because their patch-space factors would change every step. The pressure-only second-order reformulation proposed by the 3D paper is also outside scope.
+
+Immersed boundaries are not the outer walls of room scenes here. Bilbao 2022 reports enclosure leakage on the order of 1–3 dB per second, dependent on bandwidth and forcing density. The finite-volume staircase path under `src/Room/` remains the conservative room-boundary solver.
+
+The dense inverse costs `4 K^2` bytes on the GPU. A 12,000-patch surface therefore consumes 576 MB for one fp32 inverse before its sparse interpolation tables and state. Setup rejects a limiting projection whose host-double infinity-norm condition estimate exceeds 1e8.
+
+## What the step costs
+
+The 128³ interior pair takes 0.133 ms against 0.089 ms for a matched two-pass stream over the same four arrays: 755.1 GB/s and 66.6% of that stream ceiling. The surface work is dominated by two dense patch-space matrix-vector products in the small committed scenes.
+
+| 25 kHz scene | cells | patches | free step | immersed step | IB overhead |
+|---|---:|---:|---:|---:|---:|
+| sphere | 59³ | 873 | 0.013 ms | 0.319 ms | 2353% |
+| barrier | 67×67×59 | 625 | 0.019 ms | 0.525 ms | 2696% |
+
+These timings alternate the free and immersed steppers in one process and report median GPU timestamps after warmup. The percentages describe the deliberately small regression grids. They are not a grid-scale throughput claim.
+
+## The regression gate
+
+```
+script/ValidateImmersed
+script/ValidateImmersed --exact
+script/ValidateImmersed --score
+script/ValidateImmersed --update
+```
+
+The script first runs `ImmersedTest --gate`, then renders `config/ImmersedSphere.json` and `config/ImmersedBarrier.json`. Normal scoring allows 90 dB against the committed machine-local float32 references; `--exact` requires byte identity. `--update` also reruns the full on-demand figure measurements and takes several minutes. Both 113×3 renders are byte-identical across repeated runs, and the complete exact gate takes about 17 seconds warm.

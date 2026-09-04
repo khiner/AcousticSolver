@@ -1,0 +1,13 @@
+{
+  "columns": [
+    "steps",
+    "host_relative_drift",
+    "metal_relative_drift"
+  ],
+  "dtype": "float64 little-endian",
+  "paper": "Bilbao 2022, Figure 12",
+  "shape": [
+    1,
+    3
+  ]
+}

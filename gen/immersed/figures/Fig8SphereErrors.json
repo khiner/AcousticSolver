@@ -1,0 +1,18 @@
+{
+  "columns": [
+    "receiver_a",
+    "receiver_b",
+    "receiver_c"
+  ],
+  "dtype": "float64 little-endian",
+  "paper": "Bilbao 2023, Figure 8",
+  "rows": [
+    "rigid",
+    "release",
+    "resistive"
+  ],
+  "shape": [
+    3,
+    3
+  ]
+}

@@ -1,5 +1,5 @@
 # AcousticSolver
-Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), and room impulse responses with impedance walls (Bilbao/Hamilton FDTD).
+Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), room impulse responses with impedance walls (Bilbao/Hamilton FDTD), and immersed impedance surfaces and transmitting barriers.
 Each is validated against its reference implementation or an analytic ladder — see [VALIDATION.md](VALIDATION.md).
 
 ## WaveBlender
@@ -104,3 +104,21 @@ script/RenderRoomWavs
 
 Raw differentiated-pressure receiver rows are written to `build/room/<output>.bin`, with the sample rate in the adjacent JSON file.
 `script/RenderRoomWavs` applies the reference post-processing and writes normalized 48 kHz WAVs under `gen/wav/room/`.
+
+## Immersed boundaries
+
+`src/Immersed/` places static sphere, square, and triangle-mesh surfaces directly on a staggered pressure/velocity grid without voxelizing them. Surfaces may be rigid, pressure-release, passive rational impedances or admittances, or transmitting barriers. The numerical method combines Bilbao's [one-dimensional impedance/barrier formulation](https://doi.org/10.1121/10.0017763), its [three-dimensional extension](https://doi.org/10.1121/10.0020635), and the interpolation and energy construction from the [earlier virtual-acoustics method](https://doi.org/10.1121/10.0009768).
+
+Scenes specify the medium, grid, PML, surfaces, Gaussian volume-velocity source, and receivers in JSON. Receiver samples are float32 and interleaved by receiver within each timestep. The adjacent JSON records the sample rate, receiver positions, dimensions, and source scene.
+
+```
+build/AcousticSolver --immersed config/ImmersedSphere.json
+build/AcousticSolver --immersed config/ImmersedBarrier.json --seconds 0.003 --output short_barrier
+build/ImmersedTest --gate
+build/ImmersedTest --energy
+build/ImmersedTest --soak
+script/ValidateImmersed
+script/ValidateImmersed --exact
+```
+
+Outputs land under `build/immersed/<output>.bin`. `script/ValidateImmersed` runs the analytic ladder and scores the two short committed scenes against `gen/immersed/`; `--exact` requires byte identity. [VALIDATION.md](VALIDATION.md) owns the measured errors, stability bounds, implementation departures, and performance results.

@@ -1,0 +1,15 @@
+{
+  "columns": [
+    "target",
+    "real",
+    "imaginary",
+    "magnitude",
+    "complex_error"
+  ],
+  "dtype": "float64 little-endian",
+  "paper": "Bilbao 2023, Figure 6",
+  "shape": [
+    1,
+    5
+  ]
+}

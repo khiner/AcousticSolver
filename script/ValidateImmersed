@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+build_dir = os.path.join(root, "build")
+output_dir = os.path.join(build_dir, "immersed")
+reference_dir = os.path.join(root, "gen", "immersed")
+figure_dir = os.path.join(reference_dir, "figures")
+default_scenes = ["ImmersedSphere", "ImmersedBarrier"]
+snr_floor = 90.0
+
+parser = argparse.ArgumentParser()
+parser.add_argument("scenes", nargs="*")
+parser.add_argument("--score", action="store_true", help="score existing renders without running them")
+parser.add_argument("--exact", action="store_true", help="require byte-identical output")
+parser.add_argument("--update", action="store_true", help="replace references and rerun the full figure measurements")
+parser.add_argument("--floor", type=float, default=snr_floor, help=f"SNR floor in dB (default {snr_floor})")
+args = parser.parse_args()
+scenes = args.scenes or default_scenes
+failures = 0
+
+if not args.score:
+    print("=== ladder ===", flush=True)
+    failures += subprocess.run(["./ImmersedTest", "--gate"], cwd=build_dir).returncode != 0
+
+for scene in scenes:
+    print(f"=== {scene} ===", flush=True)
+    config = os.path.join(root, "config", scene + ".json")
+    if not args.score:
+        started = time.time()
+        run = subprocess.run(
+            ["./AcousticSolver", "--immersed", os.path.relpath(config, build_dir)],
+            cwd=build_dir,
+            capture_output=True,
+            text=True,
+        )
+        os.makedirs(os.path.join(build_dir, "logs"), exist_ok=True)
+        with open(os.path.join(build_dir, "logs", scene + ".immersed.log"), "w") as log:
+            log.write(run.stdout + run.stderr)
+        if run.returncode:
+            print(f"  SOLVER FAILED (exit {run.returncode}) in {time.time() - started:.1f}s")
+            print("  " + "\n  ".join((run.stdout + run.stderr).splitlines()[-5:]))
+            failures += 1
+            continue
+        print(f"  rendered in {time.time() - started:.1f}s")
+
+    got_path = os.path.join(output_dir, scene + ".bin")
+    got_meta = os.path.join(output_dir, scene + ".json")
+    want_path = os.path.join(reference_dir, scene + ".bin")
+    want_meta = os.path.join(reference_dir, scene + ".json")
+    if not os.path.exists(got_path) or not os.path.exists(got_meta):
+        print("  NO OUTPUT -- render this scene first")
+        failures += 1
+        continue
+    if args.update:
+        os.makedirs(reference_dir, exist_ok=True)
+        shutil.copyfile(got_path, want_path)
+        shutil.copyfile(got_meta, want_meta)
+        print(f"  reference updated ({os.path.getsize(got_path)} bytes)")
+        continue
+    if not os.path.exists(want_path):
+        print("  NO REFERENCE -- record one with --update")
+        failures += 1
+        continue
+    with open(got_meta) as metadata:
+        meta = json.load(metadata)
+    got = np.fromfile(got_path, dtype=np.float32)
+    want = np.fromfile(want_path, dtype=np.float32)
+    if got.shape != want.shape:
+        print(f"  LENGTH MISMATCH {got.size} vs {want.size}")
+        failures += 1
+        continue
+    identical = bool(np.array_equal(got, want))
+    error = np.linalg.norm(got.astype(np.float64) - want.astype(np.float64))
+    snr = float("inf") if error == 0 else 20 * np.log10(np.linalg.norm(want.astype(np.float64)) / error)
+    ok = identical if args.exact else snr >= args.floor
+    failures += not ok
+    verdict = "identical" if identical else f"SNR {snr:.1f} dB"
+    print(f"  {'OK' if ok else 'FAIL'}  {verdict}  {meta['samples']} x {meta['receivers']} at {meta['sample_rate']:.1f} Hz")
+
+if args.update and not failures:
+    print("\n=== figure tables ===", flush=True)
+    failures += subprocess.run(["./ImmersedTest", "--figures", figure_dir], cwd=build_dir).returncode != 0
+elif not args.update:
+    print(f"\n{'FAIL' if failures else 'PASS'} ({failures} failures)")
+sys.exit(1 if failures else 0)

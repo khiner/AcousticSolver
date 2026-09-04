@@ -41,11 +41,21 @@ set(ROOM_SOURCES
     src/Room/RoomImplicitScene.cpp
     src/Room/RoomScene.cpp)
 
+set(IMMERSED_SOURCES
+    src/Immersed/ImmersedDelta.cpp
+    src/Immersed/ImmersedExact.cpp
+    src/Immersed/ImmersedGeometry.cpp
+    src/Immersed/ImmersedGpu.cpp
+    src/Immersed/ImmersedImmittance.cpp
+    src/Immersed/ImmersedScene.cpp)
+
 # Kernels are compiled at runtime from these sources (KernelParams.h + Kernels.metal, and
 # each other solver's Params header + kernels). macOS caches the compilation, so warm-start
 # compiles are ~1 ms (see startup/msl_compile under ACOUSTIC_PROFILE).
 set(MSL_DEFINITIONS
+    ACOUSTIC_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
     ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/FDTD"
+    ACOUSTIC_IMMERSED_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Immersed"
     ACOUSTIC_RADIATION_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Radiation"
     ACOUSTIC_ROOM_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Room")
 
@@ -59,8 +69,9 @@ add_library(AcousticCore STATIC
     src/Metal/MetalContext.cpp
     ${RADIATION_SOURCES}
     ${ROOM_SOURCES}
+    ${IMMERSED_SOURCES}
 )
-target_include_directories(AcousticCore PUBLIC src src/FDTD src/Metal src/Radiation src/Room)
+target_include_directories(AcousticCore PUBLIC src src/FDTD src/Immersed src/Metal src/Radiation src/Room)
 target_include_directories(AcousticCore SYSTEM PUBLIC src/external ${metalcpp_SOURCE_DIR})
 target_compile_definitions(AcousticCore PUBLIC ${MSL_DEFINITIONS})
 target_link_libraries(AcousticCore PUBLIC "-framework Metal" "-framework Foundation" "-framework Accelerate")
@@ -83,3 +94,6 @@ target_link_libraries(RadiationTest PRIVATE AcousticCore)
 # The room solver's validation harness (see src/Room/RoomTest.cpp for the test ladder).
 add_executable(RoomTest src/Room/RoomTest.cpp)
 target_link_libraries(RoomTest PRIVATE AcousticCore)
+
+add_executable(ImmersedTest src/Immersed/ImmersedTest.cpp)
+target_link_libraries(ImmersedTest PRIVATE AcousticCore)

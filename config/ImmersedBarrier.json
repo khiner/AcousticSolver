@@ -1,0 +1,40 @@
+{
+  "grid": {
+    "extent": [1.6, 1.6, 1.4],
+    "sample_rate": 25000,
+    "courant": 0.5754
+  },
+  "medium": {
+    "c": 344,
+    "rho": 1.18
+  },
+  "pml_width": 8,
+  "interpolation_order": 5,
+  "surfaces": [
+    {
+      "type": "square",
+      "center": [0, 0, 0],
+      "rotation": [0, 0.5235987755982988, 0],
+      "side": 1.0,
+      "patch_size": 0.04,
+      "zv": {
+        "a": 0.1,
+        "b": 0.0005,
+        "c": 500
+      },
+      "yp": "1/zv"
+    }
+  ],
+  "source": {
+    "position": [0, 0, 0.3],
+    "f60": 4000,
+    "umax": 0.001
+  },
+  "receivers": [
+    [0, 0, 0.2],
+    [0.2, 0, 0.2],
+    [0, 0, -0.3]
+  ],
+  "seconds": 0.0045,
+  "output": "ImmersedBarrier"
+}

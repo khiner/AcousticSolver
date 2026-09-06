@@ -1460,3 +1460,103 @@ script/ValidateImmersed --update
 ```
 
 The script first runs `ImmersedTest --gate`, then renders `config/ImmersedSphere.json` and `config/ImmersedBarrier.json`. Normal scoring allows 90 dB against the committed machine-local float32 references; `--exact` requires byte identity. `--update` also reruns the full on-demand figure measurements and takes several minutes. Both 113×3 renders are byte-identical across repeated runs, and the complete exact gate takes about 17 seconds warm.
+
+# Curved tetrahedral DG
+
+The current solver implements strong–weak acoustics with conservation-preserving
+WADG on conforming curved tetrahedra with rigid walls. Full-mass and WADG FP64
+implementations check geometry, mass, spatial loads, and factorization before
+exporting FP32 tables for the native Metal solver.
+[Method, formats, and run instructions](src/Dg/README.md)
+are maintained alongside the code; current timing results are in [README.md](README.md#curved-tetrahedral-dg).
+
+## Independent acoustic solution
+
+For cylinder radius `R`, height `L = 1 m`, sound speed `c = 343 m/s`, density
+`rho = 1.2 kg/m³`, and the first positive zero `alpha = 3.8317059702075125` of `J1`:
+
+```text
+phi(x,y,z) = J0(alpha sqrt(x²+y²)/R) cos(pi z/L)
+k = sqrt((alpha/R)² + (pi/L)²)
+p(x,t) = 2 + phi(x) cos(c k t)
+rho c v(x,t) = -grad(phi(x))/k sin(c k t)
+```
+
+This solves both acoustic equations with rigid side and end walls.
+`DgReference check` checks the Bessel root, wall derivatives, regular axis
+limit, Helmholtz equation, and time-dependent equations. Physical error scoring
+integrates `(p-2, rho*c*v)` against the exact field with independent Duffy–Gauss
+quadrature; the stationary pressure is excluded from the denominator.
+The two fixtures use degree 6 / 70 elements at radius 1 m and degree 4 / 560
+elements at radius 0.5 m. Each advances 1,024 steps of `2^-18 s`.
+
+## Regression gates
+
+- Analytic terminal acoustic field error below `1e-3`
+- FP32 state and receiver-fluctuation differences from frozen FP64 below `2e-5`, with state measured in the FP64 modified mass norm
+- Random mass application relative error below `2e-5`; initial/random RHS errors below `2e-5` scaled by `max(norm(reference_rhs), c*norm(state))`
+- Exactly zero constant-pressure RHS
+- Modified energy at most `1.00001` times initial energy and physical mean drift below `1e-5` of initial acoustic RMS, sampled every 64 steps
+- Bitwise-identical repeated terminal states and receiver records, with matching sample clocks
+
+The Metal suite additionally checks halved timestep, an 8,192-step analytic
+trajectory, four disconnected mesh copies, an odd-element constant-state case,
+the original mass quadrature, and rejection of inconsistent spatial matrices.
+
+Only mass quadrature is reduced: 16³ to 12³ points for degree 6 and 12³ to 9³
+for degree 4. With original modified mass `H = C C^T`, each selected inverse `A`
+requires `max|eig(C^T A C)-1| < 1e-6`, positive Jacobians/masses, and constant-moment
+error below `1e-10`. These are fixture-specific choices, not universal defaults.
+Spatial assembly and independent scoring retain their original quadratures.
+
+## Upstream native CUDA benchmark
+
+[DG usage](src/Dg/README.md#upstream-cuda-comparison) records the upstream pin,
+patch scope, and reproduction commands. The upstream build uses Ubuntu 24.04,
+GCC 13.3, CUDA 12.8, and driver 580.126.16. Both solvers propagate in FP32, with
+upstream fast math retained and Metal fast math off. Hardware, power conditions,
+and timing scope are reported with the [timing table](README.md#curved-tetrahedral-dg).
+
+The workloads share mesh topology/order, nodal initial pressure, zero initial
+velocity, receiver interpolation, rigid boundaries, and five-stage LSERK4 clocks:
+
+| Problem | Initial pressure | Receivers | Timestep | Steps |
+| --- | --- | --- | ---: | ---: |
+| Unit cube, degree 4, 100 affine tetrahedra | `2 exp(-norm(x-(.5,.5,.5))²/.4²)` | `(.1,.1,.1)`, `(.7,.2,.4)` | `2^-15 s` | 656 |
+| Unit cylinder, degree 6, 70 tetrahedra (56 curved) | `2 exp(-norm(x-(0,0,.5))²/.8²)` | `(.75,0,.75)` | `2^-17 s` | 65,536 |
+
+Sound speed is `343 m/s`, density is `1.2 kg/m³`. The cylinder is generated with
+Gmsh 4.15.2; it is not the upstream stock degree-8 mesh. Upstream prepares its
+geometry in FP32. WADG assembles the same mesh in FP64 and rounds its operators
+to FP32. Its mass quadratures, 9³ points for the cube and 12³ for the cylinder,
+pass the existing spectral/moment gates against full quadrature: relative inverse
+mass errors `7.5e-14` and `1.94e-7`, respectively. Spatial assembly is unchanged.
+
+The cube agrees between GPU implementations within `2.46e-6` in terminal physical
+mass norm and `1.37e-6` over complete receiver records. Against an independent rigid
+cube cosine-series solution, both have receiver errors of `3.22%` and `1.06%` over
+256 distributed sample times; 48-versus-80-mode truncation is below `0.085%`.
+This coarse Gaussian case is a smoke test, not the retained cylinder eigenmode's
+`0.1%` analytic accuracy fixture.
+
+On the degree-6 cylinder, CUDA remains bounded over 0.5 s. Its terminal physical
+energy ratio is `0.999516`, versus Metal's `0.998767`. However, CUDA's physical mean
+drift is `1.24e-4` of initial acoustic RMS, exceeding our `1e-5` conservation gate;
+Metal's maximum sampled drift is `6.11e-7`. Terminal physical fields differ by
+`0.526%` and full receiver records by `0.191%`. Against a fresh dense FP64 WADG
+trajectory, Metal's terminal field and full receiver errors are `1.10e-5` and
+`3.09e-6`, below the existing `2e-5` precision tolerance. CUDA's corresponding
+differences are `0.525%` and `0.191%`; its spatial formulation differs from that
+reference.
+Separate Metal diagnostic runs sample energy/mean every 64 steps and produce
+exactly the same terminal/receiver bytes as benchmark mode. Repeated CUDA and
+Metal records are byte-identical, and sample clocks agree exactly.
+
+The benchmark covers the generated degree-6 cylinder. The stock degree-8 mesh
+exceeds the current FP32 initial-RHS tolerance and is outside this validated scope.
+Energy stability requires an appropriate spatial formulation independently of
+weight-adjusted mass inversion.
+
+Source/scene integration and frequency-dependent walls are unimplemented. The
+tests cover the retained meshes and stated schedules; they do not establish a
+general timestep bound, per-stage energy theorem, or broad-domain convergence.

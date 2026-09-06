@@ -1,0 +1,40 @@
+{
+  "scalar_bytes": 8,
+  "index_bytes": 4,
+  "elements": 70,
+  "degree": 6,
+  "nodes_per_element": 84,
+  "nodes_per_face": 28,
+  "fields": 4,
+  "curved_elements": 70,
+  "receivers": 2,
+  "geometry": {
+    "radius": 1,
+    "height": 1.0
+  },
+  "density": 1.2,
+  "sound_speed": 343.0,
+  "provenance": {
+    "gmsh": "4.15.2",
+    "nodes_sha256": "f4ca313c70393ff2a3cba2559f7847bc0ef61e87ecbd74f4f7824a4d66c13a78",
+    "generator_sha256": "c4f42ff8d1869bf64fc65ea61631c2164cdc02bb83d64c5c9d237f0bacd76dfa",
+    "analytic_sha256": "405b2754231f62a50a9afadcb3f78ee0e072e74fedc94d8594ec0cf3a9cd3fed"
+  },
+  "initial_condition": "cylinder_mode",
+  "receiver_elements": [
+    15,
+    27
+  ],
+  "receiver_xyz": [
+    [
+      0.3,
+      0.2,
+      0.3
+    ],
+    [
+      0.7,
+      0.1,
+      0.65
+    ]
+  ]
+}

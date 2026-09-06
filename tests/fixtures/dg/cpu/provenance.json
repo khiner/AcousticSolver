@@ -1,0 +1,57 @@
+{
+  "torch": "2.11.0",
+  "device": "CPU",
+  "formulation": "strong-weak acoustic DG; weight-adjusted mass; rigid walls",
+  "energy_norm": "inverse of the weight-adjusted inverse mass",
+  "mean_pressure_measure": "original physical mass",
+  "scaled_state": "pressure, rho*c*velocity",
+  "implementation": "dense precomposition for numerical verification",
+  "jacobian": "projected",
+  "implementation_sha256": {
+    "wadg.py": "47c0d5ad893d33a1191a2b479b49c54f8e86373c91a750db6eacb93228c03392",
+    "full_mass.py": "f1cced4dd63b8c82c2e0af44e095b87a314a2dc2c9b98b958dfa3f4e899d049c",
+    "curved_energy.py": "ff6c88c7096fdd02daeef1a97a7e234d1fc6fab060af5a93126934677f93ef18",
+    "analyze_curved.py": "cfb17d2c2b4ce800a132f4afd84d3e537cecb610d8d35dd03163861d225f6855",
+    "tetrahedral_basis.py": "82e0131e9e18e81a6075f7409dd58ae553aa84134d2bb6a3f8b69d48b7d5c462"
+  },
+  "shared_input_sha256": {
+    "rkc.bin": "5d3a53c6d34a501efe08267b5707b4a60a9fa2a0372feb9491b26e1ae19bf249",
+    "rkb.bin": "9445a356aa51354ee9894022393f8e89e0588a5540e82f3ef3f0ca33c6738d83",
+    "rka.bin": "da0dd88d4e7de08143aca9dc96c654d6b47b5e137513c014aa409a984f6c6c5d",
+    "receiver_ids.bin": "01acecb507abfe1a354aa8064f4af5d3f1acd019e37db3c11c97523b71c76e9d"
+  },
+  "cases": {
+    "r0.5_l1_p4": {
+      "quadrature": 12,
+      "nodes_sha256": "fb1552a918fc55a70b9a2583f41c54cbf1abe45c7fa63b05d6f39242df592b81",
+      "input_sha256": {
+        "vmapP.bin": "b2d8e78fb92cfb60cd64decd615036be05dbe21b6ea0b08b40d7e5b83af8ec97",
+        "EToB.bin": "af93eaf9c47f6ed09cae22d0a181f51ace23deef673629f8f7ee412f45651d38",
+        "z.bin": "4d447d06841246251df242e70d00352a86359237410297f2604b54028ef8ee11",
+        "x.bin": "ae2aa6126db671e8c18626f6801db17ee21d493b22c0b83cbc42e4c185a832d3",
+        "y.bin": "fa38d410ebea87f924a1dcddd0d8731382ad9cba5925fa01d8b25766513ccbdb",
+        "initial_q.bin": "89930f2de6b6c76805e111eb0ed6af4c1cdce1353dc08b4df4b650a2bac9234b",
+        "receiver_elements.bin": "4b1ac13afbef6d52ba8a9c370282d8cc0f19c0f2ee631a5d3c59e0b86772ff36",
+        "receiver_interpolation.bin": "e8142910bae13e2f9bc2843470d70672a39efc0c8e9fda8be0153f31a8ed32fb",
+        "receiver_xyz.bin": "27c9bc05e6b087f376fc7752da2be54276888d916262d8d7c8e179f2072bc54f",
+        "vmapM.bin": "de3f70dc0882dc8305f1f7da2cee69c547b53bf3dc160d5d4dc2225afb271783"
+      }
+    },
+    "r1_l0_p6": {
+      "quadrature": 16,
+      "nodes_sha256": "f4ca313c70393ff2a3cba2559f7847bc0ef61e87ecbd74f4f7824a4d66c13a78",
+      "input_sha256": {
+        "vmapP.bin": "397d7fd518b9d73217f3493100097d162e96400ebfcb2a0d24aa12031b4cc6f0",
+        "EToB.bin": "eb22df374116072d2cba2afaccaf43814184efcbef9a9f557ac937c333468b95",
+        "z.bin": "1af0cd6f54ace4458d32c16ad6f439aca1936c0eda4edbef1a0950f3943c019d",
+        "x.bin": "65254a4bf953b654d9914f06b4635b694b324cd9746f7dc21d2bc041156a696d",
+        "y.bin": "6d7337e882b8c1cf128f89e010ba73697871a092a2d280e6483c97bca8fa57c4",
+        "initial_q.bin": "e38d91e75e69dfe3188463ff9ababfdb2dfa9d7f096d5316f3a6dfdf7b458899",
+        "receiver_elements.bin": "6f77ee13901d364954246e2d6e8c1534132e69255705379b506cc7b8eb655c97",
+        "receiver_interpolation.bin": "7094de3504825bb73130b2f73d17e1232825db1ab62839a4b14326b5f82857b4",
+        "receiver_xyz.bin": "873147f74571dcbcbfdcad914d408eac7d3f492dba0456708cb82f4ad61ef227",
+        "vmapM.bin": "e70681053081814169e773c23f9fb28126aeb702c6e4447a7fdad9d6fc12cebb"
+      }
+    }
+  }
+}

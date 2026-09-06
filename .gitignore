@@ -2,3 +2,4 @@ __pycache__/
 build/
 Scenes
 /room/
+/gen/dg-*/

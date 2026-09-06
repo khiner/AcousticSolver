@@ -97,3 +97,13 @@ target_link_libraries(RoomTest PRIVATE AcousticCore)
 
 add_executable(ImmersedTest src/Immersed/ImmersedTest.cpp)
 target_link_libraries(ImmersedTest PRIVATE AcousticCore)
+
+add_executable(DgTest src/Dg/DgTest.cpp src/Dg/DgGpu.cpp)
+target_compile_definitions(DgTest PRIVATE ACOUSTIC_DG_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Dg")
+target_link_libraries(DgTest PRIVATE AcousticCore)
+
+add_executable(DgReference src/Dg/DgReference.cpp src/Dg/DgReferenceMain.cpp)
+target_include_directories(DgReference SYSTEM PRIVATE src/external)
+target_compile_definitions(DgReference PRIVATE ACOUSTIC_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}" EIGEN_USE_BLAS)
+target_compile_options(DgReference PRIVATE -ffp-contract=off)
+target_link_libraries(DgReference PRIVATE "-framework Accelerate")

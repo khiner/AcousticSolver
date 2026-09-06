@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/dtu-act/libparanumal",
+  "commit": "f08c22f83fd64605a634b94326f07cb88f00b0ef",
+  "note": "Nodal coordinates extracted from upstream tables, stored as one r s t row per node. Parsed coordinates are byte-identical to the upstream values. Unrelated differentiation and quadrature tables omitted.",
+  "files": {
+    "tetN04.dat": {
+      "upstream_sha256": "fb1552a918fc55a70b9a2583f41c54cbf1abe45c7fa63b05d6f39242df592b81",
+      "subset_sha256": "24683a53f8a3f064a240860d928df2e4c92aff8643f8e543d29159faa449d297"
+    },
+    "tetN06.dat": {
+      "upstream_sha256": "f4ca313c70393ff2a3cba2559f7847bc0ef61e87ecbd74f4f7824a4d66c13a78",
+      "subset_sha256": "0dca4e3cc37f3dd3ebf4f2de7cde5b11dff2b2064697653f3f0c0d58cd3316f7"
+    }
+  }
+}

@@ -1,5 +1,5 @@
 # AcousticSolver
-Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), room impulse responses with impedance walls (Bilbao/Hamilton FDTD), and immersed impedance surfaces and transmitting barriers.
+Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), room impulse responses with impedance walls (Bilbao/Hamilton FDTD), immersed impedance surfaces and transmitting barriers, and curved tetrahedral DG.
 Each is validated against its reference implementation or an analytic ladder — see [VALIDATION.md](VALIDATION.md).
 
 ## WaveBlender
@@ -122,3 +122,26 @@ script/ValidateImmersed --exact
 ```
 
 Outputs land under `build/immersed/<output>.bin`. `script/ValidateImmersed` runs the analytic ladder and scores the two short committed scenes against `gen/immersed/`; `--exact` requires byte identity. [VALIDATION.md](VALIDATION.md) owns the measured errors, stability bounds, implementation departures, and performance results.
+
+## Curved tetrahedral DG
+
+`src/Dg/` implements the rigid-wall acoustics subset of Melander et al.'s [Massively parallel nodal discontinous Galerkin finite element method simulator for room acoustics](https://doi.org/10.1177/10943420231208948) in Metal. It uses energy-stable weight-adjusted discontinuous Galerkin (WADG) on curved tetrahedral meshes with FP32 kernels. It currently consumes prepared operator tables and retains dense spatial matrices; source and scene integration remain future work.
+
+```sh
+cmake --build build --target DgTest DgReference -j 6
+build/DgReference prepare build/dg-inputs
+build/DgTest build/dg-inputs/reduced/degree6/q12 build/dg-metal-check
+```
+
+See [DG usage](src/Dg/README.md) for options and file formats, and [validation](VALIDATION.md#curved-tetrahedral-dg) for accuracy and stability checks.
+
+Native FP32 propagation on matching meshes, initial fields, receivers, and LSERK4 timesteps. CUDA runs [DTU/libParanumal](https://github.com/dtu-act/libparanumal/tree/f08c22f83fd64605a634b94326f07cb88f00b0ef)'s original numerical kernels on an A100-SXM4-80GB; Metal runs our strong–weak WADG formulation on an Apple M5 Max. The upstream build has portability, input/output, and timing patches; its numerical kernels and RK stage routine are unchanged.
+
+| Problem | Steps | Simulated time | Upstream CUDA | Metal WADG |
+| --- | ---: | ---: | ---: | ---: |
+| Rigid unit cube, degree 4, 100 elements | 656 | 20.0195 ms | 0.07185 s | 0.07748 s |
+| Rigid unit cylinder, degree 6, 70 elements | 65,536 | 500 ms | 8.031 s | 19.7 s |
+
+Median wall time of four warmed runs, covering propagation and receiver sampling only. Metal used reduced mass quadrature and ran on battery in Automatic mode, with nominal thermal pressure before and after each run.
+
+The cube implementations agree within `2.5e-6` in terminal physical field norm. On the curved cylinder, upstream remains bounded but differs from WADG by about `0.53%` and exceeds our mean-conservation tolerance. This is a comparison of the stated methods and implementations, with accuracy assessed separately. [Reproduce the comparison](src/Dg/README.md#upstream-cuda-comparison); [numerical results and limits](VALIDATION.md#upstream-native-cuda-benchmark).

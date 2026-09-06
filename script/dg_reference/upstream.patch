@@ -1,0 +1,232 @@
+--- a/include/types.h
++++ b/include/types.h
+@@ -26,7 +26,7 @@
+ 
+ 
+ //float data type
+-#if 0
++#if 1
+ #define dfloat float
+ #define MPI_DFLOAT MPI_FLOAT
+ #define dfloatFormat "%f"
+--- a/occa/include/occa/modes/threads/headers.hpp
++++ b/occa/include/occa/modes/threads/headers.hpp
+@@ -23,7 +23,7 @@
+ #include <occa/defines.hpp>
+ 
+ #if (OCCA_OS & (OCCA_LINUX_OS | OCCA_MACOS_OS))
+-#  if (OCCA_OS != OCCA_WINUX_OS)
++#  if (OCCA_OS & OCCA_MACOS_OS)
+ #    include <sys/sysctl.h>
+ #  endif
+ #  include <pthread.h>
+--- a/occa/src/tools/sys.cpp
++++ b/occa/src/tools/sys.cpp
+@@ -34,7 +34,9 @@
+ #  include <sys/types.h>
+ #  include <sys/stat.h>
+ #  include <sys/syscall.h>
+-#  include <sys/sysctl.h>
++#  if (OCCA_OS & OCCA_MACOS_OS)
++#    include <sys/sysctl.h>
++#  endif
+ #  include <sys/time.h>
+ #  include <unistd.h>
+ #  if (OCCA_OS & OCCA_LINUX_OS)
+--- a/solvers/acoustics/src/acousticsSetup.c
++++ b/solvers/acoustics/src/acousticsSetup.c
+@@ -487,6 +487,13 @@
+     mesh->dt = mesh->finalTime / mesh->NtimeSteps;
+   }
+ 
++  // A binary-exact common timestep keeps fp32/fp64 reference sampling identical.
++  if (newOptions.getArgs("REFERENCE DT", mesh->dt)) {
++    if (!newOptions.getArgs("REFERENCE STEPS", mesh->NtimeSteps) || mesh->NtimeSteps < 2)
++      throw std::runtime_error("REFERENCE STEPS must be at least two");
++    mesh->finalTime = mesh->NtimeSteps * mesh->dt;
++  }
++
+   // setup temporal output time vector from user-defined resolution
+   int ppwWaveField;
+   if (newOptions.getArgs("TEMPORAL_PPW_OUTPUT", ppwWaveField) == 0) {
+@@ -524,7 +531,7 @@
+ 
+     for (int iRead = 0; iRead < acoustics->NReceivers * 3; iRead += 3)
+     {
+-      fscanf(RecvDATAFILE, "%lf %lf %lf", &acoustics->recvXYZ[iRead],
++      fscanf(RecvDATAFILE, dfloatFormat " " dfloatFormat " " dfloatFormat, &acoustics->recvXYZ[iRead],
+             &acoustics->recvXYZ[iRead + 1],
+             &acoustics->recvXYZ[iRead + 2]);
+     }
+--- a/solvers/acoustics/src/acousticsRun.c
++++ b/solvers/acoustics/src/acousticsRun.c
+@@ -29,6 +29,7 @@
+ #include <limits>
+ #include <algorithm>
+ #include <stdexcept>
++#include "reference.h"
+ 
+ void dopri5(acoustics_t *acoustics, dfloat outputInterval);
+ void lseRK4(acoustics_t *acoustics, std::shared_ptr<IAcousticWriter> writer);
+@@ -40,7 +41,7 @@
+   for (int iRecv = 0; iRecv < acoustics->NReceiversLocal; iRecv++) {
+     // NOTE: when acoustics->qRecvCopyCounter > 0 the number of timesteps is larger than RECV_COPY_RATE
+     // The host qRecv is allocated with acoustics->qRecvCounter per source position
+-    dlong offsetHost = RECV_COPY_RATE * acoustics->qRecvCopyCounter + acoustics->qRecvCounter * iRecv;
++    dlong offsetHost = RECV_COPY_RATE * acoustics->qRecvCopyCounter + acoustics->timeStepsOut.size() * iRecv;
+ 
+     acoustics->o_qRecv.copyTo(
+       acoustics->qRecv + offsetHost, // destination (host)
+@@ -130,6 +131,8 @@
+     throw std::invalid_argument("Internal error: waveFieldWriteType is not exhaustive.");
+   }
+ 
++  acoustics->mesh->device.finish();
++  const double propagationStart = MPI_Wtime();
+   if (newOptions.compareArgs("TIME INTEGRATOR", "DOPRI5"))
+   {
+     dfloat outputInterval;
+@@ -152,9 +155,13 @@
+     throw std::invalid_argument("TIME INTEGRATOR type not supported. Supported types: DOPRI5, LSERK4, EIRK4, EIRK4ADAP.");
+   }
+ 
++  acoustics->mesh->device.finish();
++  std::ofstream propagation(dgref::directory() + "/propagation.json");
++  propagation << std::setprecision(17) << "{\"seconds\":" << MPI_Wtime() - propagationStart << "}\n";
+   // Copy remaining o_qRecv from device to host
+   copyReceiverToHost(acoustics);
+ 
++  dgref::receivers(acoustics);
+   // acousticsWriteTxtIRs(acoustics, newOptions);
+   acousticsWriteWavIRs(acoustics, newOptions);
+ }
+@@ -187,7 +194,7 @@
+   {
+     dfloat time = tstep*mesh->dt;
+ 
+-    if (acoustics->timeStepsOut.size() > 0 && abs(acoustics->timeStepsOut[tstepWrite] - time) < 1e-10) {
++    if (size_t(tstepWrite) < acoustics->timeStepsOut.size() && abs(acoustics->timeStepsOut[tstepWrite] - time) < 1e-10) {
+       updateReceivers(acoustics);
+       writer->write(acoustics, tstepWrite);      
+       tstepWrite++;
+@@ -211,7 +218,7 @@
+   {
+     dfloat time = tstep*mesh->dt;
+ 
+-    if (acoustics->timeStepsOut.size() > 0 && abs(acoustics->timeStepsOut[tstepWrite] - time) < 1e-10) {
++    if (size_t(tstepWrite) < acoustics->timeStepsOut.size() && abs(acoustics->timeStepsOut[tstepWrite] - time) < 1e-10) {
+       updateReceivers(acoustics);
+       writer->write(acoustics, tstepWrite);      
+       tstepWrite++;
+--- a/solvers/acoustics/src/acousticsSetupMain.c
++++ b/solvers/acoustics/src/acousticsSetupMain.c
+@@ -1,5 +1,6 @@
+ #include "acoustics.h"
+ #include <limits.h>
++#include "reference.h"
+ 
+ int acousticsSetupMain(setupAide &newOptions)
+ {  
+@@ -61,6 +62,12 @@
+     acousticsRecvIntpolOperators(acoustics);
+   }
+ 
++  mesh->device.finish();
++  dgref::metadata(acoustics);
++  if (std::getenv("DG_REFERENCE_PROBE")) {
++    dgref::mesh(acoustics);
++    return EXIT_SUCCESS;
++  }
+   double startTime, endTime;
+   startTime = MPI_Wtime();
+ 
+--- a/solvers/acoustics/src/acousticsWriters.c
++++ b/solvers/acoustics/src/acousticsWriters.c
+@@ -400,8 +400,8 @@
+ 
+ void getFilePath(acoustics_t* acoustics, int iRecv, std::string extension, char** filePathOut) {
+   sprintf(*filePathOut, "%s/%02d_x0=['%0.2f', '%0.2f', '%0.2f']_r0=['%0.2f', '%0.2f', '%0.2f'].%s", 
+-      (char*)acoustics->outDir.c_str(),  
++      (char*)acoustics->outDir.c_str(), acoustics->recvElementsIdx[iRecv],  
+       acoustics->sourcePosition[0], acoustics->sourcePosition[1], acoustics->sourcePosition[2],
+       acoustics->recvXYZ[iRecv * 3 + 0], acoustics->recvXYZ[iRecv * 3 + 1], acoustics->recvXYZ[iRecv * 3 + 2],
+-      acoustics->recvElementsIdx[iRecv], extension.c_str());
++      extension.c_str());
+ }
+\ No newline at end of file
+--- /dev/null
++++ b/solvers/acoustics/reference.h
+@@ -0,0 +1,73 @@
++#pragma once
++
++#include "acoustics.h"
++#include <fstream>
++#include <iomanip>
++#include <stdexcept>
++
++namespace dgref {
++inline std::string directory() {
++    const char *path = std::getenv("DG_REFERENCE_OUTPUT");
++    if (!path || !*path) throw std::runtime_error("DG_REFERENCE_OUTPUT is required");
++    return path;
++}
++
++template<class T> inline void write(const std::string &name, const T *values, size_t count) {
++    std::ofstream file(directory() + "/" + name + ".bin", std::ios::binary);
++    file.write(reinterpret_cast<const char *>(values), count * sizeof(T));
++    if (!file) throw std::runtime_error("could not write reference array: " + name);
++}
++
++inline void buffer(const std::string &name, const occa::memory &memory) {
++    if (!memory.isInitialized()) return;
++    std::vector<unsigned char> bytes(memory.size());
++    memory.copyTo(bytes.data());
++    write(name, bytes.data(), bytes.size());
++}
++
++inline void metadata(acoustics_t *a) {
++    auto *m = a->mesh;
++    int ranks;
++    MPI_Comm_size(m->comm, &ranks);
++    if (ranks != 1) throw std::runtime_error("reference capture requires one MPI rank");
++    if (a->NReceiversLocal != a->NReceivers) throw std::runtime_error("not all reference receivers were located");
++    std::ofstream out(directory() + "/solver.json");
++    out << std::setprecision(17)
++        << "{\n\"scalar_bytes\":" << sizeof(dfloat)
++        << ",\n\"backend\":\"" << m->device.mode() << "\""
++        << ",\n\"index_bytes\":" << sizeof(dlong)
++        << ",\n\"elements\":" << m->Nelements
++        << ",\n\"degree\":" << m->N
++        << ",\n\"nodes_per_element\":" << m->Np
++        << ",\n\"nodes_per_face\":" << m->Nfp
++        << ",\n\"faces_per_element\":" << m->Nfaces
++        << ",\n\"fields\":" << a->Nfields
++        << ",\n\"curved_elements\":" << m->Ncurv
++        << ",\n\"steps\":" << m->NtimeSteps
++        << ",\n\"dt\":" << double(m->dt)
++        << ",\n\"samples\":" << a->timeStepsOut.size()
++        << ",\n\"receivers\":" << a->NReceiversLocal
++        << "\n}\n";
++    if (!out) throw std::runtime_error("could not write reference metadata");
++    write("times", a->timeStepsOut.data(), a->timeStepsOut.size());
++    write("receiver_xyz", a->recvXYZ, 3 * a->NReceivers);
++}
++
++inline void mesh(acoustics_t *a) {
++    auto *m = a->mesh;
++    buffer("initial_q", a->o_q);
++    buffer("vmapM", m->o_vmapM);
++    buffer("vmapP", m->o_vmapP);
++    buffer("EToB", m->o_EToB);
++    buffer("x", m->o_x);
++    buffer("y", m->o_y);
++    buffer("z", m->o_z);
++    buffer("receiver_interpolation", a->o_recvintpol);
++    buffer("receiver_elements", a->o_recvElements);
++}
++
++inline void receivers(acoustics_t *a) {
++    buffer("final_q", a->o_q);
++    write("receivers", a->qRecv, size_t(a->NReceiversLocal) * a->timeStepsOut.size());
++}
++} // namespace dgref

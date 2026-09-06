@@ -1,3 +1,4 @@
 src/ThirdParty/** linguist-vendored
 gen/**/*.bin binary
 gen/**/*.wav binary
+script/dg_reference/upstream.patch -whitespace

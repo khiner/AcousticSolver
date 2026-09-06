@@ -16,7 +16,7 @@ struct Tables {
     std::array<float, 5> RkA{}, RkB{};
 };
 
-// FP32 factored mass with compact weak loads. Setup is performed in FP64.
+// FP32 weight-adjusted mass with compact weak loads. Setup is performed in FP64.
 class Gpu {
 public:
     explicit Gpu(const Tables &);
@@ -35,9 +35,9 @@ private:
     void Mass();
     DgParams Params;
     std::array<float, 5> RkA, RkB;
-    GpuBuffer G, L, T, W, Vm, Vp, Boundary, FaceRows, ReceiverElements, ReceiverWeights;
-    GpuBuffer Q, Residual, Load, Weighted, Rhs, Record;
+    GpuBuffer G, L, FaceInfo, InverseMass, Vm, Vp, Boundary, FaceRows, ReceiverElements, ReceiverWeights;
+    GpuBuffer Q, Residual, Load, Rhs, Record;
     MTL::Library *Library{};
-    MTL::ComputePipelineState *Weak{}, *Interpolate{}, *Project{}, *Sample{};
+    MTL::ComputePipelineState *Weak{}, *Project{};
 };
 } // namespace dg

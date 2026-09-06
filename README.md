@@ -139,9 +139,9 @@ Native FP32 propagation on matching meshes, initial fields, receivers, and LSERK
 
 | Problem | Steps | Simulated time | Upstream CUDA | Metal WADG |
 | --- | ---: | ---: | ---: | ---: |
-| Rigid unit cube, degree 4, 100 elements | 656 | 20.0195 ms | 0.07185 s | 0.07748 s |
-| Rigid unit cylinder, degree 6, 70 elements | 65,536 | 500 ms | 8.031 s | 19.7 s |
+| Rigid unit cube, degree 4, 100 elements | 656 | 20.0195 ms | 0.07185 s | 0.04208 s |
+| Rigid unit cylinder, degree 6, 70 elements | 65,536 | 500 ms | 8.031 s | 7.695 s |
 
-Median wall time of four warmed runs, covering propagation and receiver sampling only. Metal used reduced mass quadrature and ran on battery in Automatic mode, with nominal thermal pressure before and after each run.
+Median wall time of four warmed runs, covering propagation and receiver sampling only.
 
-The cube implementations agree within `2.5e-6` in terminal physical field norm. On the curved cylinder, upstream remains bounded but differs from WADG by about `0.53%` and exceeds our mean-conservation tolerance. This is a comparison of the stated methods and implementations, with accuracy assessed separately. [Reproduce the comparison](src/Dg/README.md#upstream-cuda-comparison); [numerical results and limits](VALIDATION.md#upstream-native-cuda-benchmark).
+The cube implementations agree within `2.6e-6` in terminal physical field norm. On the curved cylinder, upstream remains bounded but differs from WADG by about `0.53%` and exceeds our mean-conservation tolerance. This is a comparison of the stated methods and implementations, with accuracy assessed separately. [Reproduce the comparison](src/Dg/README.md#upstream-cuda-comparison); [numerical results and limits](VALIDATION.md#upstream-native-cuda-benchmark).

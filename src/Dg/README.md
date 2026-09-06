@@ -36,7 +36,8 @@ T = V M^-1
 A load = T^T [(w/Jp) .* (T load)]
 ```
 
-`T` is shared across elements; dense element inverse masses are not uploaded.
+Setup forms each fixed matrix `A` in FP64 from the prepared factors and uploads
+it in FP32, avoiding quadrature products during propagation.
 Only mass inversion uses `Jp`. Spatial geometry retains its original Jacobian
 and normals. Projection preserves physical constant moments under consistent
 quadrature; positivity is checked explicitly. The strong–weak spatial form is
@@ -44,10 +45,12 @@ needed for energy stability independently of this mass approximation. See
 [Chan, Hewett and Warburton](https://arxiv.org/abs/1608.03836) and the
 [validation contract](../../VALIDATION.md#curved-tetrahedral-dg).
 
-The native code uses paired FP32 SIMD matrix tiles for mass application, shares
-volume matrices with their transposes, and stores symmetric face trace blocks.
-Upload rejects inconsistent transpose or symmetry identities. Apple GPU family 7
-or newer, 32-lane SIMD execution, and sufficient threadgroup capacity are required;
+The native kernels use 32-lane SIMD reductions, share volume matrices with their
+transposes, and store symmetric face trace blocks. Planar faces use one scalar
+matrix and a constant normal when all ten coefficient matrices reconstruct within
+`1e-7` relative maximum error. Upload rejects inconsistent transpose or symmetry
+identities. Receiver sampling shares the first RK stage's load dispatch.
+Apple GPU family 7 or newer and support for 1,024-thread groups are required;
 runtime validation covers Apple M5 Max. Fast math is disabled.
 
 `dg::Tables` stores row-major FP32 arrays. State layout is

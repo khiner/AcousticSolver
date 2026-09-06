@@ -145,7 +145,7 @@ int main(int argc, char *const *argv) {
         const auto mass = gpu.ApplyMass(Read<float>(input / "mass_load.bin", count));
         const double mass_error = Error(mass, Read<double>(input / "mass_result.bin", count));
         checks["mass_relative_l2"] = mass_error;
-        if (mass_error > 2e-5) throw std::runtime_error("Metal factored mass error");
+        if (mass_error > 2e-5) throw std::runtime_error("Metal weight-adjusted mass error");
         Diagnostic diagnostic{p.Elements, p.Nodes, Read<double>(input / "modified_mass.bin", size_t(p.Elements) * p.Nodes * p.Nodes), Read<double>(input / "physical_mass_weights.bin", size_t(p.Elements) * p.Nodes), 0};
         diagnostic.Volume = std::accumulate(diagnostic.Weights.begin(), diagnostic.Weights.end(), 0.);
         const auto initial = diagnostic.Evaluate(tables.Initial);

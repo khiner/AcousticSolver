@@ -5,11 +5,12 @@ constant uint DgNodes [[function_constant(0)]];
 constant uint DgFaceNodes [[function_constant(2)]];
 
 kernel void DgWeakLoad(device const float4 *q [[buffer(0)]], device const float *g [[buffer(1)]], device const float *l [[buffer(2)]], device const uint *vm [[buffer(3)]], device const uint *vp [[buffer(4)]], device const uint *boundary [[buffer(5)]], device const int4 *faceRows [[buffer(6)]], device float4 *load [[buffer(7)]], device const uint *elements [[buffer(8)]], device const float *weights [[buffer(9)]], device float *record [[buffer(10)]], device const DgFace *info [[buffer(11)]], constant DgParams &p [[buffer(12)]], uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    const uint id = group * DG_NODE_SIMDS + sg;
+    const uint width = DgNodeLanes(DgNodes), node_lane = lane % width;
+    const uint id = (group * DG_NODE_SIMDS + sg) * (32 / width) + lane / width;
     if (id >= p.Elements * DgNodes) return;
     const uint e = id / DgNodes, i = id % DgNodes, n = DgNodes, f = DgFaceNodes;
     // LSERK4 has RkA == 0 only at its first stage; sample before changing the state.
-    if (p.Update && p.RkA == 0 && i == 0 && lane == 0) {
+    if (p.Update && p.RkA == 0 && i == 0 && node_lane == 0) {
         for (uint receiver = 0; receiver < p.Receivers; ++receiver) {
             if (elements[receiver] != e) continue;
             float pressure = 0;
@@ -20,7 +21,7 @@ kernel void DgWeakLoad(device const float4 *q [[buffer(0)]], device const float 
     const uint k = f / 4;
     const float anchor = q[e * n].x;
     float4 value = 0;
-    for (uint j = lane; j < n; j += 32) {
+    for (uint j = node_lane; j < n; j += width) {
         const float4 state = q[e * n + j];
         const float pressure = state.x - anchor;
         const uint gb = (e * 3 * n + i) * n + j;
@@ -37,7 +38,7 @@ kernel void DgWeakLoad(device const float4 *q [[buffer(0)]], device const float 
         const uint triangle = k * (k + 1) / 2, lb = data.Offset & 0x7fffffffu;
         const bool planar = (data.Offset & 0x80000000u) != 0;
         const float3 normal(data.Nx, data.Ny, data.Nz);
-        for (uint j = lane; j < k; j += 32) {
+        for (uint j = node_lane; j < k; j += width) {
             const uint face = e * f + side * k + j;
             const float4 minus = q[vm[face]];
             float4 plus = q[vp[face]];
@@ -58,18 +59,21 @@ kernel void DgWeakLoad(device const float4 *q [[buffer(0)]], device const float 
             value.w += .5f * (a[3] * diff.x - a[6] * diff.y - a[8] * diff.z - a[9] * diff.w);
         }
     }
-    value = simd_sum(value);
-    if (lane == 0) load[id] = p.SoundSpeed * value;
+    if (width == 32) value = simd_sum(value);
+    else for (uint stride = 8; stride; stride /= 2) value += simd_shuffle_xor(value, stride);
+    if (node_lane == 0) load[id] = p.SoundSpeed * value;
 }
 
 kernel void DgMassProject(device const float4 *load [[buffer(0)]], device const float *mass [[buffer(1)]], device float4 *rhs [[buffer(2)]], device float4 *q [[buffer(3)]], device float4 *residual [[buffer(4)]], constant DgParams &p [[buffer(5)]], uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    const uint id = group * DG_NODE_SIMDS + sg;
+    const uint width = DgNodeLanes(DgNodes), node_lane = lane % width;
+    const uint id = (group * DG_NODE_SIMDS + sg) * (32 / width) + lane / width;
     if (id >= p.Elements * DgNodes) return;
     const uint e = id / DgNodes;
     float4 result = 0;
-    for (uint j = lane; j < DgNodes; j += 32) result += mass[id * DgNodes + j] * load[e * DgNodes + j];
-    result = simd_sum(result);
-    if (lane == 0) {
+    for (uint j = node_lane; j < DgNodes; j += width) result += mass[id * DgNodes + j] * load[e * DgNodes + j];
+    if (width == 32) result = simd_sum(result);
+    else for (uint stride = 8; stride; stride /= 2) result += simd_shuffle_xor(result, stride);
+    if (node_lane == 0) {
         if (p.Update) {
             const float4 r = p.RkA * residual[id] + p.Dt * result;
             residual[id] = r;

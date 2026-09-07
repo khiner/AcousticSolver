@@ -151,6 +151,7 @@ int main(int argc, char *const *argv) {
         const auto initial = diagnostic.Evaluate(tables.Initial);
         const double scale = std::sqrt(2 * initial[0] / diagnostic.Volume);
         auto &ctx = MetalContext::Get();
+        const uint32_t batch_steps = benchmark ? 256 : 64;
         json report{{"device", ctx.Device->name()->utf8String()}, {"precision", "float32"}, {"fast_math", false}, {"operator", fs::absolute(input).string()}, {"steps", steps}, {"dt", dt}, {"repeats", repeats}, {"output_scalar_bytes", 8}, {"sample_start", 0.}, {"pressure_offset", metadata.at("pressure_offset")}, {"operator_checks", checks}, {"diagnostic_interval_steps", benchmark ? steps : 64}, {"runs", json::array()}};
         std::vector<float> previous_state, previous_receivers;
         for (uint32_t repeat = 1; repeat <= repeats; ++repeat) {
@@ -161,7 +162,7 @@ int main(int argc, char *const *argv) {
             const auto start = std::chrono::steady_clock::now();
             for (uint32_t step = 0; step < steps; ++step) {
                 gpu.Step(step, float(dt));
-                if ((step + 1) % 64 == 0 || step + 1 == steps) {
+                if ((step + 1) % batch_steps == 0 || step + 1 == steps) {
                     ctx.Drain();
                     gpu_seconds += ctx.TakeBatchGpuSeconds();
                     if (benchmark) continue;

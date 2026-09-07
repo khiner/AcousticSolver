@@ -1496,7 +1496,7 @@ and degree 4 / 560 elements at radius 0.5 m, each with 1,024 steps of `2^-18 s`.
 - Bitwise-identical repeated terminal states and receiver records, with matching clocks
 
 Additional cases cover halved timestep, an 8,192-step analytic trajectory, four
-disconnected mesh copies, an odd-element constant state, original mass quadrature,
+disconnected mesh copies, odd-element constant states at both degrees, original mass quadrature,
 and rejection of inconsistent spatial matrices.
 
 Mass quadrature uses 12³ instead of 16³ points for degree 6 and 9³ instead of 12³
@@ -1510,8 +1510,8 @@ spatial and scoring quadratures unchanged.
 [Reproduction instructions](src/Dg/README.md#upstream-cuda-comparison) record the
 upstream pin and patch scope. CUDA uses Ubuntu 24.04, GCC 13.3, CUDA 12.8, and
 driver 580.126.16. Both solvers propagate in FP32; upstream retains fast math,
-while Metal disables it. The four Metal runs spanned `40.80–42.26 ms` for the cube
-and `7.692–7.705 s` for the cylinder, with possible concurrent CPU/GPU work.
+while Metal disables it. The four Metal runs spanned `30.50–31.43 ms` for the cube
+and `7.586–7.620 s` for the cylinder, with possible concurrent CPU/GPU work.
 
 The solvers share meshes, initial pressure, zero initial velocity, receiver interpolation,
 rigid walls, and five-stage LSERK4 schedules:
@@ -1527,7 +1527,7 @@ assembles operators in FP64 before rounding to FP32. The cube's 9³ and cylinder
 errors of `7.5e-14` and `1.94e-7`.
 
 The cube's GPU implementations differ by `2.52e-6` in terminal physical mass norm
-and `1.39e-6` over complete receiver records. Against an independent rigid-cube
+and `1.41e-6` over complete receiver records. Against an independent rigid-cube
 cosine series, both have receiver errors of `3.22%` and `1.06%` over 256 distributed
 samples; 48-versus-80-mode truncation is below `0.085%`. This coarse Gaussian case
 is a smoke test; the cylinder eigenmode fixtures enforce `0.1%` analytic accuracy.

@@ -139,8 +139,8 @@ Native FP32 propagation on matching meshes, initial fields, receivers, and LSERK
 
 | Problem | Steps | Simulated time | Upstream CUDA | Metal WADG |
 | --- | ---: | ---: | ---: | ---: |
-| Rigid unit cube, degree 4, 100 elements | 656 | 20.0195 ms | 0.07185 s | 0.04208 s |
-| Rigid unit cylinder, degree 6, 70 elements | 65,536 | 500 ms | 8.031 s | 7.695 s |
+| Rigid unit cube, degree 4, 100 elements | 656 | 20.0195 ms | 0.07185 s | 0.03090 s |
+| Rigid unit cylinder, degree 6, 70 elements | 65,536 | 500 ms | 8.031 s | 7.605 s |
 
 Median wall time of four warmed runs, covering propagation and receiver sampling only.
 

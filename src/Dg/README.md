@@ -45,8 +45,8 @@ needed for energy stability independently of this mass approximation. See
 [Chan, Hewett and Warburton](https://arxiv.org/abs/1608.03836) and the
 [validation contract](../../VALIDATION.md#curved-tetrahedral-dg).
 
-The native kernels use 32-lane SIMD reductions, share volume matrices with their
-transposes, and store symmetric face trace blocks. Planar faces use one scalar
+The native kernels use 16-lane SIMD reductions through degree 4 and 32 lanes above
+it, share volume matrices with their transposes, and store symmetric face trace blocks. Planar faces use one scalar
 matrix and a constant normal when all ten coefficient matrices reconstruct within
 `1e-7` relative maximum error. Upload rejects inconsistent transpose or symmetry
 identities. Receiver sampling shares the first RK stage's load dispatch.
@@ -138,7 +138,7 @@ build/DgTest build/dg-upstream-metal/cylinder/operator build/dg-cylinder-timing 
   65536 0.00000762939453125 1 --benchmark
 ```
 
-`--benchmark` requires all positional arguments. It times synchronized propagation
+`--benchmark` requires all positional arguments. It times synchronized propagation in 256-step batches
 without intermediate state readback or CPU diagnostics, then checks the terminal
 energy and mean. A separate default run checks these every 64 steps. Compare
 its terminal/receiver bytes with every timed run. Warm up first, collect four

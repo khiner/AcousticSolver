@@ -178,11 +178,13 @@ void Gpu::Reset(std::span<const float> initial, uint32_t steps) {
 }
 
 void Gpu::WeakLoad() {
-    MetalContext::Get().Dispatch(Weak, {(Params.Elements * Params.Nodes + DG_NODE_SIMDS - 1) / DG_NODE_SIMDS}, {32 * DG_NODE_SIMDS}, {&Q, &G, &L, &Vm, &Vp, &Boundary, &FaceRows, &Load, &ReceiverElements, &ReceiverWeights, &Record, &FaceInfo}, &Params, sizeof(Params));
+    const uint32_t nodes_per_group = DG_NODE_SIMDS * 32 / DgNodeLanes(Params.Nodes);
+    MetalContext::Get().Dispatch(Weak, {(Params.Elements * Params.Nodes + nodes_per_group - 1) / nodes_per_group}, {32 * DG_NODE_SIMDS}, {&Q, &G, &L, &Vm, &Vp, &Boundary, &FaceRows, &Load, &ReceiverElements, &ReceiverWeights, &Record, &FaceInfo}, &Params, sizeof(Params));
 }
 
 void Gpu::Mass() {
-    MetalContext::Get().Dispatch(Project, {(Params.Elements * Params.Nodes + DG_NODE_SIMDS - 1) / DG_NODE_SIMDS}, {32 * DG_NODE_SIMDS}, {&Load, &InverseMass, &Rhs, &Q, &Residual}, &Params, sizeof(Params));
+    const uint32_t nodes_per_group = DG_NODE_SIMDS * 32 / DgNodeLanes(Params.Nodes);
+    MetalContext::Get().Dispatch(Project, {(Params.Elements * Params.Nodes + nodes_per_group - 1) / nodes_per_group}, {32 * DG_NODE_SIMDS}, {&Load, &InverseMass, &Rhs, &Q, &Residual}, &Params, sizeof(Params));
 }
 
 void Gpu::Step(uint32_t sample, float dt) {

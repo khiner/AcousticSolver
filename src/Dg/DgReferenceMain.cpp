@@ -322,6 +322,8 @@ void Validate(const fs::path &output, const fs::path &inputs, const fs::path &ex
     results["controls"] = {{"half_dt", half}, {"long_analytic", score}};
     CopyOperator(primary, generated / "tail", 1, true);
     native(generated / "tail", output / "tail", 16, 0x1p-18, 2);
+    CopyOperator(Operator(inputs, Fixtures[1]), generated / "degree4_tail", 1, true);
+    native(generated / "degree4_tail", output / "degree4_tail", 16, 0x1p-18, 2);
     results["tail_passed"] = true;
     auto const original = Operator(inputs, f, false);
     native(original, output / "original_quadrature", 1024, 0x1p-18, 2);

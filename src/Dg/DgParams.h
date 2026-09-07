@@ -9,6 +9,9 @@ using DgUint = uint32_t;
 using DgUint = uint;
 #endif
 
+// Degree 4 has 35 volume nodes and 15 face nodes; use both halves of each SIMD group.
+constexpr DgUint DgNodeLanes(DgUint nodes) { return nodes <= 35 ? 16 : 32; }
+
 struct DgParams {
     DgUint Elements, Nodes, FaceNodes, QuadraturePoints;
     DgUint Receivers, Sample, Steps, Update;

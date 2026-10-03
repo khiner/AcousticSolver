@@ -121,6 +121,13 @@ MTL::ComputePipelineState *MetalContext::RoomPipeline(const char *name) {
     return Pipelines[key] = MakePipeline(Device, RoomLib, name);
 }
 
+MTL::ComputePipelineState *MetalContext::BemPipeline(const char *name) {
+    const std::string key = std::string{"bem/"} + name;
+    if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;
+    EnsureLibrary(BemLib, Device, "startup/msl_compile_bem", ACOUSTIC_BEM_MSL_DIR, "BemParams.h", "BemKernels.metal");
+    return Pipelines[key] = MakePipeline(Device, BemLib, name);
+}
+
 MTL::ComputePipelineState *MetalContext::ImmersedPipeline(const char *name) {
     const std::string key = std::string{"immersed/"} + name;
     if (const auto it = Pipelines.find(key); it != Pipelines.end()) return it->second;

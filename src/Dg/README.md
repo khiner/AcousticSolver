@@ -2,7 +2,7 @@
 
 `DgGpu` advances homogeneous acoustics with rigid walls using strong–weak DG,
 conservation-preserving weight-adjusted mass inversion, and five-stage LSERK4.
-Geometry and operators are prepared in FP64; native Metal propagation uses FP32.
+Geometry and operators are prepared in FP64. Native Metal propagation uses FP32.
 The implementation accepts prepared tables. Native mesh loading, source injection,
 scene integration, and frequency-dependent walls remain outside its scope.
 
@@ -19,12 +19,12 @@ Preparation generates the cylinder fixtures' initial states from the analytic
 mode and reads receiver positions and element IDs from `mesh.json`. Upstream
 imports preserve their captured initial states. Mesh coordinates use a single
 FP64 `xyz.bin` in `[element][node][x,y,z]` order. Local face maps are generated
-from reference nodes; self-mapped neighboring faces define rigid boundaries.
+from reference nodes. Self-mapped neighboring faces define rigid boundaries.
 Upstream import verifies these maps and boundaries against the captured arrays.
 
 Preparation and Metal runs overwrite their generated files when rerun. Prepared
 tables in `build/dg-inputs/` can be reused across runs. Optional positional arguments after the output directory are step
-count, timestep, and repeat count; defaults are `1024`, `2^-18 s`, and `2`.
+count, timestep, and repeat count. Defaults are `1024`, `2^-18 s`, and `2`.
 
 ## Method
 
@@ -40,7 +40,7 @@ Setup forms each fixed matrix `A` in FP64 from the prepared factors and uploads
 it in FP32, avoiding quadrature products during propagation.
 Only mass inversion uses `Jp`. Spatial geometry retains its original Jacobian
 and normals. Projection preserves physical constant moments under consistent
-quadrature; positivity is checked explicitly. The strong–weak spatial form is
+quadrature. Positivity is checked explicitly. The strong–weak spatial form is
 needed for energy stability independently of this mass approximation. See
 [Chan, Hewett and Warburton](https://arxiv.org/abs/1608.03836) and the
 [validation contract](../../VALIDATION.md#curved-tetrahedral-dg).
@@ -50,8 +50,8 @@ it, share volume matrices with their transposes, and store symmetric face trace 
 matrix and a constant normal when all ten coefficient matrices reconstruct within
 `1e-7` relative maximum error. Upload rejects inconsistent transpose or symmetry
 identities. Receiver sampling shares the first RK stage's load dispatch.
-Apple GPU family 7 or newer and support for 1,024-thread groups are required;
-runtime validation covers Apple M5 Max. Fast math is disabled.
+Apple GPU family 7 or newer and support for 1,024-thread groups are required.
+Runtime validation covers Apple M5 Max. Fast math is disabled.
 
 `dg::Tables` stores row-major FP32 arrays. State layout is
 `[element][node][pressure fluctuation, rho*c*vx, rho*c*vy, rho*c*vz]`. Pressure
@@ -68,10 +68,10 @@ Each run writes three files:
 - `receivers.bin`: receiver-major pressure samples
 - `result.json`: run settings, operator checks, energy history, per-repeat metrics and timings, and repeatability status
 
-The arrays serialize the FP32 solution as FP64 for independent scoring; this does
+The arrays serialize the FP32 solution as FP64 for independent scoring. This does
 not increase propagation precision. Sample `i` is taken at `sample_start + i*dt`,
 with `steps` samples per receiver. The report records the FP32-rounded timestep.
-Repeated trajectories are compared byte for byte in memory; one copy is saved.
+Repeated trajectories are compared byte for byte in memory. One copy is saved.
 The report is written only after all checks pass.
 
 ## Regression suite
@@ -94,7 +94,7 @@ in [validation](../../VALIDATION.md#curved-tetrahedral-dg).
 The README table measures native DTU/libParanumal CUDA at commit
 `f08c22f83fd64605a634b94326f07cb88f00b0ef`. `run_upstream_dg.py` builds disposable
 FP64 and FP32 copies and records source, kernel, input, compiler, and GPU provenance.
-FP64 is used only to capture geometry; the timed upstream runs use FP32.
+FP64 is used only to capture geometry. The timed upstream runs use FP32.
 [The patch](../../script/dg_reference/upstream.patch) fixes Linux portability,
 FP32 receiver parsing and output, selects a common timestep/step count,
 and adds synchronized timing and raw capture. It leaves the acoustics kernels,
@@ -144,12 +144,12 @@ energy and mean. A separate default run checks these every 64 steps. Compare
 its terminal/receiver bytes with every timed run. Warm up first, collect four
 runs in new output directories, and take the median `propagation_wall_seconds` from `result.json`’s `runs` array.
 Require nominal OS thermal pressure before and after each run, allowing cooling
-between runs; the batched `repeats` argument can otherwise heat the machine.
+between runs. The batched `repeats` argument can otherwise heat the machine.
 The timing excludes the final receiver/state readback and disk output on both
-backends; upstream's periodic receiver transfers remain inside its timed loop.
+backends. Upstream's periodic receiver transfers remain inside its timed loop.
 
 The benchmark workloads and numerical differences are documented in
-[validation](../../VALIDATION.md#upstream-native-cuda-benchmark); measured times
+[validation](../../VALIDATION.md#upstream-native-cuda-benchmark). Measured times
 are in the [root README](../../README.md#curved-tetrahedral-dg).
 
 ## Independent reference checks
@@ -172,14 +172,14 @@ build/DgReference reference degree6 build/dg-reference-degree6
 build/DgReference reference radius_half build/dg-reference-full full_mass
 ```
 
-The default form is `wadg`; the final `full_mass` argument selects physical mass
+The default form is `wadg`. The final `full_mass` argument selects physical mass
 inversion. Each command checks energy, conservation, analytic error, and two
 identical trajectories. WADG regeneration also checks agreement with the frozen
-FP64 records below `1e-10`. Output directories must be new; these commands leave
+FP64 records below `1e-10`. Output directories must be new. These commands leave
 the frozen fixtures intact. Dense FP64 stepping remains independent of Metal's
 factored mass application and pressure-anchor subtraction.
 
-`DgReference score MESH RECORD NODES` reports analytic cylinder error;
+`DgReference score MESH RECORD NODES` reports analytic cylinder error.
 `DgReference compare REFERENCE CANDIDATE TABLES [STRIDE]` compares complete state
 and receiver records. Only upstream CUDA build/run orchestration and Gmsh mesh
 generation require Python.

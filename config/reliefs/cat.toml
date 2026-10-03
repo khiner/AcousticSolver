@@ -1,0 +1,34 @@
+# Acoustic Reliefs Cat parameters with the paper's GMSH surface mesh.
+[dimensions]
+esize = 0.02
+subdiv_top = 1
+w = 0.6
+b = 0.6
+h = 0.15
+
+[image]
+hfield_res = 128
+edge_border = 2
+cam_rad = 1
+
+[diffbem]
+freq_bands = [1000, 1250, 1600, 2000, 2500, 3150]
+n_freqs = 1
+src_pt = [0, 100, 0]
+listener_radius = 50
+listener_ds = 5
+sample_freq = true
+
+[optimization]
+guidance_type = "image"
+normalize_grads = true
+iters = 500
+lr = 0.001
+init_val = 0.0
+vmax = 0.1
+ac_wt = 7
+cl_wt = 5
+sm_wt = 15
+ba_wt = 1
+ng_wt = 1
+vw_wts = [7, 2, 2, 2, 2]

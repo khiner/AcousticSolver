@@ -104,6 +104,7 @@ struct MetalContext {
     MTL::ComputePipelineState *RoomPipeline(const char *name);
 
     MTL::ComputePipelineState *ImmersedPipeline(const char *name);
+    MTL::ComputePipelineState *BemPipeline(const char *name);
 
     // The active serial compute encoder, creating a command buffer/encoder if needed.
     // For hot encode loops that bypass Dispatch() and bind buffers persistently.
@@ -115,6 +116,7 @@ struct MetalContext {
     MTL::Library *RadiationLib{nullptr}; // lazily compiled, see RadiationPipeline
     MTL::Library *RoomLib{nullptr}; // lazily compiled, see RoomPipeline
     MTL::Library *ImmersedLib{nullptr};
+    MTL::Library *BemLib{nullptr};
 
 private:
     MetalContext();

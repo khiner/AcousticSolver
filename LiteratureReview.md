@@ -38,7 +38,7 @@ Where each mechanism in the solver comes from.
   modal-oscillators-driven-by-contact-impulses pipeline behind the Modal shader
   (`q̈ + C̃q̇ + K̃q = Uᵀf(t)`). Predecessor: **O'Brien, Cook, Essl 2001**,
   http://graphics.berkeley.edu/papers/Obrien-SSF-2001-08/.
-- **Chadwick, Zheng, James 2012.** http://www.cs.cornell.edu/projects/Sound/proxy/ — acceleration noise; the
+- **Chadwick, Zheng, James 2012.** http://www.cs.cornell.edu/projects/Sound/proxy/ — acceleration noise, including the
   Point shader's Hertz-contact profile `a(t) = (π/2τ)Δv·sin(π(t−t0)/τ)`.
 - **Zheng & James. "Harmonic Fluids." SIGGRAPH 2009.** https://www.cs.cornell.edu/projects/HarmonicFluids/ —
   bubbles as monopole sources.
@@ -137,7 +137,7 @@ Modern upgrades:
   far coarser than the explicit family allows. The implicit system is solved by a fixed number of
   Jacobi sweeps, not by ADI or factorisation, so every pass is a plain stream. Its boundaries are
   frequency-*in*dependent real admittances over staircased geometry, with the absorption bias
-  staircasing causes compensated by effective surface areas; frequency-dependent boundaries are
+  staircasing causes compensated by effective surface areas. Frequency-dependent boundaries are
   named as future work. Measured against both explicit schemes here under **Implicit schemes** in
   [VALIDATION.md](VALIDATION.md).
 - **Smits. "Efficient FD room acoustics simulation incorporating extended-reacting elements." DAFx
@@ -182,7 +182,7 @@ covered by the thesis, the 2019 passivity paper, and the 2021 JASA-EL letter.
   https://home.cc.umanitoba.ca/~lovetrij/cECE7810/Papers/Yee%201966%20HiRes.pdf — the staggered leapfrog grid.
 - **Botteldooren 1994**, *JASA* 95(5) https://pubs.aip.org/asa/jasa/article-abstract/95/5/2313/622635 and
   **1995**, *JASA* 98(6) https://pubs.aip.org/asa/jasa/article-abstract/98/6/3302/697760 — Yee's scheme in
-  linear acoustics; the exact pressure/velocity updates in the kernels.
+  linear acoustics and the exact pressure/velocity updates in the kernels.
 - **Taflove & Hagness 2005**, *Computational Electrodynamics: The FDTD Method*, 3rd ed. — von Neumann stability,
   the 3D Courant limit `cΔt/Δx ≤ 1/√3`, and the PML chapter (polynomial grading `σ(x) = σ_max(x/d)^m`).
 - **Bilbao 2009**, *Numerical Sound Synthesis* — dispersion and energy-based stability at audio rates.
@@ -211,7 +211,7 @@ covered by the thesis, the 2019 passivity paper, and the 2021 JASA-EL letter.
   before any point-source accuracy test means anything.
 - Alternatives to a fixed grid, cited by the paper but not taken: **Willemsen, Bilbao, Ducceschi, Serafin**,
   dynamic-grid FDTD, DAFx 2021 doi:10.23919/DAFx51585.2021.9768286 and *JAES* 70(9), 2022.
-- **Chaigne & Lambourg 2001**, *JASA* 109(4) — damped impacted plates; the air-loading effect on plate decay
+- **Chaigne & Lambourg 2001**, *JASA* 109(4) — damped impacted plates, including the air-loading effect on plate decay
   times that one-way coupling misses.
 
 Other GPU FDTD acoustics implementations, for behavioral comparison (PFFDTD and the Webb/Hamilton
@@ -249,7 +249,7 @@ Accelerate, for the CPU-side dense linear algebra in the bubble and modal paths:
 
 Exemplar Metal codebases:
 
-- **MLX** — https://github.com/ml-explore/mlx — idiomatic MSL + C++ host; `steel/` for `simdgroup_matrix` GEMM.
+- **MLX** — https://github.com/ml-explore/mlx — idiomatic MSL + C++ host, with `steel/` for `simdgroup_matrix` GEMM.
 - **llama.cpp** `ggml/src/ggml-metal/` — https://github.com/ggml-org/llama.cpp — runtime `.metal` compilation,
   hundreds of dispatches per command buffer, no Xcode.
 - **metal-benchmarks** — https://github.com/philipturner/metal-benchmarks — Apple GPU microarchitecture

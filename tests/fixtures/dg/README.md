@@ -6,8 +6,8 @@ current solver's regression checks: the 70-element degree-6 unit cylinder and
 and receiver interpolation. Initial pressure is generated from the analytic
 cylinder mode at time zero, with zero velocity. Receiver positions and element
 IDs are stored in `mesh.json`. `xyz.bin` stores FP64 coordinates as
-`[element][node][x,y,z]`. `vmapP.bin` stores neighboring trace-node indices;
-local face indices come from the reference nodes, and self-mapped faces are rigid
+`[element][node][x,y,z]`. `vmapP.bin` stores neighboring trace-node indices.
+Local face indices come from the reference nodes, and self-mapped faces are rigid
 boundaries. The CPU records
 retain terminal fields, complete receiver traces, clocks, and their original
 Python generator provenance in [cpu/provenance.json](cpu/provenance.json), with
@@ -16,7 +16,7 @@ regeneration is checked against these frozen records.
 
 `nodes/` contains the exact r/s/t coordinates extracted from DTU's node tables at
 `f08c22f83fd64605a634b94326f07cb88f00b0ef`, with original/subset hashes and its MIT
-license. Each row stores one node’s `r s t` coordinates; the files omit other libParanumal tables.
+license. Each row stores one node’s `r s t` coordinates. The files omit other libParanumal tables.
 `sha256.json` verifies the retained data before operator preparation.
 
 Each mesh has one `mesh.json` containing dimensions, material properties, array

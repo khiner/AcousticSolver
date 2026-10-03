@@ -1,5 +1,5 @@
 # AcousticSolver
-Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), room impulse responses with impedance walls (Bilbao/Hamilton FDTD), immersed impedance surfaces and transmitting barriers, and curved tetrahedral DG.
+Metal GPU acoustic wave solvers: sound sources in animated scenes (WaveBlender), exterior radiation without ghost cells (SonicRadiation), room impulse responses with impedance walls (Bilbao/Hamilton FDTD), immersed impedance surfaces and transmitting barriers, curved tetrahedral DG, and differentiable frequency-domain boundary elements.
 Each is validated against its reference implementation or an analytic ladder — see [VALIDATION.md](VALIDATION.md).
 
 ## WaveBlender
@@ -10,7 +10,7 @@ Per-scene listener output is validated against the CUDA reference under `gen/cud
 
 The approximately 12 GB scene dataset is not vendored.
 `script/FetchScenes` downloads it into `Scenes/` and verifies it against `script/scenes.sha256`.
-Ten scenes come from the WaveBlender dataset with their own `config.json`; Cymbal and WineglassTap come from the earlier wavesolver dataset ([Wang et al. 2018](https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html)), which WaveBlender used but did not republish.
+Ten scenes come from the WaveBlender dataset with their own `config.json`. Cymbal and WineglassTap come from the earlier wavesolver dataset ([Wang et al. 2018](https://graphics.stanford.edu/projects/wavesolver/dataset/dataset_table.html)), which WaveBlender used but did not republish.
 The fetch script maps those two scenes into this repository's layout, with configs under `config/`.
 
 Wall-clock per scene. CUDA reference on an RTX 4090 (Linux, CUDA 12.8), Metal on an Apple M5 Max.
@@ -34,7 +34,7 @@ Thermal drift can move one scene from 43s cool to 53s heat-soaked, so back-to-ba
 | **Total** | **1354.3s** | **1170.0s** (ten scenes) | **290.0s** |
 
 Cymbal and WineglassTap were added after the initial port, so they have no middle-column result.
-Cymbal's 10.2s result reads its 11 GB of per-frame shell data from the page cache; a cold read takes 40.9s, while the reference used a RAM disk.
+Cymbal's 10.2s result reads its 11 GB of per-frame shell data from the page cache. A cold read takes 40.9s, while the reference used a RAM disk.
 
 Notable performance changes relative to upstream WaveBlender:
 
@@ -84,7 +84,7 @@ The repository includes Cartesian and FCC shoebox and church scenes, a Cartesian
 
 The optimized 27-point implicit scheme from [Smits & Bilbao 2025](https://doi.org/10.1121/10.0036229) runs directly from a PFFDTD `model_export.json`.
 It voxelizes all 26 stencil legs, preserves mesh normals and materials, and applies the paper's staircase-compensated real-admittance boundary.
-Its defaults reproduce the published Fig. 6 numerical configuration; zero-mean projection for long fp32 records is available separately and remains off by default.
+Its defaults reproduce the published Fig. 6 numerical configuration. Zero-mean projection for long fp32 records is available separately and remains off by default.
 
 ```
 build/AcousticSolver --room ../Scenes/RoomChurch/config.json
@@ -121,11 +121,11 @@ script/ValidateImmersed
 script/ValidateImmersed --exact
 ```
 
-Outputs land under `build/immersed/<output>.bin`. `script/ValidateImmersed` runs the analytic ladder and scores the two short committed scenes against `gen/immersed/`; `--exact` requires byte identity. [VALIDATION.md](VALIDATION.md) owns the measured errors, stability bounds, implementation departures, and performance results.
+Outputs land under `build/immersed/<output>.bin`. `script/ValidateImmersed` runs the analytic ladder and scores the two short committed scenes against `gen/immersed/`. `--exact` requires byte identity. [VALIDATION.md](VALIDATION.md) owns the measured errors, stability bounds, implementation departures, and performance results.
 
 ## Curved tetrahedral DG
 
-`src/Dg/` implements the rigid-wall acoustics subset of Melander et al.'s [Massively parallel nodal discontinous Galerkin finite element method simulator for room acoustics](https://doi.org/10.1177/10943420231208948) in Metal. It uses energy-stable weight-adjusted discontinuous Galerkin (WADG) on curved tetrahedral meshes with FP32 kernels. It currently consumes prepared operator tables and retains dense spatial matrices; source and scene integration remain future work.
+`src/Dg/` implements the rigid-wall acoustics subset of Melander et al.'s [Massively parallel nodal discontinous Galerkin finite element method simulator for room acoustics](https://doi.org/10.1177/10943420231208948) in Metal. It uses energy-stable weight-adjusted discontinuous Galerkin (WADG) on curved tetrahedral meshes with FP32 kernels. It currently consumes prepared operator tables and retains dense spatial matrices. Source and scene integration remain future work.
 
 ```sh
 cmake --build build --target DgTest DgReference -j 6
@@ -135,7 +135,7 @@ build/DgTest build/dg-inputs/reduced/degree6/q12 build/dg-metal-check
 
 See [DG usage](src/Dg/README.md) for options and file formats, and [validation](VALIDATION.md#curved-tetrahedral-dg) for accuracy and stability checks.
 
-Native FP32 propagation on matching meshes, initial fields, receivers, and LSERK4 timesteps. CUDA runs [DTU/libParanumal](https://github.com/dtu-act/libparanumal/tree/f08c22f83fd64605a634b94326f07cb88f00b0ef)'s original numerical kernels on an A100-SXM4-80GB; Metal runs our strong–weak WADG formulation on an Apple M5 Max. The upstream build has portability, input/output, and timing patches; its numerical kernels and RK stage routine are unchanged.
+Native FP32 propagation on matching meshes, initial fields, receivers, and LSERK4 timesteps. CUDA runs [DTU/libParanumal](https://github.com/dtu-act/libparanumal/tree/f08c22f83fd64605a634b94326f07cb88f00b0ef)'s original numerical kernels on an A100-SXM4-80GB. Metal runs our strong–weak WADG formulation on an Apple M5 Max. The upstream build has portability, input/output, and timing patches. Its numerical kernels and RK stage routine are unchanged.
 
 | Problem | Steps | Simulated time | Upstream CUDA | Metal WADG |
 | --- | ---: | ---: | ---: | ---: |
@@ -144,4 +144,8 @@ Native FP32 propagation on matching meshes, initial fields, receivers, and LSERK
 
 Median wall time of four warmed runs, covering propagation and receiver sampling only.
 
-The cube implementations agree within `2.6e-6` in terminal physical field norm. On the curved cylinder, upstream remains bounded but differs from WADG by about `0.53%` and exceeds our mean-conservation tolerance. This is a comparison of the stated methods and implementations, with accuracy assessed separately. [Reproduce the comparison](src/Dg/README.md#upstream-cuda-comparison); [numerical results and limits](VALIDATION.md#upstream-native-cuda-benchmark).
+The cube implementations agree within `2.6e-6` in terminal physical field norm. On the curved cylinder, upstream remains bounded but differs from WADG by about `0.53%` and exceeds our mean-conservation tolerance. This is a comparison of the stated methods and implementations, with accuracy assessed separately. See how to [reproduce the comparison](src/Dg/README.md#upstream-cuda-comparison) and read the [numerical results and limits](VALIDATION.md#upstream-native-cuda-benchmark).
+
+## Acoustic Reliefs
+
+`src/Bem/` implements the differentiable boundary-element solver from [Acoustic Reliefs](https://doi.org/10.1145/3763287) with compressed Metal operators and height gradients. A dense FP64 CPU solve supports validation. See [run and upstream comparison instructions](script/reliefs/README.md).

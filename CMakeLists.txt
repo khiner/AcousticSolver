@@ -55,6 +55,7 @@ set(IMMERSED_SOURCES
 set(MSL_DEFINITIONS
     ACOUSTIC_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
     ACOUSTIC_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/FDTD"
+    ACOUSTIC_BEM_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Bem"
     ACOUSTIC_IMMERSED_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Immersed"
     ACOUSTIC_RADIATION_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Radiation"
     ACOUSTIC_ROOM_MSL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/Room")
@@ -63,6 +64,11 @@ set(MSL_DEFINITIONS
 # runtime-MSL directories and the frameworks ride along as usage requirements, so the two
 # executables cannot drift apart on any of them, and the shared sources compile once.
 add_library(AcousticCore STATIC
+    src/Bem/Bem.cpp
+    src/Bem/BemGpu.cpp
+    src/Bem/BemCompressed.cpp
+    src/Bem/BemTexture.cpp
+    src/Bem/BemIO.cpp
     src/Mesh.cpp
     src/ModalSound.cpp
     src/Oscillator.cpp
@@ -107,3 +113,8 @@ target_include_directories(DgReference SYSTEM PRIVATE src/external)
 target_compile_definitions(DgReference PRIVATE ACOUSTIC_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}" EIGEN_USE_BLAS)
 target_compile_options(DgReference PRIVATE -ffp-contract=off)
 target_link_libraries(DgReference PRIVATE "-framework Accelerate")
+
+add_executable(BemSolve src/Bem/BemMain.cpp)
+target_link_libraries(BemSolve PRIVATE AcousticCore)
+add_executable(BemTextureSolve src/Bem/BemTextureSolve.cpp)
+target_link_libraries(BemTextureSolve PRIVATE AcousticCore)

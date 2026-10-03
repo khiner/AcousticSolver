@@ -1,0 +1,9 @@
+torch==2.11.0
+torchvision==0.26.0
+mitsuba==3.9.1
+drjit==1.5.0
+numpy==2.2.6
+pillow==12.1.1
+opencv-python-headless==4.13.0.92
+gmsh==4.15.2
+clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Serial CPU/Metal plate timings, including diagnostics and excluding file output.
+
+script/BenchmarkPlate --seconds .05 --runs 3
+script/BenchmarkPlate --baseline-root /path/to/baseline --baseline-build /path/to/baseline/build
+Outputs contain a warmup plus interleaved CPU/Metal measurements for both examples.
+"""
+import argparse
+import json
+import math
+from pathlib import Path
+import platform
+import statistics
+import subprocess
+
+from plate.accuracy import digest
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fft", action="store_true", help="benchmark the FFT Metal backend; baseline Metal remains dense")
+    parser.add_argument("--config", type=Path, action="append", help="configuration to benchmark; repeat for several (default Small and Large)")
+    parser.add_argument("--gpu-only", action="store_true", help="omit the CPU timing for large-grid comparisons")
+    parser.add_argument("--seconds", type=float, default=.05)
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--build", type=Path, default=ROOT / "build")
+    parser.add_argument("--output", type=Path, default=ROOT / "build/plate-benchmark")
+    parser.add_argument("--baseline-root", type=Path, help="isolated source checkout used by the baseline executable's runtime shaders")
+    parser.add_argument("--baseline-build", type=Path, help="baseline build directory; defaults to BASELINE_ROOT/build")
+    args = parser.parse_args()
+    if not math.isfinite(args.seconds) or args.seconds <= 0 or args.runs < 1:
+        parser.error("seconds must be positive and finite, runs must be positive")
+    executable = args.build.resolve() / "PlateSolve"
+    if args.baseline_build and not args.baseline_root:
+        parser.error("--baseline-build requires --baseline-root")
+    def identity(root, binary):
+        return {"executable_sha256": digest(binary),
+                "source_sha256": {str(path.relative_to(root)): digest(path)
+                                  for path in sorted((root / "src/Plate").iterdir()) if path.is_file()}}
+    native_identity = identity(ROOT, executable)
+    report = {"machine": subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip(),
+              "platform": platform.platform(), "metal_transform": "fft" if args.fft else "dense", "seconds": args.seconds, "runs": args.runs,
+              **native_identity,
+              "timing_scope": "native simulation wall time including force preparation, diagnostics and batch readback; setup and file output excluded",
+              "memory_scope": "peak resident process bytes; includes runtime and retained output, not GPU allocation alone",
+              "cases": {}}
+    binaries = {"metal": executable} if args.gpu_only else {"cpu": executable, "metal": executable}
+    if args.baseline_root:
+        baseline_root = args.baseline_root.resolve()
+        baseline_binary = (args.baseline_build or baseline_root / "build").resolve() / "PlateSolve"
+        binaries["baseline_metal"] = baseline_binary
+        baseline_has_metal_flag = "--metal" in subprocess.check_output([str(baseline_binary), "--help"], text=True)
+        report["baseline"] = identity(baseline_root, baseline_binary)
+        report["baseline"]["root"] = str(baseline_root)
+        report["baseline"]["revision"] = subprocess.check_output(["git", "-C", str(baseline_root), "rev-parse", "HEAD"], text=True).strip()
+        baseline_git_root = Path(subprocess.check_output(["git", "-C", str(baseline_root), "rev-parse", "--show-toplevel"], text=True).strip()).resolve()
+        report["baseline"]["source_modified"] = baseline_git_root != baseline_root or bool(subprocess.check_output(["git", "-C", str(baseline_root), "status", "--porcelain", "--", "src/Plate"], text=True).strip())
+    configs = args.config or [ROOT / "config" / f"{scene}.json" for scene in ["PlateSmall", "PlateLarge"]]
+    if len({p.stem for p in configs}) != len(configs):
+        parser.error("configuration filenames must have distinct stems")
+    for config in configs:
+        config = config.resolve()
+        scene = config.stem
+        records = {backend: [] for backend in binaries}
+        for run in range(args.runs + 1):
+            if args.baseline_root:
+                # The GPU implementations run adjacent to each other, alternating
+                # which follows the CPU measurement and which follows GPU work.
+                order = ["cpu", *(["baseline_metal", "metal"] if run % 2 == 0 else ["metal", "baseline_metal"])]
+            else:
+                order = ["cpu", "metal"] if run % 2 == 0 else ["metal", "cpu"]
+            order = [backend for backend in order if backend in binaries]
+            for backend in order:
+                prefix = args.output.resolve() / scene / f"{backend}-{run}"
+                command = [str(binaries[backend]), str(config), "--seconds", str(args.seconds), "--no-wav", "--output", str(prefix)]
+                if backend == "cpu":
+                    command.append("--cpu")
+                elif backend == "metal":
+                    command.append("--fft" if args.fft else "--metal")
+                elif backend == "baseline_metal" and baseline_has_metal_flag:
+                    command.append("--metal")
+                completed = subprocess.run(command, check=True, text=True, capture_output=True, cwd=ROOT)
+                print(completed.stdout, end="", flush=True)
+                metadata = json.loads(Path(str(prefix) + ".json").read_text())
+                if run:
+                    records[backend].append({key: metadata[key] for key in ["setup_seconds", "simulation_seconds", "real_time_factor", "peak_process_resident_bytes"]})
+        entry = {"active_modes": metadata["active_modes"], "grid": [metadata["nx"], metadata["ny"]],
+                 "config": str(config), "sample_count": metadata["sample_count"],
+                 "config_sha256": digest(config), "measurements": records}
+        entry["median_seconds"] = {backend: statistics.median(row["simulation_seconds"] for row in values) for backend, values in records.items()}
+        if not args.gpu_only:
+            entry["cpu_over_metal"] = entry["median_seconds"]["cpu"] / entry["median_seconds"]["metal"]
+        if args.baseline_root:
+            entry["baseline_over_metal"] = entry["median_seconds"]["baseline_metal"] / entry["median_seconds"]["metal"]
+        report["cases"][scene] = entry
+        print(f"{scene}: median seconds {entry['median_seconds']}", flush=True)
+        if args.baseline_root:
+            print(f"{scene}: baseline Metal {entry['median_seconds']['baseline_metal']:.6f}s, speedup {entry['baseline_over_metal']:.3f}", flush=True)
+    if identity(ROOT, executable) != native_identity:
+        raise RuntimeError("Native executable or runtime sources changed during benchmarking")
+    if args.baseline_root and any(identity(baseline_root, baseline_binary)[key] != report["baseline"][key] for key in native_identity):
+        raise RuntimeError("Baseline executable or runtime sources changed during benchmarking")
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+
+
+if __name__ == "__main__":
+    main()

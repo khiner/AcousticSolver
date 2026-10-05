@@ -149,7 +149,7 @@ for scene in scenes:
 with open(results_path, "w") as f:
     json.dump(results, f, indent=1, sort_keys=True)
 
-# Table rows for VALIDATION.md / README, from the persisted results
+# Comparison rows from the persisted results
 print("\n| Scene | Verdict | rel L2 | corr | RMS ratio | spec err | wall |")
 print("|---|---|---|---|---|---|---|")
 total = 0.0

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Validate current Metal trajectories against saved, converged MPFR renders.
+
+Create the reference first with script/PlatePrecisionRender. This command reuses
+its hash-verified MPFR outputs, never reruns the expensive CPU integration.
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from plate.env import ROOT, ensure_environment
+from plate import accuracy as m
+
+
+def main(args):
+    reference, output = Path(args.reference).resolve(), Path(args.output).resolve()
+    if reference == output or reference in output.parents or output in reference.parents:
+        raise ValueError('Keep current renders separate from the saved reference')
+    output.mkdir(parents=True, exist_ok=True)
+    saved = json.loads((reference / 'report.json').read_text())
+    config = saved['config']
+    if not saved['full_render'] or not saved['reference']['converged']:
+        raise ValueError('A full, converged reference is required')
+    reference_artifacts = m.verify_artifacts(reference, {
+        f'mpfr{digits}{suffix}': saved['artifacts'][f'mpfr{digits}{suffix}']
+        for digits in m.DIGITS for suffix in ('.json', '.bin', '.states.bin', '.diagnostics.bin')})
+    for digits in m.DIGITS:
+        metadata = json.loads((reference / f'mpfr{digits}.json').read_text())
+        if (not metadata['full_render'] or metadata['config'] != config or
+                metadata['sample_count'] != saved['count'] or metadata['original_update_relative_residual'] > 1e-50):
+            raise ValueError('Invalid reference metadata')
+    count, modes, channels = saved['count'], metadata['mx'] * metadata['my'], len(config['pickups'])
+    convergence = m.compare(reference / 'mpfr64', reference / 'mpfr128', count, modes, channels)
+    tolerance = m.TOLERANCE
+    if not all(v <= tolerance for v in convergence['metrics'].values()):
+        raise ValueError('Reference convergence failed')
+
+    def identity():
+        return m.identity([Path(__file__), *m.native_paths()])
+
+    if args.score:
+        previous = json.loads((output / 'report.json').read_text())
+        if previous['implementation'] != identity() or previous['reference_artifacts'] != reference_artifacts:
+            raise ValueError('Implementation or reference changed; rerun without --score')
+        m.verify_artifacts(output, previous['artifacts'])
+    else:
+        m.execute(['cmake', '--build', 'build', '--target', 'PlateSolve', '-j', '4'], output / 'build.log')
+        m.save(output / 'config.json', config)
+    implementation = identity()
+    if not args.score:
+        for name, flags in (('auto', []), ('fft', ['--fft'])):
+            m.execute([ROOT / 'build/PlateSolve', output / 'config.json', *flags,
+                       '--states', '--no-wav', '--output', output / name], output / f'{name}.log')
+            print(f'Completed {name}', flush=True)
+    features = m.features(reference / 'mpfr128', config)
+    convergence['stft_magnitude'] = m.compare_acoustics(m.features(reference / 'mpfr64', config), features)['stft_magnitude_relative_l2']
+    if convergence['stft_magnitude'] > tolerance:
+        raise ValueError('Reference spectral convergence failed')
+    results = {}
+    for name in ('auto', 'fft'):
+        prefix = output / name
+        meta = json.loads(prefix.with_suffix('.json').read_text())
+        if meta['config'] != config or meta['sample_count'] != count or 'Metal' not in meta['backend']:
+            raise ValueError('Unexpected production configuration, duration or backend')
+        if name == 'fft' and (meta['backend'] != 'Metal 256-bit FFT' or meta['backend_selection'] != 'explicit'):
+            raise ValueError('Explicit FFT selection was not exercised')
+        if name == 'auto' and meta['backend_selection'] != 'auto':
+            raise ValueError('Automatic selection was not exercised')
+        result = m.compare(prefix, reference / 'mpfr128', count, modes, channels)
+        result['acoustics'] = m.compare_acoustics(m.features(prefix, config), features)
+        result['gates'] = {key: value <= tolerance for key, value in result['metrics'].items()}
+        result['gates']['stft_magnitude'] = result['acoustics']['stft_magnitude_relative_l2'] <= tolerance
+        result['energy_work_balance'] = m.energy_work_balance(prefix, config['sample_rate'])
+        result['gates']['energy_work_balance'] = result['energy_work_balance'] <= 2e-9
+        result['byte_identical'] = {suffix: m.digest(prefix.with_suffix(suffix)) == reference_artifacts[f'mpfr128{suffix}']
+                                    for suffix in ('.bin', '.states.bin', '.diagnostics.bin')}
+        result['backend'] = meta['backend']
+        result['simulation_seconds'] = meta['simulation_seconds']
+        result['setup_seconds'] = meta['setup_seconds']
+        result['passed'] = all(result['gates'].values())
+        results[name] = result
+    if implementation != identity():
+        raise ValueError('Implementation changed during validation')
+    passed = all(result['passed'] for result in results.values())
+    report = dict(passed=passed, tolerance=tolerance, config=config, sample_count=count,
+                  reference=str(reference), reference_artifacts=reference_artifacts,
+                  convergence=convergence, implementation=implementation, results=results,
+                  artifacts={p.name: m.digest(p) for p in output.iterdir()
+                             if p.suffix in ('.bin', '.json') and p.name != 'report.json'})
+    m.save(output / 'report.json', report)
+    print(json.dumps(dict(passed=passed, results={k: {x: v[x] for x in ('passed', 'backend', 'simulation_seconds', 'byte_identical')}
+                                               for k, v in results.items()}), indent=2))
+    return 0 if passed else 1
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference', default=str(ROOT / 'build/plate-end-to-end/crash'))
+    parser.add_argument('--output', default=str(ROOT / 'build/plate-accuracy/crash'))
+    parser.add_argument('--score', action='store_true')
+    ensure_environment(__file__)
+    sys.exit(main(parser.parse_args()))

@@ -78,6 +78,17 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## External reference submodules
+
+`external/fa2026` points to Victor Zheleznov and Stefan Bilbao's reference implementation for
+*Explicit and Stable Pseudospectral Time-Domain Method for the Föppl–von Kármán Equations*.
+The pinned revision `7b1e0a2088c9f5758a216c218f9c34e87656d100` has no explicit code license.
+Its public availability does not grant a GPLv3 relicensing permission. It remains an external
+comparison program, is not linked into the native targets, and retains its authors' rights.
+The native `src/Plate/` implementation is written from the published equations; the reference
+runner imports the submodule to compare numerical outputs. The paper is available at
+https://arxiv.org/abs/2608.06139.
+
 ## Libraries vendored under `src/ThirdParty/`
 
 Each carries its full license text in-tree, at the location given.

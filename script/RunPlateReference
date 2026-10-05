@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Run the pinned FA2026 implementation, recording raw FP64 output and states.
+
+script/RunPlateReference config/PlateSmall.json --seconds .02 --output build/plate/ref
+script/RunPlateReference config/PlateSmall.json --method modal --seconds .02
+
+Dependencies are installed only into build/plate-reference. The upstream tree is
+imported unchanged. Modal coupling is bounded to 128 active modes by default.
+All strikes must share a position because upstream exposes one excitation basis.
+"""
+import argparse
+import importlib.metadata
+import json
+import math
+from pathlib import Path
+import platform
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from plate.accuracy import digest, save
+from plate.env import ROOT, ensure_environment, require_reference
+
+
+def run(args):
+    commit = require_reference()
+    import numpy as np
+    from src.generators import plate as upstream
+    from src.utils import sav
+
+    config = json.loads(Path(args.config).read_text())
+    seconds = args.seconds if args.seconds is not None else config.get("seconds", .1)
+    fs = config.get("sample_rate", 44100)
+    if not math.isfinite(fs) or not math.isfinite(seconds) or int(fs) != fs or fs <= 0 or seconds <= 0:
+        raise ValueError("Reference requires positive integer sample_rate and positive seconds")
+    cycle_count = int(np.floor(seconds * fs))
+    repeats = config.get("repeat_count",1)
+    if not isinstance(repeats,int) or isinstance(repeats,bool) or repeats < 1:
+        raise ValueError("repeat_count must be a positive integer")
+    count = cycle_count*repeats
+    if cycle_count < 1:
+        raise ValueError("Duration has no samples")
+    strikes = config.get("strikes", [])
+    position = strikes[0]["position"] if strikes else [.17, .42]
+    if any(strike["position"] != position for strike in strikes):
+        raise ValueError("Upstream reference supports strikes at one shared position")
+    pickups = config.get("pickups", [[.64, .79]])
+    params = dict(fs=fs,dur=seconds,fmax=config.get("cutoff_hz"),use_exact=config.get("use_exact",True))
+    physical = config.get("physical")
+    if physical:
+        params.update(Lx=physical["lx"],Ly=physical["ly"],rho=physical["density"],H=physical["thickness"],
+                      E=physical["young_modulus"],nu=physical["poisson_ratio"],loss=physical["loss"],
+                      exc_pos=position,out_pos=pickups[0])
+    else:
+        params.update(kappa=config.get("kappa",60),sigma0=config.get("sigma0",1.3),sigma1=config.get("sigma1",1e-4),
+                      ratio=config.get("ratio",1.1),xe=position[0],ye=position[1],xo=pickups[0][0],yo=pickups[0][1])
+    nonlinear = config.get("nonlinear", True)
+    cls = upstream.VKPlatePSTD if args.method == "pstd" else upstream.VKPlateModal
+    if not nonlinear:
+        cls = upstream.LinearPlateModal
+    if nonlinear:
+        params.update(lambda0=config.get("lambda", 1000), os_factor=config.get("oversampling", 1.5),norm_type=config.get("norm_type",1))
+    def construct(kind,arguments):
+        return kind.from_physical_parameters(**arguments) if physical else kind(**arguments)
+    if args.method == "modal" and nonlinear:
+        probe = construct(upstream.LinearPlateModal,{k: v for k, v in params.items() if k not in ("lambda0", "os_factor","norm_type")})
+        if probe.num_modes > args.max_modal_modes:
+            raise ValueError(f"Modal tensor requested for {probe.num_modes} modes; limit {args.max_modal_modes}")
+    sav.EPS = config.get("epsilon", 1e-12)
+    setup_start = time.perf_counter()
+    model = construct(cls,params)
+    model._exc_factor *= config.get("excitation_scale",1.)
+    model._out_factor *= config.get("output_scale",1.)
+    setup_seconds = time.perf_counter() - setup_start
+    forcing = np.zeros(cycle_count)
+    for strike in strikes:
+        duration, start = strike["duration"], strike.get("start", 0.)
+        if duration <= 0:
+            raise ValueError("Strike duration must be positive")
+        forcing += upstream.calc_exc(fs, cycle_count, strike["amplitude"], duration, start, strike.get("type",2))
+    forcing = np.tile(forcing,repeats)
+    original_excitation = upstream.calc_exc
+    upstream.calc_exc = lambda *a, **kw: forcing.copy()
+    states = None if args.no_states else np.empty((count, model.num_modes), dtype=np.float64)
+    samples = np.empty((count,len(pickups)),dtype=np.float64)
+    length_scale = np.sqrt(physical["lx"]*physical["ly"]) if physical else 1.
+    pickup_weights = [model._calc_basis(*(np.asarray(point)/length_scale)) for point in pickups]
+    input_power = np.empty(count)
+    original_power = model._calc_power
+    index = 0
+
+    def observe(q, q2, force):
+        nonlocal index
+        if states is not None:
+            states[index] = q
+        samples[index] = [model._out_factor*np.dot(basis,q) for basis in pickup_weights]
+        input_power[index] = np.dot((q - q2) / (2 * model.k), model._exc_basis) * force
+        index += 1
+        return original_power(q, q2, force)
+
+    model._calc_power = observe
+    final_scalars = {}
+    old_profile = sys.getprofile()
+
+    def capture_return(frame, event, arg):
+        if event == "return" and frame.f_code is cls.__call__.__code__ and frame.f_locals.get("self") is model:
+            final_scalars["psi"] = float(frame.f_locals.get("psi1", 0.))
+            final_scalars["q"] = frame.f_locals["q1"].copy()
+            final_scalars["previous"] = frame.f_locals["q2"].copy()
+
+    start = time.perf_counter()
+    try:
+        sys.setprofile(capture_return)
+        first_pickup = model(0., 1., 0., 2, num_repeat=repeats,init_amp=config.get("initial_amplitude", 0.))
+    finally:
+        sys.setprofile(old_profile)
+        upstream.calc_exc = original_excitation
+    elapsed = time.perf_counter() - start
+    if not np.allclose(samples[:, 0], first_pickup, rtol=1e-13, atol=1e-15):
+        raise RuntimeError("State observation does not reproduce upstream pickup")
+    psi = model.psi_half if nonlinear else np.zeros(count)
+    potential = model.V_half if nonlinear else np.zeros(count)
+    drift = psi - np.sqrt(2 * potential + sav.EPS) if nonlinear else np.zeros(count)
+    diagnostics = np.column_stack([model.energy, input_power, input_power-model.power, psi, potential, drift])
+    rectangle = model._num_modes_x * model._num_modes_y
+    active = (model._mx - 1) * model._num_modes_y + model._my - 1
+    final_q, previous = np.zeros(rectangle), np.zeros(rectangle)
+    final_q[active], previous[active] = final_scalars["q"], final_scalars["previous"]
+    prefix = Path(args.output)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    outputs = [(".bin",samples),(".diagnostics.bin",diagnostics)]
+    if states is not None:
+        full_states = np.zeros((count, rectangle))
+        full_states[:, active] = states
+        outputs.append((".states.bin",full_states))
+    else:
+        Path(str(prefix)+".states.bin").unlink(missing_ok=True)
+    for suffix, data in outputs:
+        if not np.isfinite(data).all():
+            raise RuntimeError(f"Nonfinite reference output: {suffix}")
+        data.astype("<f8").tofile(str(prefix) + suffix)
+    # Independent fixed-state operator samples exercise both reference formulations.
+    operator = None
+    if nonlinear:
+        q = .01 * np.sin(np.arange(model.num_modes) + .5)
+        value, gradient = model._calc_potential(q)
+        operator = {"q_active": q.tolist(), "potential": float(value), "gradient_active": gradient.tolist()}
+    resolved = dict(config, seconds=seconds, sample_rate=fs)
+    scaled = dict(sample_rate=fs,cutoff_hz=config.get("cutoff_hz") or fs/(2 if params["use_exact"] else np.pi),
+                  kappa=model._kappa,ratio=model._ratio,sigma0=model._sigma0,sigma1=model._sigma1,
+                  use_exact=params["use_exact"],norm_type=config.get("norm_type",1),oversampling=config.get("oversampling",1.5),
+                  excitation_scale=model._exc_factor,output_scale=model._out_factor,
+                  lambda_=config.get("lambda",1000),epsilon=sav.EPS,nonlinear=nonlinear,
+                  strikes=[dict(strike,position=(np.asarray(strike["position"])/length_scale).tolist()) for strike in strikes],
+                  pickups=[(np.asarray(point)/length_scale).tolist() for point in pickups])
+    scaled["lambda"] = scaled.pop("lambda_")
+    metadata = {"method": args.method if nonlinear else "linear", "precision": "float64", "config": resolved,
+                "resolved_config":scaled,"cycle_sample_count":cycle_count,"repeat_count":repeats,"sample_rate":fs,"total_seconds":count/fs,
+                "samples": count, "pickups": len(pickups), "mx": model._num_modes_x, "my": model._num_modes_y,
+                "active_indices": active.tolist(), "diagnostic_columns": ["energy", "input_power", "dissipated_power", "psi", "half_potential", "drift"],
+                "states_recorded":states is not None,
+                "final_state": {"q": final_q.tolist(), "previous": previous.tolist(), "psi": final_scalars["psi"], "step_index": count},
+                "operator": operator, "setup_seconds": setup_seconds, "simulation_seconds": elapsed,
+                "provenance": {"repository": "https://github.com/victorzheleznov/fa2026", "revision": commit,
+                    "wrapper_sha256": digest(Path(__file__)),
+                    "config_sha256": digest(Path(args.config)),
+                    "python": sys.version, "platform": platform.platform(),
+                    "dependencies": {package: importlib.metadata.version(package) for package in ("numpy", "scipy", "numba")}}}
+    save(Path(str(prefix) + ".json"), metadata)
+    print(f"{metadata['method']}: {count} samples, {model.num_modes} modes, {elapsed:.3f}s -> {prefix}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("config")
+    parser.add_argument("--seconds", type=float)
+    parser.add_argument("--output", default=str(ROOT / "build/plate/reference"))
+    parser.add_argument("--method", choices=["pstd", "modal"], default="pstd")
+    parser.add_argument("--max-modal-modes", type=int, default=128)
+    parser.add_argument("--no-states",action="store_true",help="retain all pickups/diagnostics and final state without full modal history")
+    args = parser.parse_args()
+    ensure_environment(__file__)
+    run(args)

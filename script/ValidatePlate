@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Numerical ladder and independent pinned FA2026 comparisons (bounded defaults).
+
+script/ValidatePlate                 # analytic ladder, upstream PSTD/modal, CPU/Metal
+script/ValidatePlate --cpu           # native FP64 and both upstream formulations
+script/ValidatePlate --score         # inspect existing artifacts without new runs
+script/ValidatePlate --paper         # also short paper-size and crash comparisons
+
+No listening normalization is applied. Gate raw pickup, complete modal trajectories,
+energy, final q/previous/psi, and fixed-state potential/gradient. Long trajectories
+use PlatePrecisionRender and ValidatePlateAccuracy with converged MPFR references.
+Reference timings include Python observation instrumentation and are not benchmarks.
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from plate.accuracy import digest, save, execute
+from plate.env import ROOT, REVISION, ensure_environment, require_reference
+
+
+def main(args):
+    import numpy as np
+    directory = Path(args.output).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    report_path = directory/"report.json"
+    previous_report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+    captured_references = json.loads((directory/"reference-capture.json").read_text()) if (directory/"reference-capture.json").is_file() else {}
+    build = Path(args.build).resolve()
+    report = {"comparisons": {}, "artifacts": {}, "passed": True,
+              "scope":{"short_options":True,"paper":args.paper,"cpu_only":args.cpu,"metal_transform":"fft" if args.fft else "dense"}}
+    def implementation_identity():
+        paths = [build/"PlateSolve",build/"PlateTest"]
+        paths += sorted(p for p in (ROOT/"src/Plate").iterdir() if p.suffix in [".h",".cpp",".metal"])
+        return {str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path):digest(path) for path in paths}
+    identity = implementation_identity()
+    manifest = directory/"implementation.json"
+    if args.score:
+        if not manifest.is_file() or json.loads(manifest.read_text()) != identity:
+            raise RuntimeError("Saved outputs do not identify the current native binaries/runtime shader sources; rerun validation")
+    else:
+        save(manifest, identity)
+    if args.score and not args.cpu:
+        expected_backend = "Metal 256-bit FFT" if args.fft else "Metal 256-bit"
+        for path in directory.glob("*/metal.json"):
+            if json.loads(path.read_text()).get("backend") != expected_backend:
+                raise RuntimeError("Saved Metal transform backend differs from the requested backend")
+    report_path.unlink(missing_ok=True)
+    report["implementation"] = identity
+    if args.reuse_reference:
+        require_reference()
+
+    def run_reference(config_path, method, prefix):
+        metadata_path = Path(str(prefix)+".json")
+        reference_hashes = dict(captured_references.get("artifacts",{}))
+        if "passed" in previous_report:
+            reference_hashes.update(previous_report.get("artifacts",{}))
+        if args.reuse_reference and reference_hashes and metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text())
+            config = json.loads(config_path.read_text())
+            expected_method = method if config.get("nonlinear",True) else "linear"
+            files = [Path(str(prefix)+suffix) for suffix in [".json",".bin",".diagnostics.bin",".states.bin"]]
+            provenance = metadata.get("provenance",{})
+            valid = metadata.get("config") == config and metadata.get("method") == expected_method
+            valid &= provenance.get("revision") == REVISION
+            valid &= provenance.get("wrapper_sha256") == digest((ROOT/"script/RunPlateReference"))
+            valid &= provenance.get("config_sha256") == digest(config_path)
+            valid &= all(path.is_file() and reference_hashes.get(str(path.relative_to(directory))) == digest(path) for path in files)
+            if valid:
+                print(f"Reuse verified upstream artifacts: {prefix}",flush=True)
+                return
+        execute([ROOT/"script/RunPlateReference",config_path,"--method",method,"--output",prefix],Path(str(prefix)+".log"))
+
+    def metric(name, actual, expected, tolerance, scale=None):
+        if actual.shape != expected.shape or not np.isfinite(actual).all() or not np.isfinite(expected).all():
+            raise RuntimeError(f"Invalid numerical output for {name}")
+        error = float(np.linalg.norm(actual-expected)/max(np.linalg.norm(expected) if scale is None else scale,1e-30))
+        passed = error <= tolerance
+        report["comparisons"][name] = {"relative_l2": error,"tolerance":tolerance,"passed":bool(passed)}
+        report["passed"] &= bool(passed)
+        print(f"{'PASS' if passed else 'FAIL'} {name}: {error:.3g} <= {tolerance:.3g}")
+
+    base = dict(sample_rate=16000,cutoff_hz=2400,kappa=60,ratio=1.1,sigma0=2.,sigma1=.0001,
+                nonlinear=True,seconds=.032,initial_amplitude=0.,pickups=[[.64,.79],[.3,.6]],
+                strikes=[dict(position=[.17,.42],amplitude=2e5,start=0.,duration=.002)])
+    cases = {"linear":dict(base,nonlinear=False), "nonlinear":base,
+             "repeated":dict(base,seconds=.128,strikes=[dict(base["strikes"][0],start=t) for t in [0.,.03,.06]]),
+             "initial":dict(base,seconds=.016,strikes=[],initial_amplitude=.02,sigma0=0.,sigma1=0.,**{"lambda":0.}),
+             "initial_regulated":dict(base,seconds=.016,strikes=[],initial_amplitude=.02,sigma0=0.,sigma1=0.)}
+    cases.update({
+        "option_norm2":dict(base,norm_type=2),
+        "option_norm2_initial":dict(base,norm_type=2,initial_amplitude=.02),
+        "option_standard":dict(base,use_exact=False),
+        "option_standard_auto":dict(base,use_exact=False,cutoff_hz=None),
+        "option_exact_auto":dict(base,cutoff_hz=None),
+        "option_linear_standard":dict(base,nonlinear=False,use_exact=False,cutoff_hz=None),
+        "option_type1_repeat":dict(base,seconds=.005125,repeat_count=3,
+                                   strikes=[dict(base["strikes"][0],type=1,start=.001)]),
+        "option_scales":dict(base,excitation_scale=.125,output_scale=2.5),
+        "option_unpadded":dict(base,oversampling=1.),
+        "option_physical":dict(sample_rate=16000,seconds=.016,cutoff_hz=2400,
+                               physical=dict(lx=.4,ly=.3,density=7800.,thickness=.002,young_modulus=2e11,poisson_ratio=.3,
+                                             loss=[[100.,10.],[1000.,5.]]),
+                               strikes=[dict(position=[.07,.11],amplitude=20.,start=0.,duration=.002)],
+                               pickups=[[.29,.19],[.1,.23]],excitation_scale=.7,output_scale=1.2)
+    })
+    if args.paper:
+        for size in ["Small","Large","Crash"]:
+            cases[f"paper_{size.lower()}"] = dict(json.loads((ROOT/f"config/Plate{size}.json").read_text()),seconds=.02)
+    backends = ["cpu"] if args.cpu else ["cpu","metal"]
+    if not args.score:
+        execute([build/"PlateTest", *(["--cpu"] if args.cpu else []),"--output",directory/"ladder.json"],directory/"ladder.log")
+    ladder = json.loads((directory/"ladder.json").read_text())
+    report["passed"] &= ladder["failures"] == 0
+    for name, config in cases.items():
+        case = directory/name
+        case.mkdir(exist_ok=True)
+        config_path = case/"config.json"
+        linear_case = not config.get("nonlinear",True)
+        # The unpadded pseudospectral operator intentionally aliases products;
+        # the exact modal-coupling formulation is not the same discrete problem.
+        methods = ["pstd"] if linear_case or name in ["paper_large","option_unpadded"] else ["pstd","modal"]
+        if not args.score:
+            save(config_path, config)
+            for method in methods:
+                run_reference(config_path,method,case/method)
+                if not linear_case:
+                    execute([build/"PlateTest",*(["--cpu"] if args.cpu else []),"--reference",case/f"{method}.json",*(["--fft"] if args.fft else []),"--output",case/f"{method}-operators.json"],case/f"{method}-operators.log")
+            for backend in backends:
+                execute([build/"PlateSolve",config_path, *(["--cpu"] if backend == "cpu" else (["--fft"] if args.fft else ["--metal"])),
+                         "--no-wav","--states","--output",case/backend],case/f"{backend}.log")
+        reference_meta = json.loads((case/"pstd.json").read_text())
+        saved_config = json.loads(config_path.read_text())
+        if saved_config != config:
+            raise RuntimeError(f"Stored case {name} does not match current validation definition; run again without --score")
+        if reference_meta["config"] != config or reference_meta["provenance"]["revision"] != REVISION:
+            raise RuntimeError(f"Reference config does not match case {name}")
+        if reference_meta["provenance"]["wrapper_sha256"] != digest((ROOT/"script/RunPlateReference")):
+            raise RuntimeError(f"Reference wrapper changed for {name}; rerun validation")
+        prefixes = backends + (["modal"] if "modal" in methods else [])
+        truth = {suffix:np.fromfile(case/f"pstd{suffix}",dtype="<f8") for suffix in [".bin",".states.bin",".diagnostics.bin"]}
+        for backend in prefixes:
+            tolerance = 2e-8
+            # With a exactly symmetric nonzero initial state, the norm-one
+            # regulator's sign(p) responds to roundoff in stationary modes.
+            # The two upstream formulations already differ ~1.5e-6 here.
+            # Keep this explicit special gate; unregulated initialization above
+            # and every nonsymmetric forced case retain the strict FP64 bound.
+            if name == "initial_regulated":
+                tolerance = 1e-5
+            metadata = json.loads((case/f"{backend}.json").read_text())
+            if any(metadata["config"].get(key) != value for key,value in config.items()):
+                raise RuntimeError(f"Native/reference metadata config mismatch for {name}/{backend}")
+            if metadata["mx"] != reference_meta["mx"] or metadata["my"] != reference_meta["my"]:
+                raise RuntimeError(f"Mode dimensions differ for {name}/{backend}")
+            expected_samples = int(config["seconds"]*config["sample_rate"])*config.get("repeat_count",1)
+            actual_samples = metadata.get("sample_count",metadata.get("samples"))
+            if actual_samples != expected_samples or reference_meta["samples"] != expected_samples:
+                raise RuntimeError(f"Sample clock mismatch for {name}/{backend}")
+            if metadata.get("cycle_sample_count") != reference_meta["cycle_sample_count"] or metadata.get("repeat_count") != reference_meta["repeat_count"]:
+                raise RuntimeError(f"Repeated-cycle clock mismatch for {name}/{backend}")
+            actual_settings, expected_settings = metadata["resolved_config"], reference_meta["resolved_config"]
+            for field in ["sample_rate","cutoff_hz","kappa","ratio","sigma0","sigma1","excitation_scale","output_scale","use_exact","norm_type"]:
+                metric(f"{name}/{backend}/resolved_{field}",np.asarray(float(actual_settings[field])),np.asarray(float(expected_settings[field])),2e-12)
+            for suffix, label in [(".bin","pickup"),(".states.bin","states")]:
+                metric(f"{name}/{backend}/{label}",np.fromfile(case/f"{backend}{suffix}",dtype="<f8"),truth[suffix],tolerance)
+            expected_diag = truth[".diagnostics.bin"].reshape(-1,6)
+            actual_diag = np.fromfile(case/f"{backend}.diagnostics.bin",dtype="<f8").reshape(-1,6)
+            for column in range(3 if linear_case else 6):
+                diagnostic_tolerance = 2e-8 if name == "initial_regulated" and column in [0,1,2,4] else tolerance
+                metric(f"{name}/{backend}/{reference_meta['diagnostic_columns'][column]}",actual_diag[:,column],expected_diag[:,column],diagnostic_tolerance,
+                       scale=np.linalg.norm(expected_diag[:,3]) if column == 5 else None)
+            for field in ["q","previous"] + ([] if linear_case else ["psi"]):
+                metric(f"{name}/{backend}/final_{field}",np.asarray(metadata["final_state"][field]),np.asarray(reference_meta["final_state"][field]),tolerance*2)
+        for method in ([] if linear_case else methods):
+            operator_report = json.loads((case/f"{method}-operators.json").read_text())
+            report["passed"] &= operator_report["failures"] == 0
+        artifacts = [config_path]
+        for prefix in ["pstd",*prefixes]:
+            artifacts += [case/f"{prefix}{suffix}" for suffix in [".json",".bin",".states.bin",".diagnostics.bin"]]
+        artifacts += [case/f"{method}-operators.json" for method in ([] if linear_case else methods)]
+        for path in artifacts:
+            report["artifacts"][str(path.relative_to(directory))] = digest(path)
+    if args.paper:
+        for backend in ["pstd",*backends]:
+            weak = np.fromfile(directory/f"paper_small/{backend}.bin",dtype="<f8")
+            strong = np.fromfile(directory/f"paper_crash/{backend}.bin",dtype="<f8")
+            difference = float(np.linalg.norm(strong-10*weak)/np.linalg.norm(10*weak))
+            passed = np.isfinite(difference) and difference >= .1
+            report["comparisons"][f"paper/{backend}/amplitude_dependence"] = {"relative_l2":difference,"minimum":.1,"passed":bool(passed)}
+            report["passed"] &= bool(passed)
+            print(f"{'PASS' if passed else 'FAIL'} paper/{backend}/amplitude_dependence: {difference:.3g} >= .1")
+    if implementation_identity() != identity:
+        raise RuntimeError("Native binaries or runtime shader sources changed during validation; rerun with a stable build")
+    save(report_path, report)
+    print(f"{'PASS' if report['passed'] else 'FAIL'}: {directory/'report.json'}")
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--cpu",action="store_true")
+    parser.add_argument("--fft",action="store_true",help="validate Metal FFT transforms instead of dense transforms")
+    parser.add_argument("--score",action="store_true")
+    parser.add_argument("--reuse-reference",action="store_true",help="reuse previously captured reference artifacts only after config, revision, wrapper, and output-hash verification")
+    parser.add_argument("--paper",action="store_true",help="also compare 20ms of the paper configurations and 127-mode crash")
+    parser.add_argument("--build",default=str(ROOT/"build"))
+    parser.add_argument("--output",default=str(ROOT/"build/plate-validation"))
+    args = parser.parse_args()
+    ensure_environment(__file__)
+    sys.exit(main(args))

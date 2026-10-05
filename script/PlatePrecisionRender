@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Generate independent MPFR convergence references from the configured strike.
+
+Default: full 3-second crash at 214 and 427 bits, using two CPU processes.
+The larger repeated-strike cases are expensive; --steps permits a bounded smoke.
+Use ValidatePlateAccuracy separately to compare Metal with converged references.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
+import shlex
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from plate.env import ROOT, ensure_environment
+from plate import accuracy as m
+
+CASES = sorted(p.stem for p in (ROOT / 'config/plate').glob('*.json'))
+
+
+def main(args):
+    directory = Path(args.output).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    fixture = Path(args.config).resolve() if args.config else ROOT / f'config/plate/{args.case}.json'
+    config = json.loads(fixture.read_text())
+    count = int(config['seconds'] * config['sample_rate']) * config.get('repeat_count', 1)
+    if args.steps:
+        count = min(count, args.steps)
+
+    def identity():
+        paths = [Path(__file__), fixture, ROOT / 'CMakeLists.txt', ROOT / 'src/Plate/Plate.cpp',
+                 ROOT / 'src/Plate/Plate.h', ROOT / 'script/plate/env.py', ROOT / 'script/plate/accuracy.py',
+                 ROOT / 'script/plate/PrecisionModel.h', ROOT / 'script/plate/PrecisionRender.cpp',
+                 Path('/opt/homebrew/lib/libmpfr.dylib'), Path('/opt/homebrew/lib/libgmp.dylib')]
+        return m.identity(paths + [directory / f'Render{digits}' for digits in m.DIGITS])
+
+    if not args.score:
+        m.execute(['cmake', '--build', 'build', '--target', 'PlateCore', '-j', '4'], directory / 'build.log')
+        entries = json.loads((ROOT / 'build/compile_commands.json').read_text())
+        command = shlex.split(next(e['command'] for e in entries if e['file'].endswith('/PlateTest.cpp')))
+        base, i = [], 0
+        while i < len(command):
+            if command[i] in ('-o', '-c'):
+                i += 2
+            else:
+                base.append(command[i])
+                i += 1
+        for digits in m.DIGITS:
+            command = base + [f'-DPLATE_DECIMAL_DIGITS={digits}', str(ROOT / 'script/plate/PrecisionRender.cpp'),
+                '-I/opt/homebrew/include', '-L/opt/homebrew/lib', str(ROOT / 'build/libPlateCore.a'),
+                str(ROOT / 'build/libAcousticCore.a'), '-lmpfr', '-lgmp', '-framework', 'Metal',
+                '-framework', 'Foundation', '-framework', 'Accelerate', '-o', str(directory / f'Render{digits}')]
+            m.execute(command, directory / f'build-{digits}.log')
+            m.save(directory / f'compile-{digits}.json', command)
+        m.save(directory / 'implementation.json', identity())
+        m.save(directory / 'config.json', config)
+    implementation = json.loads((directory / 'implementation.json').read_text())
+    if implementation != identity() or json.loads((directory / 'config.json').read_text()) != config:
+        raise ValueError('Implementation or configuration changed; rerun without --score')
+    if args.score:
+        saved = json.loads((directory / 'report.json').read_text())
+        m.verify_artifacts(directory, saved['artifacts'])
+    else:
+        def render(digits):
+            m.execute([directory / f'Render{digits}', directory / 'config.json', directory / f'mpfr{digits}', args.steps],
+                      directory / f'mpfr{digits}.log')
+            print(f'Completed {digits}-decimal-digit reference', flush=True)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            list(workers.map(render, m.DIGITS))
+    metadata = [json.loads((directory / f'mpfr{d}.json').read_text()) for d in m.DIGITS]
+    for meta in metadata:
+        if meta['sample_count'] != count or meta['config'] != config or meta['original_update_relative_residual'] > 1e-50:
+            raise ValueError('Invalid or algebraically inconsistent MPFR render')
+    reference = m.compare(directory / 'mpfr64', directory / 'mpfr128', count,
+                          metadata[0]['mx'] * metadata[0]['my'], len(config['pickups']))
+    full = all(meta['full_render'] for meta in metadata)
+    reference['tolerance'] = m.TOLERANCE
+    reference['converged'] = full and all(value <= m.TOLERANCE for value in reference['metrics'].values())
+    if full:
+        reference['acoustics'] = m.compare_acoustics(m.features(directory / 'mpfr64', config),
+                                                    m.features(directory / 'mpfr128', config))
+        reference['converged'] &= reference['acoustics']['stft_magnitude_relative_l2'] <= m.TOLERANCE
+    if implementation != identity():
+        raise ValueError('Implementation changed during the experiment')
+    report = dict(config=config, count=count, full_render=full, implementation=implementation, reference=reference,
+                  status=('converged' if reference['converged'] else 'reference_not_converged') if full else 'smoke_only',
+                  interpretation='Independent fixed-grid arithmetic convergence; not upstream waveform parity or continuum convergence.',
+                  artifacts={p.name: m.digest(p) for p in directory.iterdir()
+                             if p.suffix in ('.bin', '.json') and p.name != 'report.json'})
+    m.save(directory / 'report.json', report)
+    print(json.dumps(dict(status=report['status'], metrics=reference['metrics']), indent=2))
+    return int(full and not reference['converged'])
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--case', choices=CASES, default='UpstreamSmallCrashUncontrolled')
+    source.add_argument('--config', type=Path, help='scaled nonlinear 44.1 kHz configuration with exact linear coefficients')
+    parser.add_argument('--output', default=str(ROOT / 'build/plate-end-to-end/crash'))
+    parser.add_argument('--steps', type=int, default=0, help='bounded smoke only; 0 renders full duration')
+    parser.add_argument('--score', action='store_true')
+    args = parser.parse_args()
+    if args.steps < 0:
+        parser.error('--steps must be nonnegative')
+    ensure_environment(__file__)
+    sys.exit(main(args))

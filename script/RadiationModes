@@ -5,11 +5,6 @@ and how far each solver's modes drift when the grid is coarsened.
     script/RadiationModes            # analyse what is already in build/
     script/RadiationModes --render   # render both solvers at all three resolutions first
 
-These are the two tables in VALIDATION.md's SonicRadiation section that are not produced by
-any other check, and before this script they were assembled by hand — which is how they came
-to be quoted from a build several weight-format changes old. Anything that touches accuracy
-should re-run this.
-
 The comparison is spectral, not sample-for-sample: the two solvers use different methods and
 different sample rates (the radiation path runs at its grid's Courant limit, not the config's
 FDTD rate), so what is comparable is where the modal energy sits. Each output is normalised

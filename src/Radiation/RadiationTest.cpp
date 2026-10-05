@@ -128,10 +128,8 @@ struct Snr {
     double Db() const { return 10. * std::log10(Sig / std::max(Err, 1e-300)); }
 };
 
-// The gate. Every threshold is this implementation's own measurement, recorded in
-// VALIDATION.md's ladder table. The ladder is deterministic to every digit it prints, so the
-// margins are for a future toolchain's rounding rather than for drift: what this catches is
-// silent wrong answers, which arrive as tens of percent.
+// Numerical ladder gates include margins for toolchain rounding; they do not
+// permit large changes in the measured analytic error.
 int Failures = 0;
 
 void Fail(const char *what, double got, const char *relation, double want) {

@@ -171,7 +171,7 @@ const Eigen::ArrayXd &CoupledDirect::Solve(const Eigen::ArrayXd &states, double 
                 RhsF = Rhs.head(NCoupled).cast<float>();
                 // The two products are independent, so splitting them across cores is
                 // bit-identical as long as each stays one unsplit Accelerate call (splitting a
-                // *single* product is not — see VALIDATION.md). Only worth the thread hop once
+                // *single* product changes reduction order). Only worth the thread hop once
                 // an inverse outgrows the last-level cache and one core can no longer saturate
                 // the read.
                 if (size_t(NCoupled) * NCoupled * sizeof(float) > (size_t{2} << 20)) {

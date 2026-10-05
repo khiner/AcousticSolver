@@ -2,10 +2,9 @@
 
 This is an Apple Silicon implementation of [Acoustic Reliefs](https://doi.org/10.1145/3763287). The runner generates the mesh, optimizes the heightfield with the Metal acoustic solver and MPS appearance objective, and writes a final OBJ. Supply a target image, such as the Cat image from the authors' repository.
 
-From the repository root:
+After the [repository build setup](../../README.md#build), run from its root:
 
 ```sh
-cmake -S . -B build
 cmake --build build --target BemTextureSolve BemSolve -j 6
 python3 -m venv build/reliefs-venv
 build/reliefs-venv/bin/pip install -r script/reliefs/requirements.txt

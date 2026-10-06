@@ -143,21 +143,16 @@ modal-tensor cases. `--score` checks saved artifacts and implementation identity
 
 Coverage includes transforms, nonlinear gradients, padding, frequency/decay,
 energy/work balance, both regulator norms, initialization, repeated strikes,
-physical scaling, full-width arithmetic and FFT scratch storage. The numerical
-ladder passes 115 checks; each short Metal suite passes 866 comparisons. Usual
-waveform/modal tolerances are `2e-8`, with `4e-8` for final states. The symmetric
-regulated initial-state case uses `1e-5`/`2e-5` on affected waveform/state checks
-because its velocity-sign regulator amplifies roundoff between formulations.
-The thresholds are enforced in [ValidatePlate](script/ValidatePlate).
+physical scaling and both Metal backends. [ValidatePlate](script/ValidatePlate)
+defines per-case tolerances, including wider limits for the symmetric regulated
+initial-state case whose velocity-sign regulator amplifies roundoff.
 
 ### High-precision Metal accuracy
 
-For the full 3-second unregulated small crash, dense and FFT Metal match an
-independent 214/427-bit converged reference at exported binary64 precision.
-Waveform and complete modal history are byte-identical; diagnostic differences
-are limited to signed zeros. This reference is an independent implementation of
-the discrete equations, not upstream Python executed at higher precision.
-Convergence is distinct from upstream FP64 waveform parity and continuum accuracy.
+Long-trajectory checks use an independent high-precision implementation of the
+discrete equations. The 3-second unregulated small crash is validated against a
+converged reference. This establishes neither upstream FP64 waveform parity nor
+continuum accuracy.
 
 ```sh
 # Generate a reference once; the small crash takes about half an hour on M5 Max.
@@ -178,14 +173,68 @@ reference generator provides a bounded smoke, not full convergence evidence.
 the energy, repeated-strike, amplitude, stock and decay presets. `--config PATH`
 accepts scaled nonlinear 44.1 kHz configurations with exact linear coefficients,
 including `config/PlateLarge.json`. Give each reference its own `--output` directory,
-then pass that directory to `ValidatePlateAccuracy --reference`. These replace the
-old long-duration FP64 waveform gates; availability of a fixture does not establish
-full-duration convergence for it.
+then pass that directory to `ValidatePlateAccuracy --reference`. Availability of a
+fixture does not establish full-duration convergence for it.
 
-Two 9-second repeated-strike fixtures still lack converged full-duration references.
-A 400:1 aspect-ratio stress case retains a CPU potential error of `2.06e-12` against
-a `2e-12` gate. Neither result is covered by the small-crash claim. The renderer
-produces displacement; acoustic radiation and audio callbacks are outside scope.
+Two 9-second repeated-strike fixtures lack converged full-duration references,
+and the 400:1 aspect-ratio stress case exceeds its CPU potential-error gate.
+Neither is covered by the small-crash validation claim.
+
+## Nonlinear stiff strings
+
+```sh
+build/StringTest --metal
+# Dependencies for comparisons with the pinned upstream MATLAB scripts:
+brew install octave
+python3 -m pip install numpy soundfile
+git submodule update --init external/nLinStringsConv-SAV
+script/ValidateString
+script/ValidateString --long --output build/string-validation-long
+```
+
+`StringTest` checks gradients, conservation/damping, analytic modes, timestep
+refinement and CPU/Metal agreement.
+`ValidateString` compares all seven variants and both integrators against Octave:
+grids, clocks, displacement, full node states and available diagnostics. Regular
+captures are 2 ms; `--long` extends them to 60 ms, while small-shift smoke cases
+remain capped at 0.5 ms. `--cpu-only` skips Metal; `--reuse-reference` verifies
+configuration and hashes before reusing captures. Reports contain measured errors
+and the enforced tolerances.
+
+For a single reference capture, run `script/RunStringReference CONFIG --output PREFIX`.
+It preserves the upstream submodule and saves its generated adapter and provenance.
+`--max-steps` and `--max-points` override its size limits for large upstream presets.
+
+Geometric Form A is sensitive to timestep, grid and potential shift. The supplied
+Form B example uses a longitudinal grid; a transverse bound alone may not resolve
+longitudinal motion. `--stress --long` exercises sensitive small-shift Form A cases
+that can fail waveform agreement, including sensitivity within upstream itself.
+Energy conservation alone does not establish trajectory or continuum accuracy.
+
+Upstream GE A unsplit energy uses stale states, and GE reference energy arrays are
+unfilled; those energy columns are excluded from parity checks. The upstream
+unsplit SAV damping update also lacks the split scheme's energy-balance guarantee.
+The native `nonlinear: false` limit is checked analytically because upstream's
+corresponding branches are inconsistent.
+
+### Paper experiments
+
+```sh
+python3 -m pip install numpy matplotlib
+python3 script/string/PaperOde.py
+python3 script/string/PaperStrings.py --workers 4
+```
+
+These CPU sweeps reconstruct Figures 1–7 and compare with Tables 2–3. The full
+string sweep takes tens of minutes on an M5 Max. Results, figures and provenance
+are written under `build/string-paper/{ode,strings}/`. String runs use verified
+caches; `--plot-only` regenerates figures from saved results. Use ODE `--smoke` or
+lower string `--max-exponent`/`--reference-exponent` values for reduced checks.
+
+Some geometric cases terminate numerically, and the published table values are
+not reproduced exactly. Reports retain failures, discrepancies and interpretation
+choices, including initialization, sample timing and the ODE force-sign correction.
+Completing the sweeps does not establish convergence of every formulation.
 
 ## Acoustic Reliefs
 

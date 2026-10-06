@@ -1,0 +1,8 @@
+{
+  "variant": "cubic-split",
+  "oversampling": 16,
+  "seconds": 0.06,
+  "initial_condition": "mode",
+  "initial_amplitude": 0.002,
+  "damping": true
+}

@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Validate all seven nonlinear string formulations against pinned upstream Octave.
+
+Captures SAV and the independent reference branches on CPU and Metal. --long runs the
+regular cases for the paper's 60 ms; explicitly named epsilon-shift smokes stay
+at 0.5 ms. --stress retains sensitive GE-A epsilon cases with unchanged gates.
+"""
+import argparse
+import json
+from pathlib import Path
+import runpy
+import re
+import subprocess
+import sys
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+REFERENCE = runpy.run_path(str(ROOT / "script/RunStringReference"))
+COLUMNS = ["kinetic", "linear_potential", "nonlinear_potential", "dissipated", "energy", "psi"]
+
+
+def cases(seconds, stress=False):
+    if stress:
+        for variant in ("ge-a-unsplit", "ge-a-split"):
+            yield f"{variant}-sav-small-shift-stress", dict(variant=variant, integrator="sav", oversampling=2, seconds=seconds,
+                initial_amplitude=.002, longitudinal_grid=True, initial_condition="raised-cosine", damping=True, potential_shift=float(np.finfo(float).eps))
+        return
+    for variant in REFERENCE["SCRIPTS"]:
+        for integrator in ("sav", "reference"):
+            for profile in ("mode", "damped"):
+                yield f"{variant}-{integrator}-{profile}", dict(
+                    variant=variant, integrator=integrator, oversampling=2, seconds=seconds,
+                    initial_amplitude=.002, longitudinal_grid=variant.startswith("ge-"), initial_condition="mode" if profile == "mode" else "raised-cosine",
+                    damping=profile == "damped", potential_shift=1000)
+        yield f"{variant}-sav-small-shift-smoke", dict(variant=variant, integrator="sav", oversampling=2, seconds=min(seconds, .0005),
+            initial_amplitude=.002, longitudinal_grid=variant.startswith("ge-"), initial_condition="raised-cosine",
+            damping=True, potential_shift=float(np.finfo(float).eps))
+    # Exercise the transverse clock with axial stiffness close to tension, so
+    # this grid also resolves the longitudinal speed (unlike the steel default).
+    yield "ge-a-unsplit-transverse", dict(variant="ge-a-unsplit", integrator="sav", oversampling=2,
+        seconds=seconds, longitudinal_grid=False, initial_condition="mode", potential_shift=1000, young_modulus=190e6)
+    yield "custom-physical-grid", dict(variant="kc-split", integrator="sav", oversampling=2,
+        seconds=seconds, intervals=64, initial_condition="raised-cosine", initial_width=.2, damping=True, loss=[[20,12],[1500,8]], density=7800, tension=90, radius=.0003, young_modulus=190e9, length=.8)
+
+
+def compare(actual, expected, tolerance, floor=1e-12):
+    if actual.shape != expected.shape:
+        return dict(pass_=False, reason=f"shape {actual.shape} != {expected.shape}")
+    scale = max(float(np.max(np.abs(expected), initial=0)), floor)
+    error = float(np.max(np.abs(actual - expected), initial=0)) / scale
+    return dict(pass_=bool(np.isfinite(error) and error <= tolerance), relative_max_error=error, tolerance=tolerance, scale=scale)
+
+
+def wav_checks(args, output):
+    import soundfile as sf
+
+    checks = {}
+    for variant, amplitude in (("ge-b-split", .002), ("cubic-split", .002), ("kc-split", 0)):
+        prefix = output / (variant + "-wav")
+        config = dict(variant=variant, seconds=.003, intervals=32, initial_condition="mode", initial_amplitude=amplitude)
+        source = Path(str(prefix) + ".config.json")
+        source.write_text(json.dumps(config) + "\n")
+        subprocess.run([str(Path(args.executable).resolve()), str(source), "--cpu", "--output", str(prefix)], check=True, capture_output=True)
+        metadata = json.loads(Path(str(prefix) + ".json").read_text())
+        audio, rate = sf.read(str(prefix) + ".wav", always_2d=True)
+        expected_frames = int(np.ceil(metadata["sample_count"] * metadata["dt"] * 48000))
+        peak = float(np.max(np.abs(audio)))
+        checks[variant] = {"pass": bool(rate == 48000 and audio.shape == (expected_frames, metadata["channels"])
+            and np.isfinite(audio).all() and abs(peak - (.95 if amplitude else 0)) < 1e-6), "frames": len(audio), "peak": peak}
+    return checks
+
+
+def main(args):
+    output = Path(args.output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    report = {"reference_revision": REFERENCE["REVISION"], "cases": {}, "pass": True}
+    selected = [(name, config) for name, config in cases(.06 if args.long else args.seconds, args.stress)
+                if not args.case or re.search(args.case, name)]
+    if not selected:
+        raise ValueError("--case matched no validation cases")
+    for name, config in selected:
+        folder = output / name
+        folder.mkdir(parents=True, exist_ok=True)
+        source = folder / "config.json"
+        source.write_text(json.dumps(config, indent=2) + "\n")
+        prefix = folder / "upstream"
+        if args.reuse_reference:
+            metadata = json.loads(Path(str(prefix) + ".json").read_text())
+            if metadata["config"] != config or metadata["provenance"]["revision"] != REFERENCE["REVISION"] or metadata["provenance"].get("initial_perturbation", "none") != "none":
+                raise RuntimeError(f"Reference provenance/config mismatch: {name}")
+            if REFERENCE["digest"](str(prefix) + ".adapter.m") != metadata["provenance"]["adapter_sha256"]:
+                raise RuntimeError(f"Reference adapter changed: {name}")
+            for suffix, checksum in metadata["artifacts"].items():
+                if REFERENCE["digest"](str(prefix) + suffix) != checksum:
+                    raise RuntimeError(f"Reference artifact changed: {name}{suffix}")
+        else:
+            metadata = REFERENCE["run"](config, prefix, octave=args.octave)
+        if args.reference_only:
+            continue
+        frames, components, points = metadata["samples"], metadata["components"], metadata["points"]
+        def capture(prefix):
+            return {key: np.fromfile(str(prefix) + suffix, dtype="<f8").reshape(-1, columns)
+                    for key, suffix, columns in (("samples", ".bin", components),
+                        ("states", ".states.bin", components * points), ("diagnostics", ".diagnostics.bin", 6))}
+        expected = capture(prefix)
+        entry = report["cases"][name] = {}
+        backends = ["cpu"] + ([] if args.cpu_only else ["metal"])
+        for backend in backends:
+            native = folder / backend
+            command = [str(Path(args.executable).resolve()), str(source), "--" + backend, "--output", str(native), "--states", "--no-wav"]
+            result = subprocess.run(command, text=True, capture_output=True)
+            Path(str(native) + ".log").write_text(result.stdout + result.stderr)
+            if result.returncode:
+                entry[backend] = {"pass": False, "reason": f"native command failed; see {native}.log"}
+                report["pass"] = False
+                print(f"FAIL {name}/{backend}: native command failed", flush=True)
+                continue
+            native_meta = json.loads(Path(str(native) + ".json").read_text())
+            checks = {}
+            checks["timestep"] = compare(np.array([native_meta["dt"]]), np.array([metadata["timestep"]]), 2e-14)
+            checks["sample_rate"] = {"pass_": native_meta["sample_rate"] == metadata["sample_rate"]}
+            checks["grid"] = {"pass_": native_meta["intervals"] == metadata["intervals"] and native_meta["sample_count"] == frames}
+            actual = capture(native)
+            for key in ("samples", "states"):
+                width = points if key == "states" else 1
+                for component in range(components):
+                    part = slice(component * width, (component + 1) * width)
+                    checks[f"{key}_{component}"] = compare(actual[key][:, part], expected[key][:, part], 2e-7, floor=1e-10)
+            # GE reference scripts never fill their energy arrays. GE A unsplit's
+            # energy observation uses stale u/v arrays; its psi remains valid.
+            columns = range(6) if metadata["energy_available"] else [5]
+            for column in columns:
+                checks[COLUMNS[column]] = compare(actual["diagnostics"][:, column], expected["diagnostics"][:, column], 3e-6, floor=1e-10)
+            passed = all(check["pass_"] for check in checks.values())
+            entry[backend] = {"pass": passed, "checks": checks}
+            report["pass"] &= passed
+            print(f"{'PASS' if passed else 'FAIL'} {name}/{backend}", flush=True)
+        (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+    if args.reference_only:
+        print("Reference captures complete; native validation not run")
+    else:
+        report["wav"] = wav_checks(args, output)
+        report["pass"] &= all(check["pass"] for check in report["wav"].values())
+        (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(f"{'PASS' if report['pass'] else 'FAIL'}: {len(report['cases'])} reference cases -> {output / 'summary.json'}")
+    return 0 if report["pass"] else 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", default="build/string-validation")
+    parser.add_argument("--executable", default=str(ROOT / "build/StringSolve"))
+    parser.add_argument("--octave", default="octave")
+    parser.add_argument("--seconds", type=float, default=.002)
+    parser.add_argument("--long", action="store_true")
+    parser.add_argument("--stress", action="store_true", help="run the original ill-conditioned epsilon-shift GE-A cases; failures remain visible")
+    parser.add_argument("--case", help="regular expression selecting named validation cases")
+    parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--reference-only", action="store_true")
+    parser.add_argument("--reuse-reference", action="store_true")
+    sys.exit(main(parser.parse_args()))

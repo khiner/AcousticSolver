@@ -15,6 +15,7 @@ upstream-identical. Files under `src/` not listed here are original to this proj
 | `FluidSound.{h,cpp}`, `Oscillator.{h,cpp}`, `BubbleUtils.{h,cpp}`, `Integrators.{h,cpp}` | [FluidSound](https://github.com/kangruix/FluidSound) |
 | `ModalSound.{h,cpp}`, `ModeData.h` | ModalSound, based on [openpbso](https://github.com/jhwang7628/openpbso) |
 | `Room/*` | [PFFDTD](https://github.com/bsxfun/pffdtd) |
+| `String/*` | [nLinStringsConv-SAV](https://github.com/Nemus-Project/nLinStringsConv-SAV) |
 
 ### WaveBlender and FluidSound
 
@@ -78,6 +79,35 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+### Nonlinear stiff strings
+
+The CPU and Metal string solvers port the seven SAV formulations and CPU reference
+integrators accompanying Russo, Ducceschi and Bilbao,
+[*Numerical convergence of the scalar auxiliary variable method applied to nonlinear
+stiff string models*](https://doi.org/10.1007/s11071-026-12708-0).
+
+MIT License
+
+Copyright (c) 2026 NEMUS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ## External reference submodules
 
 `external/fa2026` points to Victor Zheleznov and Stefan Bilbao's reference implementation for
@@ -88,6 +118,10 @@ comparison program, is not linked into the native targets, and retains its autho
 The native `src/Plate/` implementation is written from the published equations; the reference
 runner imports the submodule to compare numerical outputs. The paper is available at
 https://arxiv.org/abs/2608.06139.
+
+`external/nLinStringsConv-SAV` pins the MIT-licensed MATLAB reference at
+`5253d5c8dc7e2645c925fd45f57f6bc32b66f2ec`. It is used by the optional Octave
+comparison runner and is not linked into the native targets.
 
 ## Libraries vendored under `src/ThirdParty/`
 

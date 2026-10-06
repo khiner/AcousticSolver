@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Capture the pinned MATLAB solvers through a documented temporary Octave adapter.
+
+The upstream checkout stays unchanged. The adapter overrides parameters, removes
+post-simulation plotting/audio, and observes states and diagnostics; the generated
+.m file is retained beside the outputs so every execution edit is reviewable.
+"""
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+UPSTREAM = ROOT / "external/nLinStringsConv-SAV"
+REVISION = "5253d5c8dc7e2645c925fd45f57f6bc32b66f2ec"
+SCRIPTS = {
+    "ge-a-unsplit": "GEstring/GEStringSAV_FA_noSplit.m",
+    "ge-a-split": "GEstring/GEStringSAV_FA_split.m",
+    "ge-b-split": "GEstring/GEStringSAV_FB_split.m",
+    "cubic-unsplit": "CUBstring/CubicStringSAV_noSplit.m",
+    "cubic-split": "CUBstring/CubicStringSAV_split.m",
+    "kc-unsplit": "KCstring/KCStringSAV_noSplit.m",
+    "kc-split": "KCstring/KCStringSAV_split.m",
+}
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def matlab(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"Expected finite numeric parameter, got {value!r}")
+    return format(value, ".17g")
+
+
+def run(config, prefix, *, octave="octave", max_steps=500000, max_points=4096, perturb_initial=False):
+    import numpy as np
+
+    prefix = Path(prefix).resolve()
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    revision = subprocess.check_output(["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True).strip()
+    if revision != REVISION or subprocess.check_output(["git", "-C", str(UPSTREAM), "status", "--porcelain"], text=True).strip():
+        raise RuntimeError("Reference requires the clean pinned nLinStringsConv-SAV submodule")
+    variant = config.get("variant", "ge-b-split")
+    source = UPSTREAM / SCRIPTS[variant]
+    text = source.read_text().split("realTimeFrac = toc")[0]
+    geometric = variant.startswith("ge-")
+    sav = config.get("integrator", "sav") == "sav"
+    if config.get("integrator", "sav") not in ("sav", "reference"):
+        raise ValueError("Unknown integrator")
+    default_initial = "mode" if variant in ("cubic-split", "cubic-unsplit", "kc-unsplit") else "raised-cosine"
+    if config.get("initial_condition", default_initial) not in ("mode", "raised-cosine"):
+        raise ValueError("Unknown initial condition")
+    if not config.get("nonlinear", True):
+        raise ValueError("Upstream nonlinear=false is inconsistent across branches; use native analytic linear checks")
+    supported = {"variant", "integrator", "oversampling", "sample_rate", "seconds", "initial_amplitude", "initial_condition", "damping", "longitudinal_grid", "potential_shift", "nonlinear", "density", "tension", "radius", "young_modulus", "length", "loss", "intervals", "stability_margin", "initial_width"}
+    if set(config) - supported:
+        raise ValueError(f"Unsupported reference configuration: {sorted(set(config) - supported)}")
+    names = {"density": "rho", "tension": "T0", "radius": "radius", "young_modulus": "E", "length": "L"}
+    replacements = {
+        "SAV": sav, "plotPsi": True, "initType": 1 if config.get("initial_condition", default_initial) == "mode" else 2,
+        "dampOn": config.get("damping", False), "play": False, "realTimeDraw": False,
+        "computeEnergy": True, "plotSpect": False, "OSfac": config.get("sample_rate", config.get("oversampling", {"ge-a-unsplit": 512, "ge-a-split": 256, "cubic-unsplit": 1024, "cubic-split": 1024, "kc-unsplit": 512, "kc-split": 2}.get(variant, 16)) * 44100) / 44100,
+        "durSec": config.get("seconds", .06), "amplitude": config.get("initial_amplitude", .002),
+        "shiftV": config.get("potential_shift", np.finfo(float).eps if variant in ("ge-a-split", "kc-split") else 1000), "epsilon": config.get("stability_margin", .01),
+        "widthMeter": config.get("initial_width", .25),
+    }
+    if geometric:
+        replacements["hTypeLong"] = config.get("longitudinal_grid", variant != "ge-a-unsplit")
+    replacements.update({name: config[key] for key, name in names.items() if key in config})
+    if "loss" in config:
+        (low, decay_low), (high, decay_high) = config["loss"]
+        replacements.update(omega1=low * 2 * math.pi, omega2=high * 2 * math.pi)
+        text = re.sub(r"T601\s*=\s*[^;]+;\s*T602\s*=\s*[^;]+;", f"T601 = {matlab(decay_low)}; T602 = {matlab(decay_high)};", text)
+    for key, value in replacements.items():
+        text, count = re.subn(rf"(?m)^(\s*){key}\s*=\s*[^;\n]+;", lambda m: f"{m[1]}{key} = {matlab(value)};", text)
+        if not count and key != "shiftV":  # KC split deliberately has no potential shift.
+            raise RuntimeError(f"Parameter override {key} did not match {source.name}")
+    if config.get("intervals", 0):
+        text, count = re.subn(r"(?m)^N\s*=\s*[^;\n]+;", f"N = {matlab(config['intervals'])};", text)
+        if count != 1:
+            raise RuntimeError("Grid override did not match")
+    text = text.replace("nPoints = N - 1;", f"nPoints = N - 1;\nassert(nPoints >= 3 && nPoints <= {max_points});\nassert(timeSamples >= 1 && timeSamples <= {max_steps});")
+    current, previous, following = ("x", "xPrev", "xNext") if geometric else ("u", "uPrev", "uNext")
+    perturbation = f"{current}(outPos) = {current}(outPos) + eps({current}(outPos));\nOut(2) = {current}(outPos);\n" if perturb_initial else ""
+    text = text.replace("\ntic\n", f"\n{perturbation}States = zeros(timeSamples+2, numel({current}));\nStates(1,:) = {previous}.';\nStates(2,:) = {current}.';\nDissipated = zeros(timeSamples,1);\ntic\n", 1)
+    text, count = re.subn(r"(?m)^(\s*)Out\(n\+2\)\s*=", lambda m: f"{m[1]}States(n+2,:) = {following}.';\n{m[1]}Dissipated(n) = -Loss*k;\n{m[1]}Out(n+2)=", text)
+    if count != 1:
+        raise RuntimeError("State observation did not match")
+    quoted = str(prefix).replace("'", "''")
+    text += f"""\nelapsed = toc;
+Samples = Out;
+""" + ("Samples = [Out, OutL];\n" if geometric else "") + f"""
+Diagnostics = [Kin(:), PotLin(:), PotNlin(:), Dissipated, En(:), Psi(2:end).'];
+assert(isreal(Samples) && all(isfinite(Samples(:))));
+assert(isreal(States) && all(isfinite(States(:))));
+assert(isreal(Diagnostics) && all(isfinite(Diagnostics(:))));
+fid = fopen('{quoted}.bin','wb','ieee-le'); fwrite(fid,Samples.','double'); fclose(fid);
+fid = fopen('{quoted}.states.bin','wb','ieee-le'); fwrite(fid,States.','double'); fclose(fid);
+fid = fopen('{quoted}.diagnostics.bin','wb','ieee-le'); fwrite(fid,Diagnostics.','double'); fclose(fid);
+meta = struct('intervals',N,'points',nPoints,'components',size(Samples,2),'sample_rate',SR,'timestep',k,'spacing',h,'steps',timeSamples,'samples',timeSamples+2,'sigma0',sigma0,'sigma1',sigma1,'simulation_seconds',elapsed);
+fid = fopen('{quoted}.json','w'); fprintf(fid,'%s',jsonencode(meta)); fclose(fid);
+"""
+    adapter = Path(str(prefix) + ".adapter.m")
+    adapter.write_text(text)
+    start = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="string-reference-") as temporary:
+        result = subprocess.run([octave, "--no-gui", "--quiet", str(adapter)], capture_output=True, text=True, cwd=temporary)
+    Path(str(prefix) + ".log").write_text(result.stdout + result.stderr)
+    if result.returncode:
+        raise RuntimeError(f"Octave reference failed; see {prefix}.log")
+    metadata = json.loads(Path(str(prefix) + ".json").read_text())
+    metadata.update(config=config, diagnostic_columns=["kinetic", "linear_potential", "nonlinear_potential", "dissipated", "energy", "psi"],
+                    energy_available=(not geometric or sav) and variant != "ge-a-unsplit", states_recorded=True,
+                    wall_seconds=time.perf_counter() - start,
+                    provenance={"repository": "https://github.com/Nemus-Project/nLinStringsConv-SAV", "revision": revision,
+                        "source": SCRIPTS[variant], "source_sha256": digest(source), "adapter_sha256": digest(adapter),
+                        "wrapper_sha256": digest(__file__), "octave": subprocess.check_output([octave, "--version"], text=True).splitlines()[0],
+                        "initial_perturbation": "one ULP added to second-level transverse pickup" if perturb_initial else "none",
+                        "execution": "Temporary parameter overrides and state observation; plotting/audio removed; upstream checkout unchanged"})
+    for suffix in (".bin", ".states.bin", ".diagnostics.bin"):
+        if not np.isfinite(np.fromfile(str(prefix) + suffix, dtype="<f8")).all():
+            raise RuntimeError(f"Nonfinite {suffix}")
+    metadata["artifacts"] = {suffix: digest(str(prefix) + suffix) for suffix in (".bin", ".states.bin", ".diagnostics.bin")}
+    Path(str(prefix) + ".json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"{variant}/{config.get('integrator', 'sav')}: {metadata['samples']} frames, {metadata['points']} points -> {prefix}")
+    return metadata
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config", type=Path)
+    parser.add_argument("--output", default="build/string/reference")
+    parser.add_argument("--seconds", type=float)
+    parser.add_argument("--octave", default=shutil.which("octave") or "octave")
+    parser.add_argument("--max-steps", type=int, default=500000)
+    parser.add_argument("--max-points", type=int, default=4096)
+    parser.add_argument("--perturb-initial", action="store_true", help="add one ULP to the second initial state at the transverse pickup; sensitivity experiment only")
+    args = parser.parse_args()
+    config = json.loads(args.config.read_text())
+    if args.seconds is not None:
+        config["seconds"] = args.seconds
+    run(config, args.output, octave=args.octave, max_steps=args.max_steps, max_points=args.max_points, perturb_initial=args.perturb_initial)

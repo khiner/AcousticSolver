@@ -1,0 +1,8 @@
+{
+  "variant": "kc-split",
+  "oversampling": 2,
+  "seconds": 1,
+  "initial_condition": "raised-cosine",
+  "initial_amplitude": 0.002,
+  "damping": true
+}

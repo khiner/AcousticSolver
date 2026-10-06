@@ -11,6 +11,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Immersed boundaries](https://doi.org/10.1121/10.0020635) | Exterior scattering and transmission | Static surfaces, impedances and finite barriers |
 | [Curved tetrahedral DG](src/Dg/README.md) | Rigid-wall wave propagation | Prepared meshes and operators; no native scene/source integration |
 | [Nonlinear plates](https://arxiv.org/abs/2608.06139) | Plate vibration and crash sounds | Simply supported rectangular plates; displacement output |
+| [Nonlinear stiff strings](https://doi.org/10.1007/s11071-026-12708-0) | Plucked-string vibration | Geometrically exact, cubic and Kirchhoff–Carrier models; displacement output |
 | [Acoustic Reliefs](script/reliefs/README.md) | Acoustic heightfield optimization | Differentiable boundary elements with an appearance objective |
 
 See [validation](VALIDATION.md) for checks and numerical limits, and [third-party notices](NOTICE.md) for licensing and reference-code provenance.
@@ -113,11 +114,52 @@ Scaled configurations use `kappa`, `ratio`, `sigma0`, `sigma1` and `lambda`; coo
 
 `use_exact: false` selects standard linear coefficients; `norm_type` selects regulator norm 1 or 2. Missing/null `cutoff_hz` selects the stability limit. `oversampling` defaults to 1.5; `excitation_scale` and `output_scale` set additional gains. Metadata includes a rerunnable `resolved_config`.
 
-Nonlinear runs automatically select dense or FFT Metal, both with 256-bit arithmetic and MPFR preparation. `--metal`, `--fft` and `--cpu` force a backend; linear automatic runs use CPU FP64. FFT evaluates the same transforms and is not necessarily faster. A measured 3-second crash took about 80 seconds on dense Metal and 352 seconds on FFT on an M5 Max.
+Nonlinear runs automatically select dense or FFT Metal, both with 256-bit arithmetic and MPFR preparation. `--metal`, `--fft` and `--cpu` force a backend; linear automatic runs use CPU FP64. FFT evaluates the same transforms and is not necessarily faster.
 
 Outputs include float64 pickup samples (`.bin`), six energy/work/drift diagnostics (`.diagnostics.bin`), metadata and final state (`.json`), and a normalized WAV. `--states` records every modal state; `--no-wav` omits WAV output. Physical pickups measure metres, while modal state and diagnostics retain scaled units.
 
-The full small crash matches an independently converged high-precision reference. This differs from matching the authors' FP64 waveform on long sensitive trajectories. See [plate validation and limits](VALIDATION.md#nonlinear-plates). The optional upstream comparison code is initialized with `git submodule update --init external/fa2026`.
+Long sensitive trajectories can diverge from the authors' FP64 waveform; see [plate validation and limits](VALIDATION.md#nonlinear-plates). Initialize optional upstream comparison code with `git submodule update --init external/fa2026`.
+
+## Nonlinear stiff strings
+
+Port of [Russo, Ducceschi and Bilbao (2026)](https://doi.org/10.1007/s11071-026-12708-0),
+with seven scalar auxiliary variable (SAV) formulations: geometric Form A
+split/unsplit, geometric Form B split, cubic split/unsplit, and Kirchhoff–Carrier
+split/unsplit. Simply supported strings start from a first mode or a raised-cosine
+pluck; geometric models also evolve longitudinal displacement.
+
+```sh
+build/StringSolve config/StringGeometric.json
+build/StringSolve config/StringCubic.json
+build/StringSolve config/StringKirchhoffCarrier.json
+```
+
+`variant` selects `ge-a-unsplit`, `ge-a-split`, `ge-b-split`, `cubic-unsplit`,
+`cubic-split`, `kc-unsplit`, or `kc-split`. `integrator` defaults to `"sav"`;
+`"reference"` selects Verlet for geometric models or energy-preserving schemes
+for cubic/Kirchhoff–Carrier. Both use Metal paired-float arithmetic by default;
+`--cpu` selects FP64 and can be faster for a single string.
+
+Configurations accept `seconds`, `oversampling` (relative to 44.1 kHz),
+`initial_amplitude` in metres, `initial_condition` (`mode` or `raised-cosine`),
+`initial_width` as a fraction of the interior grid, and `damping`. Physical inputs
+are `density`, `tension`, `radius`, `young_modulus`, and `length` in SI units.
+`loss: [[0, 15], [1000, 10]]` specifies frequency/T60 pairs in Hz/seconds.
+`sample_rate` can replace `oversampling`. `potential_shift`, `longitudinal_grid`,
+`stability_margin`, and explicit `intervals` expose the paper's numerical choices;
+changing them can affect convergence. Omitted settings follow the upstream variant
+presets, which can use very high sample rates. The supplied examples use lower
+explicit rates. `nonlinear: false` provides a linear limit for cubic/Kirchhoff–Carrier.
+
+The solver adjusts the grid and timestep as upstream does. Metadata records both
+its rounded bookkeeping sample rate and the physical rate `1/dt`. Outputs under
+`build/string/` include float64 displacement samples (`.bin`), six diagnostics
+(`.diagnostics.bin`), configuration/final-state metadata (`.json`), and a normalized,
+low-pass-resampled 48 kHz listening WAV. Geometric output has transverse and
+longitudinal channels; other models have one channel. `--states` records every
+interior-node state, `--no-wav` skips listening output, and `--output PREFIX` sets
+the destination. Radiation and contact/bowing excitation are outside this model.
+See [string validation and numerical limits](VALIDATION.md#nonlinear-stiff-strings).
 
 ## Acoustic Reliefs
 

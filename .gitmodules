@@ -1,3 +1,6 @@
 [submodule "external/fa2026"]
 	path = external/fa2026
 	url = https://github.com/victorzheleznov/fa2026.git
+[submodule "external/nLinStringsConv-SAV"]
+	path = external/nLinStringsConv-SAV
+	url = https://github.com/Nemus-Project/nLinStringsConv-SAV.git

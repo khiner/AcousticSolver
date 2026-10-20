@@ -1,10 +1,12 @@
 #include "RoomScene.h"
 
+#include "PorousScene.h"
 #include "Profile.h"
 #include "RoomGpu.h"
 #include "json.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -64,6 +66,7 @@ RoomScene LoadRoomScene(const std::string &config_file) {
     if (!config_stream) throw std::runtime_error("Failed to read room config: " + config_file);
     json config;
     config_stream >> config;
+    if (config.contains("room")) return Porous::MakeRoom(config, dir);
 
     RoomScene scene;
     const std::string scheme = config["scheme"];
@@ -133,13 +136,16 @@ RoomScene LoadRoomScene(const std::string &config_file) {
     if (int(scene.OutIxyz.size()) != scene.NumReceivers * scene.CornersPerReceiver || scene.OutAlpha.size() != scene.OutIxyz.size())
         throw std::runtime_error("Receiver sidecars disagree on the corner count");
     scene.Output = receivers["output"];
+    if (config.contains("porous_volumes") && !config.at("porous_volumes").empty())
+        Porous::AddVolumes(scene, config, dir, grid.at("origin").get<std::array<double, 3>>());
     return scene;
 }
 
-std::vector<double> RenderRoomScene(RoomScene &scene, int n_steps) {
+std::vector<double> RenderRoomScene(RoomScene &scene, int n_steps, size_t *metal_buffer_bytes) {
     const double infac = ScaleSource(scene);
     RoomGpu gpu;
     gpu.Init(scene);
+    if (metal_buffer_bytes) *metal_buffer_bytes = gpu.MemoryBytes();
     gpu.RunSteps(n_steps);
 
     const float *samples = gpu.Samples();
@@ -157,17 +163,24 @@ std::vector<double> RenderRoomScene(RoomScene &scene, int n_steps) {
 }
 
 void RunRoomScene(const std::string &config_file, double seconds) {
+    const auto start = std::chrono::steady_clock::now();
     RoomScene scene = LoadRoomScene(config_file);
+    const auto prepared = std::chrono::steady_clock::now();
     const int steps = seconds > 0. ? std::min(scene.Nt, std::max(1, int(std::ceil(seconds * scene.Srate)))) : scene.Nt;
     std::printf("[room] %s: %s %dx%dx%d = %.2fM nodes, %d boundary (%d lossy), %d steps at %.1f Hz\n", scene.Output.c_str(), scene.Fcc ? "FCC" : "cart", scene.Nx, scene.Ny, scene.Nz, double(scene.NumNodes()) / 1e6, int(scene.BnIxyz.size()), scene.NumLossy, steps, scene.Srate);
     std::fflush(stdout); // so a long render shows what it is running before it starts
 
-    const auto rows = RenderRoomScene(scene, steps);
+    size_t metal_buffer_bytes{};
+    const auto rows = RenderRoomScene(scene, steps, &metal_buffer_bytes);
+    const auto finished = std::chrono::steady_clock::now();
 
     std::filesystem::create_directories(OutputDir);
     const auto stem = std::filesystem::path{OutputDir} / scene.Output;
     std::ofstream{stem.string() + ".bin", std::ofstream::binary}.write(reinterpret_cast<const char *>(rows.data()), std::streamsize(rows.size() * sizeof(double)));
-    std::ofstream{stem.string() + ".json"} << json{{"srate", scene.Srate}, {"receivers", scene.NumReceivers}, {"samples", steps}}.dump() << '\n';
+    std::ofstream{stem.string() + ".json"} << json{
+                                                  {"srate", scene.Srate}, {"receivers", scene.NumReceivers}, {"samples", steps}, {"field", scene.PressureOutput ? "pressure" : "differentiated_pressure"}, {"preparation_seconds", std::chrono::duration<double>(prepared - start).count()}, {"render_seconds", std::chrono::duration<double>(finished - prepared).count()}, {"metal_buffer_bytes", metal_buffer_bytes}, {"grid_nodes", scene.NumNodes()}, {"h", scene.H}, {"porous", bool(scene.Porous)}
+                                              }.dump(2)
+                                           << '\n';
     std::printf("[room] wrote %s.bin (%d receivers x %d float64)\n", stem.string().c_str(), scene.NumReceivers, steps);
     profile::Report();
 }

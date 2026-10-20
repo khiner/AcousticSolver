@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Validate porous FCC acoustics; --demo adds matched treated/untreated room WAVs."""
+
+import argparse
+import hashlib
+import json
+import platform
+import subprocess
+from fractions import Fraction
+from pathlib import Path
+
+import numpy as np
+from scipy.io import wavfile
+from scipy.signal import butter, resample_poly, sosfilt
+
+ROOT = Path(__file__).resolve().parent.parent
+BUILD = ROOT / "build"
+OUT = BUILD / "porous"
+
+
+def run(args, name):
+    with (OUT / f"{name}.log").open("w") as log:
+        process = subprocess.Popen([str(x) for x in args], cwd=BUILD, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in process.stdout:
+            log.write(line)
+            print(line, end="", flush=True)
+        code = process.wait()
+    if code:
+        raise RuntimeError(f"{name} failed; see {OUT / (name + '.log')}")
+
+
+def machine_info():
+    return {"hardware": subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip(),
+            "system": platform.platform()}
+
+
+def band_report():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    path = OUT / "band.json"
+    report = json.loads(path.read_text())
+    cases = report["cases"]
+    files = [BUILD / "PorousTest", ROOT / "script/ValidatePorous",
+             *sorted((ROOT / "src/Room").glob("Porous*")),
+             *(ROOT / "src/Room" / name for name in
+               ("RoomGpu.cpp", "RoomGpu.h", "RoomKernels.metal", "RoomParams.h"))]
+    report["sha256"] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in files}
+    report.update(machine_info())
+    fine = cases[1::2]
+    report["max_fine_errors"] = {
+        name: max(r[name] for r in fine)
+        for name in ("reflection_error", "transmission_error", "impedance_error")
+    }
+    report["max_fine_errors"]["absorption_error"] = max(
+        abs(r["absorption"] - r["expected_absorption"]) for r in fine)
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    for rigid in (True, False):
+        fields = ["reflection", "normalized_impedance", "absorption"]
+        if not rigid:
+            fields.insert(1, "transmission")
+        fig, axes = plt.subplots(len(fields), 2, figsize=(12, 3 * len(fields)), sharex=True)
+        for column, oblique in enumerate((False, True)):
+            rows = [r for r in cases if r["rigid_backing"] == rigid and
+                    (r["angle_degrees"] > 1) == oblique]
+            for row, field in enumerate(fields):
+                ax = axes[row, column]
+                for label, samples, prefix, style in (("coarse", rows[::2], "", "--"),
+                                                      ("fine", rows[1::2], "", "-"),
+                                                      ("theory", rows[1::2], "expected_", ".")):
+                    frequency = [r["frequency_hz"] for r in samples]
+                    values = np.array([r[prefix + field] for r in samples]).reshape(len(samples), -1)
+                    for component, y in enumerate(values.T):
+                        part = (" Re", " Im")[component] if values.shape[1] == 2 else ""
+                        ax.semilogx(frequency, y, style, color=f"C{component}", label=label + part)
+                ax.set_ylabel(field.replace("_", " "))
+                ax.grid(True, which="both", alpha=.2)
+                if row == 0:
+                    ax.set_title("Near 45° incidence" if oblique else "Normal incidence")
+                ax.legend(fontsize=8, ncol=3)
+            axes[-1, column].set_xlabel("Frequency (Hz)")
+        fig.suptitle("10 cm porous slab: " + ("rigid backing with air gap" if rigid else "freestanding"))
+        fig.tight_layout()
+        stem = OUT / ("band-backed" if rigid else "band-freestanding")
+        fig.savefig(stem.with_suffix(".png"), dpi=160)
+        fig.savefig(stem.with_suffix(".svg"))
+        plt.close(fig)
+    print("Maximum fine-grid errors:", report["max_fine_errors"])
+
+
+def demo():
+    config = json.loads((ROOT / "config/PorousRoom.json").read_text())
+    signals = {}
+    report = machine_info()
+    for name, volumes in (("treated", config["porous_volumes"]), ("untreated", [])):
+        case = {**config, "porous_volumes": volumes, "output": f"porous-{name}"}
+        path = OUT / f"{name}.json"
+        path.write_text(json.dumps(case, indent=2) + "\n")
+        run([BUILD / "AcousticSolver", "--room", path], name)
+        stem = BUILD / "room" / case["output"]
+        meta = json.loads(stem.with_suffix(".json").read_text())
+        if meta["field"] != "pressure":
+            raise RuntimeError("Porous demo requires pressure samples")
+        raw = np.fromfile(stem.with_suffix(".bin"), dtype=np.float64).reshape(
+            meta["receivers"], meta["samples"]
+        )
+        if not np.isfinite(raw).all():
+            raise RuntimeError("Nonfinite room output")
+        # The 4 cm grid demo is deliberately low-bandwidth. Both recordings use
+        # the same listening filter and shared gain; raw pressure stays untouched.
+        filtered = sosfilt(butter(4, [30, 1000], btype="bandpass", fs=meta["srate"], output="sos"), raw)
+        ratio = Fraction(48000 / meta["srate"]).limit_denominator(16384)
+        signals[name] = resample_poly(filtered, ratio.numerator, ratio.denominator, axis=-1)
+        meta["rendered_audio_seconds"] = meta["samples"] / meta["srate"]
+        meta["seconds_per_audio_second"] = meta["render_seconds"] / meta["rendered_audio_seconds"]
+        meta["late_pressure_rms"] = np.sqrt(np.mean(raw[:, raw.shape[1] // 2:] ** 2, axis=1)).tolist()
+        report[name] = meta
+    gain = .9 / max(np.max(np.abs(s)) for s in signals.values())
+    for name, signal in signals.items():
+        wavfile.write(OUT / f"{name}.wav", 48000, (signal.T * gain).astype(np.float32))
+    report["shared_wav_gain"] = float(gain)
+    report["listening_band_hz"] = [30, 1000]
+    report["late_pressure_ratio"] = (
+        np.array(report["treated"]["late_pressure_rms"]) /
+        np.array(report["untreated"]["late_pressure_rms"])
+    ).tolist()
+    (OUT / "demo.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Matched WAVs and timings: {OUT}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cpu", action="store_true", help="only bounded FP64 checks, no Metal")
+    parser.add_argument("--demo", action="store_true", help="also render the household room comparison")
+    parser.add_argument("--band", action="store_true", help="sweep 20–4000 Hz with grid refinement; requires matplotlib")
+    args = parser.parse_args()
+    if args.cpu and args.demo:
+        parser.error("--demo uses Metal and cannot be combined with --cpu")
+    OUT.mkdir(parents=True, exist_ok=True)
+    run([BUILD / "PorousTest", "--band" if args.band else "--slabs",
+         *(["--cpu"] if args.cpu else [])], "band-checks" if args.band else "checks")
+    if args.band:
+        band_report()
+    if args.demo:
+        demo()
+
+
+if __name__ == "__main__":
+    main()

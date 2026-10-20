@@ -1,4 +1,5 @@
 #include "RoomGpu.h"
+#include "Porous.h"
 
 #include "Profile.h"
 
@@ -11,7 +12,6 @@
 #include <cstdlib>
 #include <numbers>
 #include <stdexcept>
-#include <type_traits>
 
 namespace {
 // The fp32 diagonal shift the reference applies to keep a single-precision run from
@@ -22,6 +22,12 @@ constexpr double Eps = 1.19209289e-07;
 constexpr uint32_t Group = 256; // threads of the one-dimensional passes
 
 Dim3 Blocks1d(int n) { return {(uint32_t(n) + Group - 1) / Group, 1, 1}; }
+
+template<class T>
+void UploadTable(GpuBuffer &buffer, const std::vector<T> &values) {
+    buffer.ResizeZeroed(std::max<size_t>(4, values.size() * sizeof(T)));
+    buffer.Upload(values.data(), values.size() * sizeof(T));
+}
 
 // The count RoomShellQ's position test picks out, against the closed form for the shell of a
 // box. On the FCC grid it is the shell of the *unfolded* box, whose y extent is Nyf and half
@@ -103,6 +109,15 @@ void RoomGpu::Init(const RoomScene &scene) {
     GP.Sl2 = coeffs.Sl2;
     GP.L = coeffs.L;
     GP.Lo2 = float(.5 * scene.L);
+    HasPorous = bool(scene.Porous);
+    if (HasPorous && !Fcc) throw std::runtime_error("Porous volumes require the FCC room grid");
+    PhysicalAir = Fcc && (HasPorous || scene.PressureOutput);
+    if (PhysicalAir) {
+        // The staggered equations have no artificial diagonal loss. Match their
+        // scalar air limit; preserve the original shifted scheme in ordinary scenes.
+        GP.Sl2 = GP.A2 = float(.25 * scene.L2);
+        GP.A1 = float(2. - 3. * scene.L2);
+    }
 
     CheckShellCount(scene.Nx, scene.Ny, scene.Nz, Fcc);
 
@@ -110,12 +125,6 @@ void RoomGpu::Init(const RoomScene &scene) {
     I0 = 0;
     I1 = 1;
     StepN = 0;
-
-    const auto upload = [&](GpuBuffer &buffer, const auto &values) {
-        using T = typename std::decay_t<decltype(values)>::value_type;
-        buffer.ResizeZeroed(std::max<size_t>(4, values.size() * sizeof(T)));
-        buffer.Upload(values.data(), values.size() * sizeof(T));
-    };
 
     // Cartesian masks are grid-wide; FCC masks are packed and reached through block rank.
     const int64_t nzny = int64_t(scene.Nz) * scene.Ny;
@@ -139,8 +148,8 @@ void RoomGpu::Init(const RoomScene &scene) {
             block.Rank = rank;
             rank += uint32_t(std::popcount(block.Occupied));
         }
-        upload(BnMask, blocks);
-        upload(AdjBn, scene.AdjBn);
+        UploadTable(BnMask, blocks);
+        UploadTable(AdjBn, scene.AdjBn);
     } else {
         const size_t node_count = size_t(nodes);
         std::vector<uint8_t> adj(node_count, uint8_t(RoomAirAdj));
@@ -150,15 +159,15 @@ void RoomGpu::Init(const RoomScene &scene) {
             if (scene.AdjBn[i] == RoomAirAdj) throw std::runtime_error("A boundary node keeps every neighbour, which is the value that marks ordinary air");
             adj[size_t(ii)] = uint8_t(scene.AdjBn[i]);
         }
-        upload(BnMask, adj);
+        UploadTable(BnMask, adj);
     }
 
-    upload(InIxyz, scene.InIxyz);
-    upload(OutIxyz, scene.OutIxyz);
+    UploadTable(InIxyz, scene.InIxyz);
+    UploadTable(OutIxyz, scene.OutIxyz);
 
     std::vector<float> in_sigs(scene.InSigs.size());
     for (size_t i = 0; i < in_sigs.size(); ++i) in_sigs[i] = float(scene.InSigs[i]);
-    upload(InSigs, in_sigs);
+    UploadTable(InSigs, in_sigs);
 
     const auto lossy = RoomLossySubset(scene);
     const auto materials = RoomMaterialCoefficients(scene);
@@ -166,12 +175,12 @@ void RoomGpu::Init(const RoomScene &scene) {
     // Fixed fields move 25 bytes; each LRC branch reads and writes 16 more.
     LossyBytes = 0.;
     for (const int8_t m : lossy.Mat) LossyBytes += 25. + 16. * double(scene.MatBranches[size_t(m)]);
-    upload(BnlIxyz, lossy.Ixyz);
-    upload(SsafBnl, lossy.Ssaf);
-    upload(MatBnl, lossy.Mat);
-    upload(MatMb, scene.MatBranches);
-    upload(MatBeta, materials.Beta);
-    upload(MatQuads, materials.Quads);
+    UploadTable(BnlIxyz, lossy.Ixyz);
+    UploadTable(SsafBnl, lossy.Ssaf);
+    UploadTable(MatBnl, lossy.Mat);
+    UploadTable(MatMb, scene.MatBranches);
+    UploadTable(MatBeta, materials.Beta);
+    UploadTable(MatQuads, materials.Quads);
 
     const size_t branch_bytes = std::max<size_t>(4, size_t(GP.Nbl) * RoomMaxBranches * sizeof(float));
     Vh1.ResizeZeroed(branch_bytes);
@@ -186,16 +195,82 @@ void RoomGpu::Init(const RoomScene &scene) {
     Params.ResizeZeroed(sizeof(RoomGridParams));
     Params.Upload(&GP, sizeof GP);
 
-    PsoAir = ctx.RoomPipeline(Fcc ? "RoomAirFcc" : "RoomAir");
+    PsoAir = ctx.RoomPipeline(HasPorous ? "RoomAirFccPorous" : PhysicalAir ? "RoomAirFccPhysical" :
+                                  Fcc                                      ? "RoomAirFcc" :
+                                                                             "RoomAir");
     PsoLossy = ctx.RoomPipeline("RoomLossy");
     PsoIo = ctx.RoomPipeline("RoomIo");
     PsoEnergy = ctx.RoomPipeline(Fcc ? "RoomEnergyFcc" : "RoomEnergy");
+    InitPorous(scene);
 
     // z is the contiguous axis, so a 32-wide row of it keeps the stencil's reads sequential.
     AirThreads = {32, 4, 4};
     AirTiles = {(uint32_t(GP.Nz - 2) + AirThreads.x - 1) / AirThreads.x, (uint32_t(GP.Ny - 2) + AirThreads.y - 1) / AirThreads.y, (uint32_t(GP.Nx - 2) + AirThreads.z - 1) / AirThreads.z};
 
     TimeKernels = std::getenv("ACOUSTIC_ROOM_KERNEL_TIMES") != nullptr;
+    KernelTiming.clear();
+}
+
+void RoomGpu::InitPorous(const RoomScene &scene) {
+    PP = {};
+    if (!HasPorous) return;
+    const auto &data = *scene.Porous;
+    PP = {int(data.Interior.size()), int(data.Interface.size()), int(data.Links.size()), float(scene.Ts), float(.25 / (scene.H * scene.H)), float(1. / (std::numbers::sqrt2 * scene.H)), float(1. / (2. * std::numbers::sqrt2 * scene.H))};
+    std::vector<RoomPorousPole> poles;
+    const auto function = [&](const Porous::Rational &r) {
+        RoomPorousFunction f{float(r.Constant), int(poles.size()), int(r.Poles.size())};
+        for (const auto &p : r.Poles) {
+            const double d = scene.Ts * p.Rate;
+            poles.push_back({float((2. - d) / (2. + d)), float(2. * scene.Ts / (2. + d)), float(.5 * p.Residue)});
+        }
+        return f;
+    };
+    std::vector<RoomPorousFunction> q, k, r;
+    for (const auto &m : data.Materials) {
+        q.push_back(function(m.WaveSpeedSquared));
+        k.push_back(function(m.BulkModulus));
+    }
+    for (const auto &f : data.LinkInverseDensity) r.push_back(function(f));
+    UploadTable(PorousQ, q);
+    UploadTable(PorousK, k);
+    UploadTable(PorousR, r);
+    UploadTable(PorousPoles, poles);
+
+    std::vector<uint32_t> excluded((size_t(scene.NumNodes()) + RoomBnBlock - 1) / RoomBnBlock);
+    const auto exclude = [&](int node) { excluded[size_t(node) / RoomBnBlock] |= 1u << (node % RoomBnBlock); };
+    int qstates = 0, kstates = 0, rstates = 0;
+    const auto allocate_state = [](int &count, int branches) {
+        if (branches > INT32_MAX - count) throw std::runtime_error("Porous ADE state exceeds 32-bit indexing");
+        return std::exchange(count, count + branches);
+    };
+    std::vector<RoomPorousInterior> interiors;
+    for (const auto &n : data.Interior) {
+        interiors.push_back({n.Node, n.Material, allocate_state(qstates, q[size_t(n.Material)].Count), n.Adjacency});
+        exclude(n.Node);
+    }
+    std::vector<RoomPorousInterface> interfaces;
+    for (const auto &n : data.Interface) {
+        RoomPorousInterface entry{n.Node, n.Material, allocate_state(kstates, k[size_t(n.Material)].Count), {}};
+        std::copy(n.Links.begin(), n.Links.end(), entry.Links);
+        interfaces.push_back(entry);
+        exclude(n.Node);
+    }
+    std::vector<RoomPorousLink> links;
+    links.reserve(data.Links.size());
+    for (const auto &link : data.Links)
+        links.push_back({link.A, link.B, link.Material, allocate_state(rstates, r[size_t(link.Material)].Count)});
+    UploadTable(PorousExcluded, excluded);
+    UploadTable(PorousInterior, interiors);
+    UploadTable(PorousInterface, interfaces);
+    UploadTable(PorousLinks, links);
+    PorousQState.ResizeZeroed(std::max<size_t>(4, size_t(qstates) * sizeof(float)));
+    PorousKState.ResizeZeroed(std::max<size_t>(4, size_t(kstates) * sizeof(float)));
+    PorousRState.ResizeZeroed(std::max<size_t>(4, size_t(rstates) * sizeof(float)));
+    PorousVelocity.ResizeZeroed(std::max<size_t>(4, links.size() * sizeof(float)));
+    auto &ctx = MetalContext::Get();
+    PsoPorousInterior = ctx.RoomPipeline("RoomPorousInteriorUpdate");
+    PsoPorousVelocity = ctx.RoomPipeline("RoomPorousVelocity");
+    PsoPorousPressure = ctx.RoomPipeline("RoomPorousPressure");
 }
 
 void RoomGpu::Timed(int slot, const char *name, MTL::ComputePipelineState *pso, Dim3 blocks, Dim3 threads, std::initializer_list<GpuSlice> buffers, const void *params, size_t params_size) {
@@ -218,7 +293,15 @@ void RoomGpu::RunSteps(int n_steps) {
         if (StepN >= GP.Nt) throw std::runtime_error("Room step index ran past the scene's step count");
         const RoomStepParams step{StepN};
 
-        if (Fcc) Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &AdjBn, &Params});
+        if (HasPorous) {
+            Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &AdjBn, &Params, &PorousExcluded});
+            if (PP.Links)
+                Timed(3, "porous velocity", PsoPorousVelocity, Blocks1d(PP.Links), {Group, 1, 1}, {&U[I1], &PorousVelocity, &PorousRState, &PorousLinks, &PorousR, &PorousPoles}, &PP, sizeof PP);
+            if (PP.Interiors)
+                Timed(4, "porous interior", PsoPorousInterior, Blocks1d(PP.Interiors), {Group, 1, 1}, {&U[I0], &U[I1], &PorousQState, &PorousInterior, &PorousQ, &PorousPoles, &Params}, &PP, sizeof PP);
+            if (PP.Interfaces)
+                Timed(5, "porous pressure", PsoPorousPressure, Blocks1d(PP.Interfaces), {Group, 1, 1}, {&U[I0], &U[I1], &PorousVelocity, &PorousKState, &PorousInterface, &PorousK, &PorousPoles}, &PP, sizeof PP);
+        } else if (Fcc) Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &AdjBn, &Params});
         else Timed(0, "air", PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &Params});
         if (GP.Nbl > 0)
             Timed(1, "lossy", PsoLossy, Blocks1d(GP.Nbl), {Group, 1, 1}, {&U[I0], &Ub[I0b], &Ub[I2b], &Vh1, &Gh1, &BnlIxyz, &SsafBnl, &MatBnl, &MatMb, &MatBeta, &MatQuads, &Params});
@@ -232,6 +315,9 @@ void RoomGpu::RunSteps(int n_steps) {
         I1b = I0b;
         I0b = oldest;
         ++StepN;
+        // Porous runs add several dispatches per step. Bound command-buffer
+        // size and in-flight resource use even when a caller requests a full IR.
+        if (PhysicalAir && (local + 1) % 64 == 0) ctx.Sync();
     }
     ctx.Flush();
 }
@@ -241,19 +327,18 @@ void RoomGpu::Seed(const std::vector<float> &u) {
     if (bytes != size_t(GP.Nx) * GP.Ny * GP.Nz * sizeof(float)) throw std::runtime_error("Seed state is not one value a node");
     MetalContext::Get().Drain();
     for (const auto &level : U) level.Upload(u.data(), bytes);
-    // At rest means at rest everywhere, walls included.
-    Vh1.Zero(Vh1.Capacity());
-    Gh1.Zero(Gh1.Capacity());
-    for (const auto &b : Ub) b.Zero(b.Capacity());
+    for (auto const *state : {&Vh1, &Gh1, &Ub[0], &Ub[1], &Ub[2], &PorousQState, &PorousKState, &PorousRState, &PorousVelocity})
+        state->Zero(state->Capacity());
 }
 
 double RoomGpu::Energy(int x0, int x1, int y0, int y1, int z0, int z1) {
+    if (HasPorous) throw std::runtime_error("Room energy diagnostic does not include porous material storage");
     // The diagonal shift the interior update is actually carrying, read back out of A1
     // rather than recomputed from eps: A1 is the rounded 2 - 6 Sl2, and its rounding is worth
     // 17% of the shift itself. Boundary nodes take theirs from Sl2 instead, which differs in
     // the last bits, but they are a few percent of any box.
     const int neighbours = Fcc ? int(RoomFccNeighbours) : int(RoomNumNeighbours);
-    const float diag = float((2. - double(GP.A1) - neighbours * double(GP.A2)) / neighbours);
+    const float diag = PhysicalAir ? 0.f : float((2. - double(GP.A1) - neighbours * double(GP.A2)) / neighbours);
     const RoomEnergyParams box{x0, x1, y0, y1, z0, z1, GP.A2, diag};
     const int64_t n = int64_t(x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1);
     if (n <= 0) throw std::runtime_error("Energy box is empty");
@@ -277,6 +362,7 @@ double RoomGpu::TimePass(MTL::ComputePipelineState *pso, Dim3 blocks, Dim3 threa
 }
 
 RoomGpu::Bandwidth RoomGpu::Roofline(int reps) {
+    if (HasPorous) throw std::runtime_error("Room air roofline requires a scene without porous volumes");
     auto *stream = MetalContext::Get().RoomPipeline("RoomStream");
     const double nodes = double(int64_t(GP.Nx - 2) * (GP.Ny - 2) * (GP.Nz - 2));
     const double update = Fcc ? TimePass(PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &AdjBn, &Params}, reps) : TimePass(PsoAir, AirTiles, AirThreads, {&U[I0], &U[I1], &BnMask, &Params}, reps);
@@ -305,4 +391,17 @@ void RoomGpu::ReportTimings(const std::vector<KernelTimes> &timings) {
         if (!k.Name) continue;
         std::printf("  %-10s %8.4f ms/step  %5.1f%%  (%llu dispatches)\n", k.Name, 1e3 * k.Seconds / double(steps), 100. * k.Seconds / total, (unsigned long long)k.Count);
     }
+}
+
+size_t RoomGpu::MemoryBytes() const {
+    size_t bytes = 0;
+    for (const auto *buffer : {
+             &U[0], &U[1], &BnMask, &AdjBn, &InIxyz, &InSigs, &OutIxyz, &Out,
+             &Params, &EnergyOut, &BnlIxyz, &SsafBnl, &MatBnl, &MatMb, &MatBeta, &MatQuads,
+             &Ub[0], &Ub[1], &Ub[2], &Vh1, &Gh1,
+             &PorousExcluded, &PorousInterior, &PorousInterface, &PorousLinks,
+             &PorousQ, &PorousK, &PorousR, &PorousPoles,
+             &PorousQState, &PorousKState, &PorousRState, &PorousVelocity
+         }) bytes += buffer->Capacity();
+    return bytes;
 }

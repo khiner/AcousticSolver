@@ -7,6 +7,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [WaveBlender](https://github.com/kangruix/WaveBlender) | Sound from animated scenes | Modal bodies, bubbles, speakers, impulses and occluders |
 | [SonicRadiation](https://arxiv.org/abs/2508.08775) | Exterior sound radiation | Closed rigid modal bodies, including motion |
 | [Room acoustics](https://www.pure.ed.ac.uk/ws/files/22154168/fv_genimp_final_r3.pdf) | Room impulse responses | Cartesian/FCC FDTD with rigid or frequency-dependent walls |
+| [Porous room elements](https://www.dafx.de/paper-archive/2023/DAFx23_paper_46.pdf) | Absorber panels, air gaps and porous partitions | FCC propagation through rigid-frame equivalent fluids |
 | [Implicit room acoustics](https://doi.org/10.1121/10.0036229) | Low-dispersion room simulation | 27-point scheme with real-admittance walls |
 | [Immersed boundaries](https://doi.org/10.1121/10.0020635) | Exterior scattering and transmission | Static surfaces, impedances and finite barriers |
 | [Curved tetrahedral DG](src/Dg/README.md) | Rigid-wall wave propagation | Prepared meshes and operators; no native scene/source integration |
@@ -75,6 +76,45 @@ build/RoomTest --implicit
 Implicit defaults reproduce the paper's Fig. 6 numerical configuration. Optional zero-mean projection is off by default. Explicit walls support parallel-LRC materials; implicit walls use real admittance.
 
 Receiver arrays and sample-rate metadata are written under `build/room/`. `RenderRoomWavs` applies reference post-processing and writes normalized 48 kHz WAVs under `gen/wav/room/`.
+
+## Porous room elements
+
+Independent implementation of Jan W. Smits,
+[*Efficient finite-difference room acoustics simulation incorporating extended-reacting elements* (DAFx 2023)](https://www.dafx.de/paper-archive/2023/DAFx23_paper_46.pdf).
+Metal evolves pressure inside porous volumes and pressure/velocity at their
+interfaces, including transmission, oblique incidence and air gaps.
+
+```sh
+(cd build && ./AcousticSolver --room ../config/PorousRoom.json)
+script/ValidatePorous --demo
+script/ValidatePorous --band  # 20–4000 Hz scattering validation and plots
+```
+
+[PorousRoom.json](config/PorousRoom.json) defines a rigid shoebox with a backed
+panel and a freestanding partition. `room` sets dimensions and grid spacing in
+metres, Courant number and duration. Sources and receivers use physical coordinates.
+`porous_materials` specifies `flow_resistivity` in Pa·s/m² and optional `fit_hz`
+limits (default 20–4000 Hz) for the Allard–Champoux model. `porous_volumes` assigns
+a zero-based material index to each `min`/`max` box or relative-path `mesh` OBJ.
+Meshes must be closed, connected, consistently wound and free of self-intersections;
+self-intersections are not detected.
+
+Porous volumes may meet rigid walls but must not overlap each other or locally
+reacting wall nodes. Sources must be in scalar air, away from porous interfaces;
+receivers must be in air. Existing converted FCC scenes also accept these material
+and volume fields when `grid.origin` specifies the physical position of grid
+index `(0,0,0)`. Cartesian porous scenes are unsupported.
+
+Native shoebox outputs are float64 **pressure**, stored receiver by receiver under
+`build/room/`, with field type, timings and Metal buffer bytes in adjacent JSON.
+The demo writes treated/untreated 48 kHz WAVs under `build/porous/`, using the same
+30–1000 Hz filter and shared gain. Use this renderer for native pressure output;
+`RenderRoomWavs` expects the older differentiated-pressure scene format.
+
+The fit band describes material approximation, not grid accuracy. Resolve the
+shorter wavelength inside the porous medium and check spatial convergence.
+This is a rigid-frame model: fabric motion, elastic foam frames and structural
+vibration are outside its scope. See [porous validation](VALIDATION.md#porous-room-elements).
 
 ## Immersed boundaries
 

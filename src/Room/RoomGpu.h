@@ -93,6 +93,8 @@ struct RoomGpu {
     };
     const std::vector<KernelTimes> &Timings() const { return KernelTiming; }
     static void ReportTimings(const std::vector<KernelTimes> &);
+    // Allocated simulation buffer capacity, excluding Metal driver/pipeline storage.
+    size_t MemoryBytes() const;
 
     // Destructive update-versus-stream roofline measurement.
     struct Bandwidth {
@@ -107,6 +109,7 @@ struct RoomGpu {
 private:
     RoomGridParams GP{};
     bool Fcc{false};
+    bool PhysicalAir{false};
     int StepN{0};
 
     // Two pressure levels, rotating by index: I1 is u(n), I0 is u(n-1) and receives u(n+1).
@@ -126,6 +129,14 @@ private:
     int I0b{0}, I1b{1}, I2b{2};
 
     MTL::ComputePipelineState *PsoAir{}, *PsoLossy{}, *PsoIo{}, *PsoEnergy{};
+
+    RoomPorousParams PP{};
+    GpuBuffer PorousExcluded, PorousInterior, PorousInterface, PorousLinks;
+    GpuBuffer PorousQ, PorousK, PorousR, PorousPoles;
+    GpuBuffer PorousQState, PorousKState, PorousRState, PorousVelocity;
+    MTL::ComputePipelineState *PsoPorousInterior{}, *PsoPorousVelocity{}, *PsoPorousPressure{};
+    bool HasPorous{false};
+    void InitPorous(const RoomScene &);
 
     Dim3 AirTiles{}, AirThreads{};
     double LossyBytes{0.};

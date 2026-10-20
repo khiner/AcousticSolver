@@ -37,6 +37,9 @@ set(RADIATION_SOURCES
 # The room-acoustics solver [Bilbao, Hamilton, Botts and Savioja 2016; PFFDTD-equivalent]:
 # the scene loader and the Metal stepper. Shared by the scene runner and its harness.
 set(ROOM_SOURCES
+    src/Room/Porous.cpp
+    src/Room/PorousMaterial.cpp
+    src/Room/PorousScene.cpp
     src/Room/RoomGpu.cpp
     src/Room/RoomImplicitScene.cpp
     src/Room/RoomScene.cpp)
@@ -100,6 +103,9 @@ target_link_libraries(RadiationTest PRIVATE AcousticCore)
 # The room solver's validation harness (see src/Room/RoomTest.cpp for the test ladder).
 add_executable(RoomTest src/Room/RoomTest.cpp)
 target_link_libraries(RoomTest PRIVATE AcousticCore)
+
+add_executable(PorousTest src/Room/PorousTest.cpp src/Room/PorousSlab.cpp)
+target_link_libraries(PorousTest PRIVATE AcousticCore)
 
 add_executable(ImmersedTest src/Immersed/ImmersedTest.cpp)
 target_link_libraries(ImmersedTest PRIVATE AcousticCore)

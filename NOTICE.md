@@ -14,7 +14,7 @@ upstream-identical. Files under `src/` not listed here are original to this proj
 | `WaveBlender.{h,cpp}`, `Shaders.h`, `Shaders/*.cpp`, `FDTD/*` | [WaveBlender](https://github.com/kangruix/WaveBlender) |
 | `FluidSound.{h,cpp}`, `Oscillator.{h,cpp}`, `BubbleUtils.{h,cpp}`, `Integrators.{h,cpp}` | [FluidSound](https://github.com/kangruix/FluidSound) |
 | `ModalSound.{h,cpp}`, `ModeData.h` | ModalSound, based on [openpbso](https://github.com/jhwang7628/openpbso) |
-| `Room/*` | [PFFDTD](https://github.com/bsxfun/pffdtd) |
+| `Room/*` except `Porous*` | [PFFDTD](https://github.com/bsxfun/pffdtd) |
 | `String/*` | [nLinStringsConv-SAV](https://github.com/Nemus-Project/nLinStringsConv-SAV) |
 
 ### WaveBlender and FluidSound
@@ -56,6 +56,12 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 The room-acoustics solver's step sequence, its update coefficients and its frequency-dependent
 impedance boundary arithmetic are transcribed from PFFDTD's C engine (`c_cuda/cpu_engine.h`,
 `c_cuda/fdtd_data.h`), and its scenes are converted from that project's own voxelizer output.
+
+The porous extension (`Room/Porous*` and its added Metal kernels) is an independent
+implementation of Jan W. Smits,
+[*Efficient finite-difference room acoustics simulation incorporating extended-reacting elements*,
+DAFx 2023](https://www.dafx.de/paper-archive/2023/DAFx23_paper_46.pdf).
+No upstream source implementation is included or linked.
 
 MIT License
 

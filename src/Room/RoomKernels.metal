@@ -152,35 +152,101 @@ kernel void RoomAir(device float *u0, device const float *u1, device const uchar
 //
 // Twelve FCC adjacency bits would require two bytes per node. Pack boundary rows instead and
 // recover each row from block rank plus the occupied bits below its slot.
-kernel void RoomAirFcc(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks, device const ushort *adj_bn, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
-    const int iz = int(t.x) + 1, iy = int(t.y) + 1, ix = int(t.z) + 1;
-    if (ix >= g.Nx - 1 || iy >= g.Ny - 1 || iz >= g.Nz - 1) return;
-    const int3 pos = int3(ix, iy, iz), n = int3(g.Nx, g.Ny, g.Nz);
-    const int nzny = g.Nz * g.Ny;
-    const int ii = ix * nzny + iy * g.Nz + iz;
-    const int q = RoomShellQ(pos, n, true);
-    const float previous = u0[ii];
+inline float RoomFccLaplacian(device const float *pressure, int node, thread const int *offsets, uint adjacency) {
+    float value = 0.f;
+    for (int bit = 0; bit < RoomFccNeighbours; ++bit)
+        if ((adjacency >> bit) & 1u) value += pressure[node + offsets[bit]] - pressure[node];
+    return value;
+}
 
+template<bool Physical>
+inline void RoomAirFccUpdate(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks, device const ushort *adj_bn, constant RoomGridParams &g, uint3 t, device const uint *excluded) {
+    const int3 pos = int3(t.z, t.y, t.x) + 1, n = int3(g.Nx, g.Ny, g.Nz);
+    if (any(pos >= n - 1)) return;
+    const int ii = (pos.x * g.Ny + pos.y) * g.Nz + pos.z;
+    if (excluded && ((excluded[ii / RoomBnBlock] >> (ii % RoomBnBlock)) & 1u)) return;
     const RoomBnBlockEntry block = bn_blocks[ii / RoomBnBlock];
     const uint slot = uint(ii % RoomBnBlock);
-
+    const bool boundary = ((block.Occupied >> slot) & 1u) != 0;
+    const uint adj = boundary ? adj_bn[block.Rank + popcount(block.Occupied & ((1u << slot) - 1u))] : 4095u;
+    const int q = RoomShellQ(pos, n, true);
+    const float previous = u0[ii];
     int step[RoomNumNeighbours], off[RoomFccNeighbours];
-    RoomAxisSteps(pos, n, g.Nz, nzny, true, step);
+    RoomAxisSteps(pos, n, g.Nz, g.Nz * g.Ny, true, step);
     RoomFccOffsets(step, off);
-    if (((block.Occupied >> slot) & 1u) == 0) {
+    if (Physical) {
+        // Differences preserve the staggered air limit without a rounded diagonal DC force.
+        const float old = boundary ? RoomAbsorb(previous, previous, g.L, q) : previous;
+        const float next = 2.f * u1[ii] - old + g.A2 * RoomFccLaplacian(u1, ii, off, adj);
+        u0[ii] = boundary ? next : RoomAbsorb(next, previous, g.L, q);
+    } else if (!boundary) {
         float partial = g.A1 * u1[ii] - previous;
         for (int bit = 0; bit < RoomFccNeighbours; ++bit) partial += g.A2 * u1[ii + off[bit]];
         u0[ii] = RoomAbsorb(partial, previous, g.L, q);
-        return;
+    } else {
+        const float b1 = 2.f - g.Sl2 * float(popcount(adj));
+        float partial = b1 * u1[ii] - RoomAbsorb(previous, previous, g.L, q);
+        for (int bit = 0; bit < RoomFccNeighbours; ++bit) partial += g.A2 * float((adj >> bit) & 1) * u1[ii + off[bit]];
+        u0[ii] = partial;
     }
-    // Dropped neighbors leave both the sum and diagonal.
-    const uint adj = adj_bn[block.Rank + popcount(block.Occupied & ((1u << slot) - 1u))];
-    const float b1 = 2.f - g.Sl2 * float(popcount(adj));
-    float partial = b1 * u1[ii] - RoomAbsorb(previous, previous, g.L, q);
+}
+
+kernel void RoomAirFcc(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks, device const ushort *adj_bn, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
+    RoomAirFccUpdate<false>(u0, u1, bn_blocks, adj_bn, g, t, nullptr);
+}
+
+kernel void RoomAirFccPhysical(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks, device const ushort *adj_bn, constant RoomGridParams &g, uint3 t [[thread_position_in_grid]]) {
+    RoomAirFccUpdate<true>(u0, u1, bn_blocks, adj_bn, g, t, nullptr);
+}
+
+kernel void RoomAirFccPorous(device float *u0, device const float *u1, device const RoomBnBlockEntry *bn_blocks, device const ushort *adj_bn, constant RoomGridParams &g, device const uint *excluded, uint3 t [[thread_position_in_grid]]) {
+    RoomAirFccUpdate<true>(u0, u1, bn_blocks, adj_bn, g, t, excluded);
+}
+
+// Trapezoidal ADE: accumulator input and output are centered at the same
+// half/integer time as their constitutive update (Smits 2023, Eqs. 29, 44, 45).
+inline float RoomPorousResponse(float input, RoomPorousFunction function, device const RoomPorousPole *poles, device float *state, int offset) {
+    float value = function.Constant * input;
+    for (int m = 0; m < function.Count; ++m) {
+        const RoomPorousPole pole = poles[function.Offset + m];
+        const float previous = state[offset + m];
+        const float next = pole.Decay * previous + pole.Drive * input;
+        state[offset + m] = next;
+        value += pole.Residue * (previous + next);
+    }
+    return value;
+}
+
+kernel void RoomPorousVelocity(device const float *pressure, device float *velocity, device float *state, device const RoomPorousLink *links, device const RoomPorousFunction *functions, device const RoomPorousPole *poles, constant RoomPorousParams &p, uint index [[thread_position_in_grid]]) {
+    if (index >= uint(p.Links)) return;
+    const RoomPorousLink link = links[index];
+    const float gradient = (pressure[link.B] - pressure[link.A]) * p.GradientScale;
+    velocity[index] -= p.Dt * RoomPorousResponse(gradient, functions[link.Material], poles, state, link.State);
+}
+
+kernel void RoomPorousInteriorUpdate(device float *next, device const float *pressure, device float *state, device const RoomPorousInterior *nodes, device const RoomPorousFunction *functions, device const RoomPorousPole *poles, constant RoomGridParams &g, constant RoomPorousParams &p, uint index [[thread_position_in_grid]]) {
+    if (index >= uint(p.Interiors)) return;
+    const RoomPorousInterior node = nodes[index];
+    const int ii = node.Node;
+    const int3 position = int3(ii / (g.Ny * g.Nz), (ii / g.Nz) % g.Ny, ii % g.Nz);
+    int step[RoomNumNeighbours], offsets[RoomFccNeighbours];
+    RoomAxisSteps(position, int3(g.Nx, g.Ny, g.Nz), g.Nz, g.Nz * g.Ny, true, step);
+    RoomFccOffsets(step, offsets);
+    const float laplacian = RoomFccLaplacian(pressure, ii, offsets, node.Adjacency);
+    const float acceleration = RoomPorousResponse(laplacian * p.LaplacianScale, functions[node.Material], poles, state, node.State);
+    next[ii] = 2.f * pressure[ii] - next[ii] + p.Dt * p.Dt * acceleration;
+}
+
+kernel void RoomPorousPressure(device float *next, device const float *pressure, device const float *velocity, device float *state, device const RoomPorousInterface *nodes, device const RoomPorousFunction *functions, device const RoomPorousPole *poles, constant RoomPorousParams &p, uint index [[thread_position_in_grid]]) {
+    if (index >= uint(p.Interfaces)) return;
+    const RoomPorousInterface node = nodes[index];
+    float divergence = 0.f;
     for (int bit = 0; bit < RoomFccNeighbours; ++bit) {
-        partial += g.A2 * float((adj >> bit) & 1) * u1[ii + off[bit]];
+        const int link = node.Links[bit];
+        if (link != 0) divergence += (link > 0 ? 1.f : -1.f) * velocity[abs(link) - 1];
     }
-    u0[ii] = partial;
+    const float rate = RoomPorousResponse(divergence * p.DivergenceScale, functions[node.Material], poles, state, node.State);
+    next[node.Node] = pressure[node.Node] - p.Dt * rate;
 }
 
 // Destructive traffic ceiling for the scattered eight-stream lossy pass.

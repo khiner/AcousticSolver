@@ -59,6 +59,31 @@ struct RoomStepParams {
     int Step;
 };
 
+// Sparse extended-reacting volume tables. Each state offset owns exactly the
+// number of accumulator values in its material's rational function.
+struct RoomPorousFunction {
+    float Constant;
+    int Offset, Count;
+};
+struct RoomPorousPole {
+    float Decay, Drive, Residue;
+};
+struct RoomPorousInterior {
+    int Node, Material, State;
+    unsigned int Adjacency;
+};
+struct RoomPorousInterface {
+    int Node, Material, State;
+    int Links[RoomFccNeighbours]; // signed one-based link indices; zero is rigid
+};
+struct RoomPorousLink {
+    int A, B, Material, State;
+};
+struct RoomPorousParams {
+    int Interiors, Interfaces, Links;
+    float Dt, LaplacianScale, GradientScale, DivergenceScale;
+};
+
 // The optimised implicit scheme of Smits & Bilbao 2025, in the form its two kernels read it.
 // The scheme is
 //

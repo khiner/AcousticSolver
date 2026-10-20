@@ -11,8 +11,13 @@
 #include "RoomParams.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace Porous {
+struct Prepared;
+} // namespace Porous
 
 struct RoomScene {
     // Which stencil steps this grid: the 7-point Cartesian one over the whole grid, or the
@@ -26,6 +31,7 @@ struct RoomScene {
     int Nx{0}, Ny{0}, Nz{0};
     double H{0}; // grid spacing, m
     double C{0}; // speed of sound, m/s
+    double Rho{1.2}; // ambient density, kg/m^3 (porous equivalent-fluid model)
     double Ts{0}; // time step, s
     double Srate{0}; // 1 / Ts
     double L{0}, L2{0}; // Courant number and its square, as the reference recorded them
@@ -62,6 +68,8 @@ struct RoomScene {
     int CornersPerReceiver{8};
 
     std::string Output; // output stem, from the config
+    bool PressureOutput{false}; // native scenes emit pressure; legacy inputs require integration
+    std::shared_ptr<Porous::Prepared> Porous; // optional FCC porous-volume preparation
 
     int NumNodes() const { return Nx * Ny * Nz; }
     int NumSources() const { return int(InIxyz.size()); }
@@ -74,7 +82,7 @@ RoomScene LoadRoomScene(const std::string &config_file);
 // Steps `scene` for `n_steps` and returns one float64 row a receiver, the trilinear corners
 // recombined and the source normalisation undone — the same signal the reference engines
 // write. Normalising the source rewrites `scene`'s signal rows in place.
-std::vector<double> RenderRoomScene(RoomScene &, int n_steps);
+std::vector<double> RenderRoomScene(RoomScene &, int n_steps, size_t *metal_buffer_bytes = nullptr);
 
 // `seconds`, when positive, renders only that much of the scene rather than its full step
 // count.

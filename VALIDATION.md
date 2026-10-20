@@ -75,6 +75,64 @@ filtering, resampling and air absorption. Raw samples and processed WAVs are not
 interchangeable numerical references. Finite record lengths can truncate decay;
 a rigid room's truncated tail must not be interpreted as physical damping.
 
+## Porous room elements
+
+```sh
+script/ValidatePorous
+script/ValidatePorous --cpu
+script/ValidatePorous --demo
+script/ValidatePorous --band  # extended frequency sweep; requires matplotlib
+```
+
+The focused checks cover material fits, transparent interfaces, box/OBJ
+classification, rigid-room attenuation, FP64/Metal agreement and split-run
+repeatability. Metal receiver relative error must remain below `2e-4` against the
+FP64 discrete reference. The source starts from rest; arbitrary nonzero porous
+initial fields require consistent auxiliary states.
+
+Production-solver slab checks compare complex reflection and transmission with
+an independent continuum transfer-matrix calculation. A 10 cm absorber with
+flow resistivity 10000 Pa·s/m² is tested at approximately 1011 Hz, at normal and
+45° incidence, both freestanding and backed by an approximately 20 cm air gap.
+The exact voxelized gap is used in each comparison. Refining spacing from 2 cm
+to 1 cm must reduce errors, with fine-grid complex-amplitude errors below `0.03`.
+Stationarity and spatial wave-fit residuals must be below `0.001`, with
+decomposition condition below 10. `build/porous/slabs.json` records geometry,
+coefficients, errors and timings.
+
+`--band` extends this to 20 frequencies spanning 20–4000 Hz, at normal and
+near-45° incidence (43.86–46.23°), with both backing configurations and two grid resolutions.
+Transverse mirror-mode dimensions are rounded to the grid; the exact angle and
+backing gap enter the analytical comparison and are recorded for every case.
+Runs last at least 96 cycles and 200 ms. Fine spacing decreases from 25 mm at
+low frequencies to 1.25 mm at the upper band edge.
+
+Each pair must reduce complex reflection/transmission errors under refinement,
+with fine-grid errors below `0.03`. Absorption error must be below `0.05`;
+impedance error is `|z-z_ref|/max(1,|z_ref|) < 0.05`, where `z = Z/(rho*c)`.
+The same `0.001` stationarity and spatial-residual limits apply. The wave
+decomposition condition limit is 100 because the fixed probe span covers only
+a small part of a wavelength at 20 Hz.
+
+`build/porous/band.json` records the results, hardware and executable/source
+hashes; `band-backed` and `band-freestanding` PNG/SVG plots show the comparisons.
+This validates sampled frequency-dependent scattering with the production
+Metal solver. It does not reproduce the paper's large finite-aperture pulse
+experiment or its full-audio-band room benchmark.
+
+Material preparation requires stable real poles, positive K/R relaxation weights,
+and sampled passivity of Q/s. Fits are checked densely against the frequency-domain
+Allard–Champoux model. These checks and bounded post-excitation runs do not prove
+stability for arbitrary fitted materials, grids or durations.
+
+The demo produces shared-gain listening WAVs and `build/porous/demo.json` with
+render time, allocated Metal buffer bytes and late pressure RMS. Render time
+includes GPU initialization, stepping and receiver extraction but excludes file
+writing and WAV processing; buffer bytes exclude driver/pipeline allocations.
+Late pressure RMS is a listening comparison, not a stored-energy or RT60 estimate.
+The 4 cm demo grid is intended for low-frequency room effects; its 4 kHz material
+fit limit does not establish 4 kHz spatial accuracy.
+
 ## Immersed boundaries
 
 ```sh

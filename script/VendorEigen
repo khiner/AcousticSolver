@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Re-vendors Eigen into src/external/Eigen. To bump it, change Version and Sha256 and
-# rerun. script/Build is the check: every kept module is reached through <Eigen/Dense>.
+# rerun. script/Build checks the dense and sparse modules used by the solvers.
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ Url="https://gitlab.com/libeigen/eigen/-/archive/${Version}/eigen-${Version}.tar
 # Modules the project reaches, directly or transitively. Kept ones are copied whole: their
 # LAPACKE/BLAS shims are inert without EIGEN_USE_LAPACKE, and pruning within a module is
 # latent breakage for about a megabyte.
-Modules=(Core LU Cholesky QR SVD Geometry Eigenvalues Householder Jacobi)
+Modules=(Core LU Cholesky QR SVD Geometry Eigenvalues Householder Jacobi SparseCore SparseLU OrderingMethods)
 
 ScriptDir="$(cd "$(dirname "${0}")" && pwd)"
 ProjectRootDir="$(dirname "${ScriptDir}")"
@@ -46,7 +46,7 @@ are upstream's, unmodified.
 - SHA256: \`${Sha256}\`
 - Modules kept: Dense ${Modules[*]}
 
-Everything else is dropped: the sparse solvers, the external library backends, the Qt/STL
+Everything else is dropped: the other sparse solvers, the external library backends, the Qt/STL
 container headers, and upstream's \`unsupported/\`, \`doc/\`, and \`test/\` trees.
 
 Eigen is MPL2 (\`COPYING.MPL2\`). The Intel-authored \`*_BLAS.h\`, \`*_LAPACKE.h\`, and

@@ -294,6 +294,48 @@ not reproduced exactly. Reports retain failures, discrepancies and interpretatio
 choices, including initialization, sample timing and the ODE force-sign correction.
 Completing the sweeps does not establish convergence of every formulation.
 
+## Coupled plates and air
+
+```sh
+git submodule update --init external/ness
+script/ValidateCoupled
+script/ValidateCoupled --demo  # one second each of supported/free plate and drum audio
+```
+
+The validator compares Metal float-pair stepping against pinned NESS FP64 for
+the original discretization, and a separate FP64 sparse direct solve for explicit
+rectangular edge conditions. Short cases cover nonlinear/linear motion, silence,
+sympathetic plates, reduced air loading, repeated strikes with a reflecting
+exterior, two circular drum heads with a rigid shell, all three rectangular edge
+conditions, and a scene mixing boundary types, grid sizes, linear/nonlinear
+panels and coupling iteration counts. It checks that
+nonlinearity and air loading change the motion and that unstruck surfaces respond.
+Each receiver trace and the complete final air/panel states must have relative
+L2 error below `1e-4`; the reports preserve measured errors and source/binary hashes.
+WAV checks cover rate, shape, finite samples and normalization. Two malformed
+configurations must be rejected. Free-edge strikes must move boundary nodes;
+clamped and simply supported boundary displacements must stay zero.
+
+`CoupledBoundaryTest` also checks mass-weighted stiffness symmetry, the three
+free-plate rigid modes, nonlinear polarization, lossless nonlinear energy, and
+the plate/air interpolation work identity. Fundamental frequencies on 8-, 16-
+and 24-interval square grids must converge toward the analytic simply supported
+value and the clamped/free Rayleigh–Ritz references in
+[Leissa, NASA SP-160, Tables 4.22 and 4.67](https://ntrs.nasa.gov/citations/19700009156),
+within 1.2% on the finest grid. The nonlinear energy check allows relative drift
+below `1e-8` and requires at least 1% of energy to enter the nonlinear term.
+The Airy boundary treatment follows
+[Thomas and Bilbao, Eqs. 21 and 33](https://doi.org/10.1016/j.jsv.2008.04.014).
+
+CPU/Metal comparisons share prepared coefficients; the mode/refinement and
+energy checks provide additional evidence for the new boundary operators.
+Pressure is the centered velocity-potential derivative multiplied by air density;
+this adds the `rho/2` factor omitted by NESS's `OutputPressure` convention.
+The build applies circular-mask bounds guards and initializes an unused plate
+wave-speed argument in a generated NESS source copy; the submodule stays unchanged.
+The frequency checks establish refinement behavior for isolated plates, not
+convergence of every coupled nonlinear trajectory or reproduction of every paper figure.
+
 ## Acoustic Reliefs
 
 The [sanity and upstream comparison commands](script/reliefs/README.md) test Metal

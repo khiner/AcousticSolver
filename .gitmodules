@@ -4,3 +4,6 @@
 [submodule "external/nLinStringsConv-SAV"]
 	path = external/nLinStringsConv-SAV
 	url = https://github.com/Nemus-Project/nLinStringsConv-SAV.git
+[submodule "external/ness"]
+	path = external/ness
+	url = https://github.com/Edinburgh-Acoustics-and-Audio-Group/ness.git

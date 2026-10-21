@@ -149,3 +149,35 @@ add_executable(StringTest src/String/StringTest.cpp)
 target_link_libraries(StringTest PRIVATE StringCore)
 add_executable(StringPaper src/String/StringPaper.cpp)
 target_link_libraries(StringPaper PRIVATE StringCore)
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/ness/src/PlateEmbedded.cpp")
+    set(NESS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/ness/src")
+    # Guard exhausted circular masks without modifying the pinned submodule.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NESS_DIR}/PlateEmbedded.cpp")
+    file(READ "${NESS_DIR}/PlateEmbedded.cpp" NESS_PLATE_SOURCE)
+    string(REPLACE "if (TruePhi[I] == l)" "if (I < TruePhiSize && TruePhi[I] == l)" NESS_PLATE_SOURCE "${NESS_PLATE_SOURCE}")
+    string(REPLACE "if (TruePhi[j] == i)" "if (j < TruePhiSize && TruePhi[j] == i)" NESS_PLATE_SOURCE "${NESS_PLATE_SOURCE}")
+    string(REPLACE "double K, sig0, c;" "double K, sig0, c = 0;" NESS_PLATE_SOURCE "${NESS_PLATE_SOURCE}")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/ness")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ness/PlateEmbedded.cpp" "${NESS_PLATE_SOURCE}")
+    execute_process(COMMAND git -C "${NESS_DIR}" rev-parse HEAD OUTPUT_VARIABLE NESS_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    add_library(NessReference STATIC
+        ${NESS_DIR}/Airbox.cpp ${NESS_DIR}/AirboxIndexed.cpp ${CMAKE_CURRENT_BINARY_DIR}/ness/PlateEmbedded.cpp
+        ${NESS_DIR}/Embedding.cpp ${NESS_DIR}/Component.cpp ${NESS_DIR}/Component2D.cpp ${NESS_DIR}/Component3D.cpp
+        ${NESS_DIR}/Connection.cpp ${NESS_DIR}/GlobalSettings.cpp ${NESS_DIR}/SettingsManager.cpp
+        ${NESS_DIR}/Input.cpp ${NESS_DIR}/InputSample.cpp ${NESS_DIR}/InputStrike.cpp
+        ${NESS_DIR}/Logger.cpp ${NESS_DIR}/Material.cpp ${NESS_DIR}/Profiler.cpp
+        ${NESS_DIR}/Task.cpp ${NESS_DIR}/TaskWholeComponent.cpp ${NESS_DIR}/TaskWholeConnection.cpp
+        ${NESS_DIR}/MathUtil.cpp ${NESS_DIR}/matgen.c
+        ${NESS_DIR}/lib/csrmatrix.c ${NESS_DIR}/lib/arralloc.c ${NESS_DIR}/lib/pcg.c ${NESS_DIR}/lib/banded.c)
+    target_include_directories(NessReference SYSTEM PUBLIC ${NESS_DIR} ${NESS_DIR}/lib)
+    target_compile_options(NessReference PRIVATE -w -ffp-contract=off)
+    add_library(CoupledCore STATIC src/Coupled/CoupledReference.cpp src/Coupled/CoupledBoundary.cpp src/Coupled/CoupledGpu.cpp)
+    target_link_libraries(CoupledCore PUBLIC AcousticCore PRIVATE NessReference)
+    target_compile_definitions(CoupledCore PRIVATE ACOUSTIC_NESS_COMMIT="${NESS_COMMIT}")
+    target_compile_options(CoupledCore PRIVATE -ffp-contract=off)
+    add_executable(CoupledSolve src/Coupled/CoupledMain.cpp)
+    target_link_libraries(CoupledSolve PRIVATE CoupledCore)
+    add_executable(CoupledBoundaryTest src/Coupled/CoupledBoundaryTest.cpp)
+    target_link_libraries(CoupledBoundaryTest PRIVATE CoupledCore)
+endif()

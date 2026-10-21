@@ -16,6 +16,7 @@ upstream-identical. Files under `src/` not listed here are original to this proj
 | `ModalSound.{h,cpp}`, `ModeData.h` | ModalSound, based on [openpbso](https://github.com/jhwang7628/openpbso) |
 | `Room/*` except `Porous*` | [PFFDTD](https://github.com/bsxfun/pffdtd) |
 | `String/*` | [nLinStringsConv-SAV](https://github.com/Nemus-Project/nLinStringsConv-SAV) |
+| `Coupled/*` | [NESS](https://github.com/Edinburgh-Acoustics-and-Audio-Group/ness) |
 
 ### WaveBlender and FluidSound
 
@@ -139,3 +140,21 @@ Each carries its full license text in-tree, at the location given.
 | [AudioFile](https://github.com/adamstark/AudioFile) — Adam Stark | MIT | header of `AudioFile.h` | verbatim |
 | [JSON for Modern C++](https://github.com/nlohmann/json) — Niels Lohmann | MIT | header of `json.hpp` | verbatim |
 | AABB-triangle overlap — Tomas Akenine-Möller | MIT | header of `tribox.h` | adapted: `float` → `REAL`, internal linkage |
+
+## NESS coupled plates and air
+
+`external/ness` pins revision `14c7b47e4cb32eda09bc75ad938cff90d5ff245b`.
+The library supplies preparation and the CPU reference; `src/Coupled/` ports
+its air, plate and embedding timesteps to Metal. Explicit rectangular boundary
+conditions reuse NESS's standalone linear plate operators, with native nonlinear
+stress and mass-weighted coupling extensions. CMake applies circular-mask
+bounds guards and initializes an unused wave-speed argument in a generated
+build copy of `PlateEmbedded.cpp`, leaving the submodule unchanged.
+
+Copyright 2012-2024 The University Of Edinburgh
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

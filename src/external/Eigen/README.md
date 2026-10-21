@@ -5,9 +5,9 @@ are upstream's, unmodified.
 
 - Release: <https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz>
 - SHA256: `8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72`
-- Modules kept: Dense Core LU Cholesky QR SVD Geometry Eigenvalues Householder Jacobi
+- Modules kept: Dense Core LU Cholesky QR SVD Geometry Eigenvalues Householder Jacobi SparseCore SparseLU OrderingMethods
 
-Everything else is dropped: the sparse solvers, the external library backends, the Qt/STL
+Everything else is dropped: the other sparse solvers, the external library backends, the Qt/STL
 container headers, and upstream's `unsupported/`, `doc/`, and `test/` trees.
 
 Eigen is MPL2 (`COPYING.MPL2`). The Intel-authored `*_BLAS.h`, `*_LAPACKE.h`, and

@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Check coupled plate boundaries and compare Metal with the appropriate FP64 reference."""
+import argparse
+from copy import deepcopy
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+
+import numpy as np
+import soundfile as sf
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run(executable, folder, name, config):
+    source = folder / (name + '.config.json')
+    source.write_text(json.dumps(config, indent=2) + '\n')
+    prefix = folder / name
+    with (folder / (name + '.log')).open('w') as log:
+        result = subprocess.run([str(executable), str(source), '--compare', '--output', str(prefix)],
+                                stdout=log, stderr=subprocess.STDOUT, env={**os.environ, 'NESS_LOG_LEVEL': '5'})
+    if result.returncode:
+        raise RuntimeError(f'{name} failed; see {prefix}.log')
+    report = json.loads(Path(str(prefix) + '.json').read_text())
+    channels = len(config['receivers']) + len(config['panels'])
+    samples = np.fromfile(str(prefix) + '.bin', dtype='<f8').reshape(-1, channels)
+    audio, rate = sf.read(str(prefix) + '.wav', always_2d=True)
+    assert rate == config['sample_rate'] and audio.shape == (len(samples), len(config['receivers']))
+    assert np.isfinite(audio).all() and np.isfinite(samples).all()
+    assert np.max(np.abs(audio), initial=0) <= .950001
+    print(f"PASS {name}: worst channel error {max(report['channel_relative_errors']):.3g}, "
+          f"Metal {report['render_seconds']:.3f}s, FP64 {report['reference_seconds']:.3f}s", flush=True)
+    return report, samples
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT / 'build/coupled-validation')
+    parser.add_argument('--executable', type=Path, default=ROOT / 'build/CoupledSolve')
+    parser.add_argument('--demo', action='store_true', help='also render one second of supported/free plate and drum audio')
+    args = parser.parse_args()
+    folder = args.output.resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    boundary_test = args.executable.resolve().parent / 'CoupledBoundaryTest'
+    result = subprocess.run([str(boundary_test)], capture_output=True, text=True, env={**os.environ, 'NESS_LOG_LEVEL': '5'})
+    (folder/'boundary-operators.log').write_text(result.stdout + result.stderr)
+    if result.returncode:
+        raise RuntimeError(f'Boundary operator checks failed; see {folder}/boundary-operators.log')
+    boundary_report = json.loads(result.stdout)
+    print('PASS boundary frequencies, refinement, rigid modes, nonlinear energy and interface work', flush=True)
+    plate = json.loads((ROOT / 'config/CoupledPlate.json').read_text())
+    plate['seconds'] = .05
+    plate['strikes'][0]['force'] = 300
+    cases = {'nonlinear': plate}
+    linear = deepcopy(plate)
+    linear['panels'][0]['nonlinear'] = False
+    cases['linear'] = linear
+    quiet = deepcopy(plate)
+    quiet['strikes'] = []
+    quiet['seconds'] = .005
+    cases['silence'] = quiet
+    pair = deepcopy(plate)
+    pair['panels'][0]['center'][2] = -.09
+    pair['panels'].append(deepcopy(pair['panels'][0]))
+    pair['panels'][1]['center'][2] = .09
+    cases['sympathetic'] = pair
+    weak = deepcopy(plate)
+    weak['air_density'] = .0121
+    cases['weak_air_loading'] = weak
+    reflecting = deepcopy(plate)
+    reflecting.update(lossless=True, reflecting=True)
+    reflecting['strikes'].append({**reflecting['strikes'][0], 'start': .02})
+    cases['reflecting_repeated'] = reflecting
+    drum = json.loads((ROOT / 'config/CoupledDrum.json').read_text())
+    drum['seconds'] = .04
+    cases['drum'] = drum
+    for boundary in ('clamped', 'simply_supported', 'free'):
+        scene = deepcopy(plate)
+        scene['panels'][0]['boundary'] = boundary
+        if boundary == 'free':
+            scene['strikes'].append({**scene['strikes'][0], 'start': .02, 'position': [.001, .5]})
+        cases[boundary] = scene
+    mixed = deepcopy(plate)
+    mixed['panels'] = [deepcopy(plate['panels'][0]) for _ in range(3)]
+    for item, boundary, z in zip(mixed['panels'], ('free', 'simply_supported', 'ness'), (-.14, 0, .14)):
+        item.update(boundary=boundary, center=[0, 0, z])
+    mixed['panels'][0].update(size=[.30, .26], coupling_iterations=3)
+    mixed['panels'][1].update(nonlinear=False, coupling_iterations=7)
+    cases['mixed_boundaries'] = mixed
+    report = {'cases': {}, 'checks': {}, 'boundary_operators': boundary_report}
+    captures = {}
+    for name, config in cases.items():
+        report['cases'][name], captures[name] = run(args.executable.resolve(), folder, name, config)
+    checks = report['checks']
+    checks['silence'] = bool(np.count_nonzero(captures['silence']) == 0)
+    checks['passive_panel_excited'] = bool(np.max(np.abs(captures['sympathetic'][:, -1])) > 1e-9)
+    checks['passive_drum_head_excited'] = bool(np.max(np.abs(captures['drum'][:, -2])) > 1e-9)
+    checks['mixed_passive_panels_excited'] = bool(np.min(np.max(np.abs(captures['mixed_boundaries'][:, -2:]), axis=0)) > 1e-9)
+    for boundary in ('clamped', 'simply_supported', 'free'):
+        data = report['cases'][boundary]['panels'][0]
+        final = np.fromfile(str(folder/boundary) + '.panels.bin', dtype='<f8').reshape(data['grid'])
+        edge = np.concatenate([final[0], final[-1], final[:, 0], final[:, -1]])
+        checks[boundary+'_edges'] = bool(np.max(np.abs(edge)) > 1e-8) if boundary == 'free' else bool(np.count_nonzero(edge) == 0)
+    def difference(a, b):
+        return float(np.linalg.norm(a-b) / max(np.linalg.norm(b), 1e-300))
+    nonlinear_effect = difference(captures['nonlinear'][:, -1], captures['linear'][:, -1])
+    loading_effect = difference(captures['nonlinear'][:, -1], captures['weak_air_loading'][:, -1])
+    checks['nonlinear_effect'] = nonlinear_effect > .01
+    checks['air_loading_feedback'] = loading_effect > 1e-5
+    report['nonlinear_relative_change'] = nonlinear_effect
+    report['air_loading_relative_change'] = loading_effect
+    for name, edit in [('invalid_geometry', {'airbox': [.01, .01, .01]}), ('invalid_rate', {'sample_rate': 0})]:
+        config = {**plate, **edit}
+        source = folder / (name+'.json')
+        source.write_text(json.dumps(config))
+        result = subprocess.run([str(args.executable.resolve()), str(source), '--output', str(folder/name)], capture_output=True)
+        checks[name] = result.returncode == 1
+    if args.demo:
+        for name in ('CoupledPlate', 'CoupledFreePlate', 'CoupledDrum'):
+            config = json.loads((ROOT / 'config' / (name+'.json')).read_text())
+            config['seconds'] = 1
+            report['cases'][name], _ = run(args.executable.resolve(), folder, name, config)
+    files = [args.executable.resolve(), boundary_test, ROOT/'CMakeLists.txt', *sorted((ROOT/'src/Coupled').glob('*')), ROOT/'src/String/StringReal.h', Path(__file__).resolve()]
+    report['sha256'] = {str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+    report['passed'] = all(checks.values())
+    (folder/'summary.json').write_text(json.dumps(report, indent=2)+'\n')
+    print(json.dumps(checks, indent=2))
+    print(folder/'summary.json')
+    return 0 if report['passed'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

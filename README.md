@@ -13,6 +13,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Curved tetrahedral DG](src/Dg/README.md) | Rigid-wall wave propagation | Prepared meshes and operators; no native scene/source integration |
 | [Nonlinear plates](https://arxiv.org/abs/2608.06139) | Plate vibration and crash sounds | Simply supported rectangular plates; displacement output |
 | [Nonlinear stiff strings](https://doi.org/10.1007/s11071-026-12708-0) | Plucked-string vibration | Geometrically exact, cubic and Kirchhoff–Carrier models; displacement output |
+| [Coupled plates and air](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf) | Radiating panels, sympathetic vibration and drums | Nonlinear parallel plates/membranes with two-way 3D air coupling |
 | [Acoustic Reliefs](script/reliefs/README.md) | Acoustic heightfield optimization | Differentiable boundary elements with an appearance objective |
 
 See [validation](VALIDATION.md) for checks and numerical limits, and [third-party notices](NOTICE.md) for licensing and reference-code provenance.
@@ -200,6 +201,70 @@ longitudinal channels; other models have one channel. `--states` records every
 interior-node state, `--no-wav` skips listening output, and `--output PREFIX` sets
 the destination. Radiation and contact/bowing excitation are outside this model.
 See [string validation and numerical limits](VALIDATION.md#nonlinear-stiff-strings).
+
+## Coupled plates and air
+
+Metal port of the coupled model in Torin and Bilbao,
+[*A 3D Multi-Plate Environment for Sound Synthesis* (DAFx 2013)](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf),
+using the later [NESS implementation](https://github.com/Edinburgh-Acoustics-and-Audio-Group/ness)
+for grid/operator preparation and an FP64 reference. Metal advances the air,
+nonlinear plates, iterative stress solve and both directions of the coupling.
+
+```sh
+git submodule update --init external/ness
+PATH="$(brew --prefix llvm)/bin:$PATH" script/Build
+build/CoupledSolve config/CoupledPlate.json --output build/coupled/plate
+build/CoupledSolve config/CoupledFreePlate.json --output build/coupled/free-plate
+build/CoupledSolve config/CoupledDrum.json --output build/coupled/drum
+script/ValidateCoupled --demo
+```
+
+The airbox is centered at the origin. Panels lie parallel to the XY plane, with
+physical `center`, rectangular `size` or circular `radius`, `thickness`, `density`,
+`young_modulus`, `poisson_ratio`, optional `tension` (N/m), `t60` and `sigma1`.
+Dimensions are in metres and times in seconds. Set `nonlinear: false` per panel
+for linear motion. Strikes specify a zero-based `panel`, normalized `position`
+within its bounding rectangle, raised-cosine `force` in newtons, `start` and `duration`.
+Receivers use physical coordinates. `drum_shell` connects two centered circular
+heads of equal radius with a rigid cylindrical shell.
+
+Rectangular panels accept `boundary: "clamped"`, `"simply_supported"`, or `"free"`.
+These select transverse edge conditions; all three use traction-free in-plane
+conditions, with zero Airy stress function and normal derivative at the perimeter.
+Free edges retain their displacement nodes and corner/edge mass weights, including
+rigid translation and tilt modes when tension is zero. A free plate cannot carry
+prescribed uniform `tension`. Omitting `boundary` retains the original `"ness"`
+discretization for reference comparisons; circular membranes use that discretization.
+Different rectangular edge conditions can share one airbox.
+
+`--seconds N` overrides duration; `--cpu` selects the FP64 reference; `--compare` renders both
+backends and checks receiver traces and final fields. Outputs are native-rate
+float32 `.wav` listening copies and float64 `.bin` samples interleaved by timestep:
+air pressures in Pa, then each panel's center displacement in metres. WAVs contain
+only the air channels, with one normalization gain recorded in `.json` alongside
+resolved grids, backend, timing and reference revision. `.air.bin` stores final
+air velocity potential; `.panels.bin` concatenates final panel displacements.
+Comparison runs write `.upstream.wav`/`.upstream.bin` for NESS-only scenes or
+`.reference.wav`/`.reference.bin` for scenes using explicit rectangular boundaries.
+The latter reference uses a sparse direct plate solve and NESS air stepping.
+
+Supported geometry is static and parallel to the XY plane.
+Panels require two air cells of lateral clearance and four slices of separation.
+The exterior uses NESS's absorbing boundary by default; `reflecting: true` selects
+a zero-potential, pressure-release boundary. `lossless: true` disables structural
+and air attenuation. Arbitrary plate rotations and contact are not implemented.
+
+Resolution follows the requested sample rate and NESS stability grid. Limits are
+four million air cells, 4096 points per panel, 512 MiB of prepared operators and
+256 MiB of trace/excitation storage. The dense inverse preconditioner costs
+quadratic storage per nonlinear panel. `solver_tolerance` (default `1e-9`),
+`solver_iterations` (64), and per-panel `coupling_iterations` (5 rectangular,
+8 circular) control the iterative solves. Metal uses float-pair arithmetic and
+reports failure if PCG does not converge. The CPU reference can be faster on small
+scenes, particularly the two-head drum. GPU work is submitted in bounded
+batches, with panel-size-dependent PCG segments and concurrent panel solves.
+Reported render times exclude operator preparation, shader compilation and file output.
+Set `ACOUSTIC_PROFILE=1` to report GPU execution, submission gaps and host wait time.
 
 ## Acoustic Reliefs
 

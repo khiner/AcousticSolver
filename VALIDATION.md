@@ -355,3 +355,37 @@ competing machine load. Solver-specific benchmark tools are `RadiationBench`,
 `RoomBench`, `BenchmarkPlate`, and the DG benchmark mode. Runtime Metal shaders are
 loaded from the source checkout recorded at build time; separate binaries from one
 checkout do not provide independent shader baselines.
+
+## Viscothermal tubes
+
+```sh
+git submodule update --init external/openwind
+python3 -m venv --system-site-packages build/tube-reference/venv
+build/tube-reference/venv/bin/python -m pip install numpy scipy matplotlib h5py soundfile
+build/tube-reference/venv/bin/python script/ValidateTube --demo
+```
+
+The validator executes pinned OpenWind v0.12.4 with independently assembled
+Gauss–Lobatto operators and the same explicit SI material inputs, geometry,
+endpoint conditions and excitation. It compares native preparation coefficients,
+FP64 receiver pressures, final acoustic/memory states, and discrete energy against
+the independently implemented OpenWind solver.
+
+Cases cover tapered tubes, polynomial degrees 1, 3 and 10, loss approximations with
+0, 4, 8 and 16 terms, closed/open/matched/resistive ends, excitation from either
+end, silence, lossless conservation and passive decay, including a larger mesh.
+`--demo` includes the five-second README example. Errors must remain below `1e-7` relative L2; passivity is checked
+separately after excitation ends. Invalid geometry, approximation order and CFL
+settings must fail before stepping.
+
+A cylinder refinement check compares the damped Laplace transform of the rendered
+input pressure/flow with the independent Zwikker–Kosten Bessel-function impedance
+over 100–3000 Hz. The final mesh must reach 2% relative error and improve on the
+coarse mesh. Exponential windowing limits truncation of the impulse response.
+This checks the continuum approximation and discretization together.
+
+`build/tube-validation/` contains raw native/reference traces, listening WAVs,
+impedance data, logs and a summary with source/executable hashes. `--output` and
+`--executable` select another output directory or build. The model equations and
+source implementation are compared; the paper's exact trumpet plots and human
+perceptual equivalence are not claimed.

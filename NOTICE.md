@@ -17,6 +17,7 @@ upstream-identical. Files under `src/` not listed here are original to this proj
 | `Room/*` except `Porous*` | [PFFDTD](https://github.com/bsxfun/pffdtd) |
 | `String/*` | [nLinStringsConv-SAV](https://github.com/Nemus-Project/nLinStringsConv-SAV) |
 | `Coupled/*` | [NESS](https://github.com/Edinburgh-Acoustics-and-Audio-Group/ness) |
+| `Tube/*` | [OpenWind](https://gitlab.inria.fr/openwind/openwind) |
 
 ### WaveBlender and FluidSound
 
@@ -158,3 +159,27 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## OpenWind viscothermal tubes
+
+`external/openwind` pins release v0.12.4, revision
+`0c88d39200f5a2af5a8c206e1ca17940b998562d`. The tube loss tables, spectral
+element preparation and time-stepping equations are adapted from
+`continuous/thermoviscous_models.py`, `discretization/glQuad.py`,
+`discretization/discretized_pipe.py`, and `temporal/tpipe_lossy.py`.
+Native preparation and CPU updates use the same physical model;
+`script/ValidateTube` executes the unmodified upstream Python solver independently.
+
+Copyright (C) 2019-2025, INRIA
+
+OpenWind is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+OpenWind is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+The license is retained in `external/openwind/LICENSE` and this project's `LICENSE`.

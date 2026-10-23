@@ -150,6 +150,13 @@ target_link_libraries(StringTest PRIVATE StringCore)
 add_executable(StringPaper src/String/StringPaper.cpp)
 target_link_libraries(StringPaper PRIVATE StringCore)
 
+add_library(TubeCore STATIC src/Tube/Tube.cpp)
+target_include_directories(TubeCore PUBLIC src)
+target_include_directories(TubeCore SYSTEM PUBLIC src/external)
+target_compile_options(TubeCore PRIVATE -ffp-contract=off)
+add_executable(TubeSolve src/Tube/TubeMain.cpp)
+target_link_libraries(TubeSolve PRIVATE TubeCore)
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/ness/src/PlateEmbedded.cpp")
     set(NESS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/ness/src")
     # Guard exhausted circular masks without modifying the pinned submodule.

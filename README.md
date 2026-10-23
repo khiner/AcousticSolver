@@ -14,6 +14,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Nonlinear plates](https://arxiv.org/abs/2608.06139) | Plate vibration and crash sounds | Simply supported rectangular plates; displacement output |
 | [Nonlinear stiff strings](https://doi.org/10.1007/s11071-026-12708-0) | Plucked-string vibration | Geometrically exact, cubic and Kirchhoff–Carrier models; displacement output |
 | [Coupled plates and air](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf) | Radiating panels, sympathetic vibration and drums | Nonlinear parallel plates/membranes with two-way 3D air coupling |
+| [Viscothermal tubes](https://doi.org/10.1121/10.0005537) | Narrow pipes, tapered ducts and tube resonators | 1D pressure/volume-flow propagation with viscous and thermal boundary-layer losses |
 | [Acoustic Reliefs](script/reliefs/README.md) | Acoustic heightfield optimization | Differentiable boundary elements with an appearance objective |
 
 See [validation](VALIDATION.md) for checks and numerical limits, and [third-party notices](NOTICE.md) for licensing and reference-code provenance.
@@ -265,6 +266,53 @@ scenes, particularly the two-head drum. GPU work is submitted in bounded
 batches, with panel-size-dependent PCG segments and concurrent panel solves.
 Reported render times exclude operator preparation, shader compilation and file output.
 Set `ACOUSTIC_PROFILE=1` to report GPU execution, submission gaps and host wait time.
+
+## Viscothermal tubes
+
+Port of Thibault and Chabassier,
+[*Dissipative time-domain one-dimensional model for viscothermal acoustic propagation in wind instruments* (JASA, 2021)](https://doi.org/10.1121/10.0005537).
+Native C++ prepares the spectral finite elements and diffusive loss coefficients,
+then advances pressure, volume flow, and viscous/thermal memory states in FP64 on the CPU.
+[OpenWind](https://gitlab.inria.fr/openwind/openwind) is pinned as an independent Python reference.
+
+```sh
+PATH="$(brew --prefix llvm)/bin:$PATH" script/Build
+build/TubeSolve config/Tube.json --output build/tube/render
+```
+
+`bore` lists increasing `[position, radius]` pairs in metres, starting at zero.
+Radius is linear between pairs. `elements_per_segment` gives the number of elements
+in each interval; `order` selects polynomial degree 1–10. `loss_terms` accepts
+0–8 or 16 auxiliary terms from the upstream tables; zero retains the lowest-order
+loss model, while `lossless: true` disables both viscous and thermal losses.
+`air` optionally specifies `density` (kg/m³), `sound_speed` (m/s), `viscosity` (Pa·s),
+`conductivity` (W/(m·K)), `heat_capacity` (J/(kg·K)), and `heat_ratio`.
+Defaults approximate air at 20 °C and are recorded in the output metadata.
+
+The two `ends` accept `"closed"`, `"open"` (zero pressure), `"matched"` (local
+characteristic impedance), or a nonnegative resistance in Pa·s/m³.
+Each raised-cosine pulse specifies `start`, `duration`, peak volume `flow` in m³/s,
+and `end` (0 or 1). Positive flow enters the tube. An open end cannot accept a
+flow source. `receivers` are positions along the tube in metres.
+
+`sample_rate` is the actual simulation and WAV rate; there is no implicit resampling.
+The renderer rejects rates below a conservative CFL bound, reporting the required
+minimum. Increase the rate or reduce mesh density/order. `--seconds N` overrides
+duration. The validator checks the native implementation against OpenWind.
+
+Outputs are interleaved float64 pressure `.bin` samples in Pa, discrete energy
+`.energy.bin` in joules, final `.state.bin`, a normalized 24-bit listening `.wav`,
+and `.json` with physical inputs, mesh, normalization gain and timing.
+Samples are recorded after each step, beginning at `1/sample_rate`.
+The final state stores each pressure node as `[P, P0, Pi...]`, followed by each
+discontinuous flow node as `[V, Vi...]`. Pressure states use Pa; flow states use m³/s.
+
+The model assumes rigid axisymmetric walls and approximately plane acoustic waves.
+It does not generate turbulent/whistling excitation or simulate mean flow, wall
+motion, nonlinear propagation, or the exterior radiation field. Endpoint resistance
+is a local termination model. The mesh is limited to 4096 pressure nodes and 8192
+flow nodes. Reported render times exclude preparation and file output.
+See [validation](VALIDATION.md#viscothermal-tubes) for upstream comparisons.
 
 ## Acoustic Reliefs
 

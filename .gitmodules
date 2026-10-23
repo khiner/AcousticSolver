@@ -7,3 +7,6 @@
 [submodule "external/ness"]
 	path = external/ness
 	url = https://github.com/Edinburgh-Acoustics-and-Audio-Group/ness.git
+[submodule "external/openwind"]
+	path = external/openwind
+	url = https://gitlab.inria.fr/openwind/openwind.git

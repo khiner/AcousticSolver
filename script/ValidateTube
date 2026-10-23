@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Compare native preparation and FP64 tube propagation with pinned OpenWind."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+ROOT = Path(__file__).resolve().parents[1]
+UPSTREAM = ROOT / 'external/openwind'
+REVISION = '0c88d39200f5a2af5a8c206e1ca17940b998562d'
+sys.path.insert(0, str(UPSTREAM))
+import numpy as np
+from scipy.special import jve
+import soundfile as sf
+from openwind.continuous import Pipe, Scaling, ThermoviscousDiffusiveRepresentation, ThermoviscousLossless
+from openwind.temporal import TemporalLossyPipe, TemporalPipe
+
+
+def read(prefix, suffix='', shape=-1):
+    return np.fromfile(f'{prefix}{suffix}.bin', '<f8').reshape(shape)
+
+
+def relative(a, b):
+    assert a.shape == b.shape and np.isfinite(a).all() and np.isfinite(b).all()
+    return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-300))
+
+
+class Bore:
+    def __init__(self, points):
+        self.points = np.asarray(points)
+
+    def get_length(self):
+        return self.points[-1, 0]
+
+    def get_radius_at(self, x):
+        return np.interp(np.asarray(x) * self.get_length(), *self.points.T)
+
+    def get_conicity_at(self, x):
+        i = np.clip(np.searchsorted(self.points[:, 0], np.asarray(x) * self.get_length(), side='right'), 1, len(self.points) - 1)
+        return (self.points[i, 1] - self.points[i - 1, 1]) / (self.points[i, 0] - self.points[i - 1, 0])
+
+
+def oracle(config, metadata, prefix):
+    lossless = config.get('lossless', False)
+    terms = config.get('loss_terms', 8)
+    losses = ThermoviscousLossless() if lossless else ThermoviscousDiffusiveRepresentation(f'diffrepr{terms}')
+    pipe = Pipe(Bore(config['bore']), 20, 'tube', Scaling(), losses)
+    # Use identical, explicit SI material inputs; upstream still prepares every operator independently.
+    names = {'rho': 'density', 'c': 'sound_speed', 'mu': 'viscosity', 'kappa': 'conductivity', 'Cp': 'heat_capacity', 'gamma': 'heat_ratio'}
+    for name, key in names.items():
+        setattr(pipe.get_physics(), name, lambda x, value=metadata['air'][key]: np.full_like(np.asarray(x), value, dtype=float))
+    edges = [0.0]
+    for i, count in enumerate(config['elements_per_segment']):
+        edges.extend(np.linspace(config['bore'][i][0], config['bore'][i + 1][0], count + 1)[1:])
+    temporal = (TemporalPipe if lossless else TemporalLossyPipe)(pipe, None, l_ele=np.diff(edges).tolist(), order=config['order'])
+    rate = metadata['sample_rate']
+    temporal.set_dt(1 / rate)
+    np_, nv = temporal.nH1, temporal.nL2
+    assert np_ == metadata['pressure_nodes'] and nv == metadata['flow_nodes']
+    interpolation = temporal.get_interp_mat_H1(np.array(config['receivers']) / pipe.get_length())
+    samples = np.zeros((metadata['steps'], len(config['receivers'])))
+    energies = np.zeros(metadata['steps'])
+    inputs = np.zeros((metadata['steps'], 2))
+    times = (np.arange(metadata['steps']) + .5) / rate
+    for pulse in config.get('pulses', [{'start': 0, 'duration': .001, 'flow': 1e-6}]):
+        t = times - pulse.get('start', 0)
+        length = pulse.get('duration', .001)
+        active = (t >= 0) & (t < length)
+        inputs[active, pulse.get('end', 0)] += .5 * pulse.get('flow', 1e-6) * (1 - np.cos(2 * np.pi * t[active] / length))
+    endpoints = [temporal.end_minus, temporal.end_plus]
+    impedances = []
+    for i, boundary in enumerate(config.get('ends', ['closed', 'open'])):
+        zc = metadata['air']['density'] * metadata['air']['sound_speed'] / (np.pi * config['bore'][0 if i == 0 else -1][1] ** 2)
+        impedances.append({'closed': np.inf, 'open': 0, 'matched': zc}.get(boundary, boundary))
+    for step in range(metadata['steps']):
+        for i, end in enumerate(endpoints):
+            z = impedances[i]
+            flow = -inputs[step, i] if np.isinf(z) else (end.get_p_no_flow() - z * inputs[step, i]) / (z + end.get_alpha())
+            end.update_flow(float(flow))
+        temporal.one_step()
+        samples[step] = interpolation @ temporal.PV[0]
+        energies[step] = temporal.energy()
+    pressure = np.zeros((np_, 2 + terms))
+    flow = np.zeros((nv, 1 + terms))
+    pressure[:, 0], flow[:, 0] = temporal.PV
+    if not lossless:
+        pressure[:, 1], pressure[:, 2:], flow[:, 1:] = temporal._P0, temporal._Pi.T, temporal._Vi.T
+    state = np.concatenate([pressure.ravel(), flow.ravel()])
+    for suffix, data in [('.upstream.bin', samples), ('.upstream.energy.bin', energies), ('.upstream.state.bin', state)]:
+        data.astype('<f8').tofile(str(prefix) + suffix)
+    gain = .95 / max(float(np.max(np.abs(samples))), 1e-300) if np.any(samples) else 1
+    sf.write(str(prefix) + '.upstream.wav', samples * gain, int(rate), subtype='FLOAT')
+    # Compare full native update tables, not only a waveform generated with shared coefficients.
+    reference = {'': samples, '.energy': energies, '.state': state,
+                 '.positions': temporal.mesh.get_xH1() * pipe.get_length(),
+                 '.gradient': temporal.mesh.elements[0].get_Bh_coeff().ravel(),
+                 '.input': inputs.ravel(), '.pickups': interpolation.toarray()}
+    if not lossless:
+        (r0, ri, li), (g0, gi, c0, ci) = temporal._diffrepr_coefs
+        pc = np.empty((np_, 7 + 5 * terms))
+        pc[:, :6] = np.array([temporal.mH1, c0, temporal.p_to_p_noflow, temporal.p0_to_p_noflow,
+                             temporal.p_to_p0, temporal.p0_to_p0]).T
+        # alpha is local; the pressure mass and series thermal admittance determine it.
+        reduced = (gi / 2) * (ci * rate) / (ci * rate + gi / 2)
+        gamma2 = g0 / 2 + reduced.sum(axis=0)
+        gamma3 = c0 * rate * gamma2 / (c0 * rate + gamma2)
+        pc[:, 6] = 1 / (2 * (temporal.mH1 * rate + gamma3))
+        vc = np.empty((nv, 4 + 4 * terms))
+        reduced_v = (ri / 2) * (li * rate) / (ri / 2 + li * rate)
+        vc[:, :4] = np.array([temporal.mL2, r0, temporal.v_to_v, 1 / (temporal.mL2 * rate + r0 / 2 + reduced_v.sum(axis=0))]).T
+        for j in range(terms):
+            pc[:, 7 + 5*j:12 + 5*j] = np.array([temporal.pi_to_p_noflow[j], temporal.pi_to_p0[j], temporal.p_to_pi[j], temporal.pi_to_pi[j], ci[j]]).T
+            vc[:, 4 + 4*j:8 + 4*j] = np.array([temporal.vi_to_v[j], temporal.v_to_vi[j], temporal.vi_to_vi[j], li[j]]).T
+        reference.update({'.pressure_coefficients': pc, '.flow_coefficients': vc})
+    return reference
+
+
+def run(executable, folder, name, config):
+    prefix = folder / name
+    source = folder / (name + '.config.json')
+    source.write_text(json.dumps(config, indent=2) + '\n')
+    with Path(str(prefix) + '.log').open('w') as log:
+        subprocess.run([str(executable), str(source), '--tables', '--output', str(prefix)], stdout=log, stderr=subprocess.STDOUT, check=True)
+    report = json.loads(Path(str(prefix) + '.json').read_text())
+    upstream = oracle(config, report, prefix)
+    errors = {}
+    for suffix, reference in upstream.items():
+        native = read(prefix, suffix, reference.shape)
+        # Normalize coefficient columns independently so large SI coefficients cannot hide others.
+        errors[suffix.lstrip('.') or 'pressure'] = (max(relative(a, b) for a, b in zip(native.T, reference.T))
+                                                   if suffix.endswith('_coefficients') else relative(native, reference))
+    energy = read(prefix, '.energy')
+    passive = energy[int(np.ceil(report['source_end'] * report['sample_rate'])) + 2:]
+    scale = max(float(energy.max()), 1e-300)
+    passive_increase = float(np.max(np.diff(passive), initial=0) / scale)
+    assert energy.min() >= -1e-10 * scale and passive_increase < 1e-9, (name, passive_increase)
+    if config.get('lossless') and config.get('ends') == ['closed', 'closed']:
+        assert np.ptp(passive) / scale < 1e-9
+    assert max(errors.values()) < 1e-7, (name, errors)
+    wav, rate = sf.read(str(prefix) + '.wav', always_2d=True)
+    assert wav.shape == upstream[''].shape and rate == report['sample_rate'] and np.isfinite(wav).all()
+    result = {'errors': errors, 'passive_energy_increase': passive_increase, 'render_seconds': report['render_seconds'], 'audio_seconds': report['audio_seconds']}
+    print(f'PASS {name}: maximum relative error {max(errors.values()):.3g}', flush=True)
+    return result
+
+
+def impedance_check(folder, name):
+    """Compare a tapered-window impulse response with the independent cylindrical ZK solution."""
+    prefix = folder / name
+    report = json.loads(Path(str(prefix) + '.json').read_text())
+    config, air = report['config'], report['air']
+    rate = report['sample_rate']
+    pressure = read(prefix, shape=(-1, len(config['receivers'])))[:, 0]
+    pressure = .5 * (pressure + np.r_[0, pressure[:-1]])
+    flow = read(prefix, '.input', (-1, 2))[:, 0]
+    times = (np.arange(len(pressure)) + .5) / rate
+    frequencies = np.linspace(100, 3000, 80)
+    s = 200 + 2j * np.pi * frequencies
+    measured = np.array([np.sum(pressure * np.exp(-z * times)) / np.sum(flow * np.exp(-z * times)) for z in s])
+    radius, length = config['bore'][0][1], config['bore'][-1][0]
+    area = np.pi * radius**2
+    rho, speed = air['density'], air['sound_speed']
+    def bessel_loss(z):
+        return 2 * jve(1, z) / (z * jve(0, z))
+    viscous = bessel_loss(radius * np.sqrt(-s * rho / air['viscosity']))
+    thermal = bessel_loss(radius * np.sqrt(-s * rho * air['heat_capacity'] / air['conductivity']))
+    z = s * rho / area / (1 - viscous)
+    y = s * area / (rho * speed**2) * (1 + (air['heat_ratio'] - 1) * thermal)
+    exact = np.sqrt(z / y) * np.tanh(length * np.sqrt(z * y))
+    result = {'frequencies': frequencies.tolist(), 'laplace_damping': 200, 'relative_error': relative(measured, exact),
+              'measured_real': measured.real.tolist(), 'measured_imag': measured.imag.tolist(),
+              'analytical_real': exact.real.tolist(), 'analytical_imag': exact.imag.tolist()}
+    Path(str(prefix) + '.impedance.json').write_text(json.dumps(result, indent=2) + '\n')
+    return result['relative_error']
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT / 'build/tube-validation')
+    parser.add_argument('--executable', type=Path, default=ROOT / 'build/TubeSolve')
+    parser.add_argument('--demo', action='store_true', help='also compare the five-second example')
+    args = parser.parse_args()
+    assert subprocess.check_output(['git', '-C', str(UPSTREAM), 'rev-parse', 'HEAD'], text=True).strip() == REVISION
+    folder = args.output.resolve(); folder.mkdir(parents=True, exist_ok=True)
+    base = json.loads((ROOT / 'config/Tube.json').read_text()); base['seconds'] = .025
+    base['pulses'] = base['pulses'][:1]
+    cases = {'tapered': base}
+    for name, changes in {
+        'lossless': {'lossless': True, 'ends': ['closed', 'closed']},
+        'zero_memory': {'loss_terms': 0},
+        'four_memory': {'loss_terms': 4, 'ends': ['closed', 'matched']},
+        'sixteen_memory': {'loss_terms': 16, 'ends': ['closed', 2e6]},
+        'linear_elements': {'order': 1},
+        'high_order': {'order': 10, 'elements_per_segment': [3, 2], 'sample_rate': 384000, 'seconds': .005},
+        'silence': {'pulses': []},
+        'right_source': {'ends': ['open', 'closed'], 'pulses': [{'end': 1, 'duration': .001, 'flow': 1e-6}]},
+        'many_nodes': {'bore': [[0, .006], [4, .009]], 'elements_per_segment': [96], 'receivers': [0, 2], 'seconds': .003, 'loss_terms': 4},
+    }.items():
+        cases[name] = {**base, **changes}
+    for elements in [8, 16, 32]:
+        name = f'cylinder_{elements}'
+        cases[name] = {**base, 'bore': [[0, .003], [.6, .003]], 'elements_per_segment': [elements],
+                  'receivers': [0, .3], 'seconds': .08, 'order': 2, 'loss_terms': 8,
+                  'pulses': [{'duration': .0004, 'flow': 1e-6}]}
+    if args.demo: cases['demo'] = json.loads((ROOT / 'config/Tube.json').read_text())
+    executable = args.executable.resolve()
+    summary = {'openwind_commit': REVISION, 'cases': {name: run(executable, folder, name, config) for name, config in cases.items()},
+               'impedance_errors': [impedance_check(folder, f'cylinder_{elements}') for elements in [8, 16, 32]]}
+    assert summary['impedance_errors'][-1] < .02, summary['impedance_errors']
+    assert summary['impedance_errors'][-1] < summary['impedance_errors'][0] / 2, summary['impedance_errors']
+    for name, change in {'unstable': {'sample_rate': 8000}, 'negative_radius': {'bore': [[0, -.01], [1, .01]]}, 'invalid_terms': {'loss_terms': 9}}.items():
+        source = folder / (name + '.config.json'); source.write_text(json.dumps({**base, **change}))
+        result = subprocess.run([str(executable), str(source)], capture_output=True)
+        assert result.returncode != 0, name
+    summary['passed'] = True
+    summary['sha256'] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in [executable, Path(__file__).resolve(), *sorted((ROOT / 'src/Tube').glob('*'))] if p.is_file()}
+    (folder / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    print('PASS tube validation', flush=True)
+
+
+if __name__ == '__main__':
+    main()

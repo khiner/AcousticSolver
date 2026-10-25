@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare an elastic sphere in air or a water-filled elastic spherical shell."""
+"""Prepare an elastic or viscoelastic sphere in air, or a water-filled elastic shell."""
 
 import argparse
 import json
@@ -81,13 +81,17 @@ def prepare(output, scene, spacing, degree):
         config["sources"][0].update(position=[0.35, 0.01, 0.02], frequency=250.0, time=0.006)
         config["receivers"][1] = {"position": [0.1, 0.03, 0.02], "region": 3, "field": "pressure"}
         config["receivers"].append({"position": [0.35, 0.04, 0.02], "region": 2, "field": "vx"})
+    elif scene == "viscoelastic":
+        config["seconds"] = 2.0
+        config["materials"]["2"]["relaxation"] = [{"stress_time": [0.005, 0.002, 0.002, 0.002],
+                                                    "strain_time": [0.006, 0.003, 0.003, 0.003]}]
     (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(output / "config.json")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("scene", choices=["sphere", "container"])
+    parser.add_argument("scene", choices=["sphere", "container", "viscoelastic"])
     parser.add_argument("output", type=Path)
     parser.add_argument("--spacing", type=float)
     parser.add_argument("--degree", type=int, default=2)

@@ -12,6 +12,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Immersed boundaries](https://doi.org/10.1121/10.0020635) | Exterior scattering and transmission | Static surfaces, impedances and finite barriers |
 | [Curved tetrahedral DG](src/Dg/README.md) | Rigid-wall wave propagation | Prepared meshes and operators; no native scene/source integration |
 | [Coupled elastic–acoustic waves](src/Elastic/README.md) | Transmission, structural radiation and fluid-filled elastic objects | General conforming tetrahedral fluids/solids, curved geometry, heterogeneity and anisotropy |
+| [Viscoelastic waves](https://doi.org/10.1016/j.camwa.2021.08.003) | Material damping in plastics, elastomers and layered solids | Generalized Zener relaxation, frequency-dependent attenuation and dispersion, coupled to fluid acoustics |
 | [Nonlinear plates](https://arxiv.org/abs/2608.06139) | Plate vibration and crash sounds | Simply supported rectangular plates; displacement output |
 | [Nonlinear stiff strings](https://doi.org/10.1007/s11071-026-12708-0) | Plucked-string vibration | Geometrically exact, cubic and Kirchhoff–Carrier models; displacement output |
 | [Coupled plates and air](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf) | Radiating panels, sympathetic vibration and drums | Nonlinear parallel plates/membranes with two-way 3D air coupling |
@@ -366,6 +367,23 @@ Preparation requires NumPy and Gmsh. The example requests one second; `--seconds
 overrides it. This explicit volumetric solver can be much slower than rendered audio.
 See [inputs, outputs and physical limits](src/Elastic/README.md), including the
 reflection limits of its local absorbing boundary.
+
+## Viscoelastic waves
+
+[Shukla, Chan and de Hoop (2021)](https://doi.org/10.1016/j.camwa.2021.08.003)
+adds solid relaxation to `ElasticSolve`: anisotropic, heterogeneous materials can
+have multiple Zener mechanisms, with frequency-dependent attenuation and dispersion.
+Material dissipation is reported separately from interface and boundary loss.
+
+```sh
+python3 script/ElasticDemo viscoelastic build/elastic-demo/viscoelastic
+build/ElasticSolve build/elastic-demo/viscoelastic/config.json --output build/elastic-demo/viscoelastic/render
+```
+
+This two-second example uses illustrative relaxation times. See
+[material inputs and stiffness conventions](src/Elastic/README.md#solid-relaxation).
+`build/ElasticTest --viscoelastic` runs the focused analytical and CPU/Metal checks,
+including an independent comparison with SeisSol's attenuation coefficients.
 
 ## Elastic–acoustic demo videos
 

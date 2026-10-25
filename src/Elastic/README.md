@@ -15,9 +15,13 @@ Preparation still forms local matrices for energy diagnostics and the CFL bound.
 `--cpu` selects the assembled Accelerate FP64 reference with the same fixed timestep. Both use five-stage fourth-order
 Runge–Kutta integration and either full physical mass inversion or matrix
 weight-adjusted mass inversion. Solution degrees 1–6 and geometry degrees
-1–4 are supported. This is small-deformation, lossless acoustics and elasticity;
-it does not model contact, plasticity, viscosity, material attenuation or moving
-interfaces. Numerical dissipation is reported separately from physical energy.
+1–4 are supported, subject to GPU threadgroup storage for the chosen number of
+relaxation mechanisms. Solids can include the generalized Zener viscoelastic model
+of [Shukla, Chan and de Hoop (2021)](https://doi.org/10.1016/j.camwa.2021.08.003).
+Without relaxation data, propagation remains lossless. This is small-deformation
+acoustics and solid mechanics; it does not model contact, plasticity, nonlinear
+material response, fluid viscosity or moving interfaces. Material damping and
+numerical dissipation are reported separately.
 
 ## Run
 
@@ -33,10 +37,15 @@ build/ElasticSolve build/elastic-demo/sphere/config.json --output build/elastic-
 
 python3 script/ElasticDemo container build/elastic-demo/container --spacing 0.3
 build/ElasticSolve build/elastic-demo/container/config.json --prepare
+
+python3 script/ElasticDemo viscoelastic build/elastic-demo/viscoelastic
+build/ElasticSolve build/elastic-demo/viscoelastic/config.json --output build/elastic-demo/viscoelastic/render
 ```
 
-The examples prepare a soft elastic sphere in air and an acrylic spherical shell
-containing water. They request one second of output. `--seconds N` overrides the
+The examples prepare a soft sphere in air and an acrylic spherical shell
+containing water. The elastic examples request one second of output; the
+viscoelastic sphere requests two seconds and uses illustrative relaxation times,
+not measured material data. `--seconds N` overrides the
 duration. `--prepare` reports the unknown count, preparation time and CFL timestep
 without rendering. Fine solid elements and material interfaces can require many
 steps per audio sample; these simulations can take substantially longer than the audio.
@@ -98,6 +107,49 @@ between quadrature points. Sub-cell variation needs sufficient quadrature and me
 resolution; the solver samples admissibility at its integration points. `quadrature_order`
 can increase integration accuracy above its default `degree + geometry_degree + 1`
 (up to 20); check convergence for rapid coefficient variation.
+
+### Solid relaxation
+
+Add `relaxation` to a solid material to model frequency-dependent attenuation and
+dispersion. Each entry adds six local memory variables and one relaxation time
+pair for each of the paper's four modes: dilatation, yz shear, xz shear, xy shear.
+The yz pair also governs normal-deviatoric relaxation, as in the paper's Eq. (28).
+
+```json
+"relaxation": [
+  {"stress_time": [0.005, 0.002, 0.002, 0.002],
+   "strain_time": [0.006, 0.003, 0.003, 0.003]}
+]
+```
+
+Times are in seconds. A scalar applies to all four modes; each value also accepts
+the spatial-field syntax above. Require `strain_time >= stress_time > 0`.
+Equal times give zero attenuation for that mode. Multiple entries add parallel
+relaxation decrements. The configured stiffness (or Young's modulus and Poisson
+ratio) is the **unrelaxed, high-frequency stiffness**, not the static stiffness.
+The equilibrium stiffness after subtracting all decrements must remain positive
+definite; inadmissible materials are rejected. Relaxation data must be fitted or
+measured over the intended frequency band; elastic constants alone do not specify it.
+
+The paper's stress/strain memory equations are implemented in equivalent scaled
+Maxwell-branch coordinates. Writing their coupling columns as `L`, decay rates as
+`Omega = diag(1/stress_time)`, and engineering strain rate as `epsilon_dot`, the
+local equations are
+
+```
+stress_dot = C_infinity * epsilon_dot - L * Omega * memory
+memory_dot = L^T * epsilon_dot - Omega * memory
+C(omega) = C_infinity - L * Omega * (Omega + i*omega*I)^-1 * L^T
+```
+
+The symmetric energy mass includes the memory variables. Material power loss is
+`memory^T * Omega * memory`, integrated over the mesh. These local terms are part
+of the same RK stages and operator CFL calculation as propagation. No relaxation
+splitting or adaptive timestep is used. Fluid/solid and bonded-solid interfaces
+transmit total stress and velocity; memory variables have no face flux.
+
+The absorbing boundary still uses the unrelaxed characteristic impedance. It is
+not an exact frequency-dependent radiation condition for a dissipative medium.
 
 `mass` is `full` or `weight_adjusted` (default). `penalty` defaults to 1; zero selects
 the central interface flux. Integration uses fixed-step, five-stage fourth-order
@@ -165,6 +217,7 @@ For output prefix `render`, the solver writes:
 - `render.wav`: 24-bit WAV with a common peak-normalization gain recorded in JSON.
 - `render.energy.bin`: sample-major FP64 columns for discrete energy, physical
   energy, source power, boundary power and interior interface dissipation.
+  Viscoelastic runs append material dissipation as a sixth column.
 - `render.state.bin`: terminal FP64 Bernstein coefficients, ordered by mesh element,
   then field, then basis coefficient.
 - `render.json`: configuration, step count, fixed timestep (`dt`),
@@ -181,10 +234,15 @@ The fluid state is `[vx,vy,vz,-pressure]`; solid state is
 sign. Channels with different physical units share the WAV gain; use raw values for
 quantitative comparisons.
 
-Discrete energy obeys `dE/dt = source_power + boundary_power - interface_dissipation`
+Each solid relaxation entry appends six memory fields after the nine mechanical
+fields: dilatation, two orthonormal normal-deviatoric components, yz, xz, xy.
+They are scaled branch stresses in square-root pascals. They start at zero in CLI
+runs; native projection can initialize them for a prestrained material.
+
+Discrete energy obeys `dE/dt = source_power + boundary_power - interface_dissipation - material_dissipation`
 up to integration/roundoff error. Boundary power includes boundary numerical loss
 and any prescribed boundary input. With weight-adjusted mass, physical and discrete
 energy are distinct; neither interface penalties nor absorbing-boundary loss are
-material damping.
+material damping. Physical stored energy includes the relaxation branches.
 
 See [validation and reference commands](../../VALIDATION.md#coupled-elasticacoustic-waves).

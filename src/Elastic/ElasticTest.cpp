@@ -7,6 +7,7 @@
 #include <random>
 
 using namespace elastic;
+void CheckViscoelasticReference(Json &);
 namespace {
 void Check(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
@@ -161,9 +162,147 @@ Vec Scholte(const V3 &x, int tag, double time) {
     return q;
 }
 
+void ViscoelasticChecks(Json &report) {
+    CheckViscoelasticReference(report);
+    Json material = Solid();
+    material["relaxation"] = {{{"stress_time", {.05, .04, .03, .02}}, {"strain_time", {.07, .064, .054, .04}}}};
+    const auto m = EvaluateMaterial(material, V3::Zero());
+    Check(m.Fields() == 15 && m.RelaxationRates.size() == 6, "Viscoelastic state layout");
+    for (const auto &times : {Json{{"stress_time", 0}, {"strain_time", .1}}, Json{{"stress_time", .1}, {"strain_time", .05}}}) {
+        bool rejected = false;
+        try {
+            auto bad = material;
+            bad["relaxation"] = {times};
+            EvaluateMaterial(bad, V3::Zero());
+        } catch (const std::invalid_argument &) { rejected = true; }
+        Check(rejected, "Invalid relaxation times accepted");
+    }
+    const auto mesh = BoxMesh(1, V3::Ones(), [](const V3 &) { return 2; });
+    {
+        const Json config = {{"degree", 1}, {"mass", "full"}, {"materials", {{"2", material}}}, {"default_boundary", "fixed"}};
+        Model model(config, mesh);
+        const Vec strain = Vec::LinSpaced(6, .01, .06);
+        const auto exact = [&](double time) {
+            Vec q = Vec::Zero(m.Fields());
+            const Vec initial = m.RelaxationCoupling.transpose() * strain;
+            q.tail(initial.size()) = (-time * m.RelaxationRates.array()).exp().matrix().cwiseProduct(initial);
+            q.segment(3, 6) = m.Stiffness * strain + m.RelaxationCoupling * (q.tail(initial.size()) - initial);
+            return q;
+        };
+        model.Initial = model.Project([&](const V3 &, int) { return exact(0); });
+        const Vec final = model.Project([&](const V3 &, int) { return exact(.1); });
+        const auto cpu = model.Run(.1, 1000, RunOptions{true, .001});
+        const auto gpu = model.Run(.1, 1000, RunOptions{false, .001});
+        const double error = std::sqrt(model.Energy(cpu.State - final) / model.Energy(final));
+        Check(error < 1e-8, "Analytic stress relaxation");
+        Check(std::sqrt(model.Energy(gpu.State - cpu.State) / model.Energy(cpu.State)) < 1e-9, "Metal stress relaxation");
+        Check(gpu.Energy(gpu.Energy.rows() - 1, 0) < model.Energy(model.Initial), "Relaxation energy decay");
+        report["stress_relaxation_error"] = error;
+    }
+    for (const bool shear : {false, true}) {
+        using C = std::complex<double>;
+        const C imaginary(0, 1);
+        const double omega = 2;
+        // Independent frequency-domain Zener moduli, normalized by their high-frequency values.
+        const auto modulus = [&](int mode) {
+            const double ts = material["relaxation"][0]["stress_time"][mode];
+            const double te = material["relaxation"][0]["strain_time"][mode];
+            return (ts / te) * (1. + imaginary * omega * te) / (1. + imaginary * omega * ts);
+        };
+        const C bulk = (5. / 3) * modulus(0), mu = modulus(shear ? 3 : 1);
+        const C longitudinal = bulk + (4. / 3) * mu, speed = std::sqrt((shear ? mu : longitudinal) / m.Density);
+        const C k = omega / speed;
+        Check(k.imag() < 0, "Passive wave attenuation sign");
+        Eigen::Matrix<C, 6, 6> stiffness = m.Stiffness.cast<C>();
+        for (int j = 0; j < m.RelaxationRates.size(); ++j)
+            stiffness -= (m.RelaxationRates[j] / (m.RelaxationRates[j] + imaginary * omega)) * (m.RelaxationCoupling.col(j) * m.RelaxationCoupling.col(j).transpose()).cast<C>();
+        Check(std::abs(stiffness(shear ? 5 : 0, shear ? 5 : 0) - (shear ? mu : longitudinal)) < 1e-13, "Paper relaxation versus Zener complex modulus");
+        const V3 velocity = shear ? V3::UnitY() : V3::UnitX();
+        const Vec strain = NormalMatrix(V3::UnitX()) * velocity;
+        Eigen::VectorXcd amplitude(m.Fields());
+        amplitude.head(3) = velocity.cast<C>();
+        amplitude.segment(3, 6) = -(k / omega) * stiffness * strain.cast<C>();
+        for (int j = 0; j < m.RelaxationRates.size(); ++j)
+            amplitude[9 + j] = -imaginary * k * m.RelaxationCoupling.col(j).dot(strain) / (m.RelaxationRates[j] + imaginary * omega);
+        Check((omega * m.Density * amplitude.head(3) + k * NormalMatrix(V3::UnitX()).transpose().cast<C>() * amplitude.segment(3, 6)).norm() < 1e-12, "Analytic momentum balance");
+        const auto exact = [&](const V3 &x, int, double time) -> Vec { return (amplitude * std::exp(imaginary * (omega * time - k * x[0]))).real(); };
+        double previous = 1;
+        for (int degree : {1, 2, 3, 4}) {
+            Json const config = {{"degree", degree}, {"mass", "weight_adjusted"}, {"materials", {{"2", material}}}, {"default_boundary", "prescribed"}};
+            Model model(config, mesh);
+            const double error = Evolution(model, exact, .04);
+            std::cout << "viscoelastic " << (shear ? "S" : "P") << " degree " << degree << " error " << error << std::endl;
+            Check(error < previous * .8, "Viscoelastic plane-wave convergence");
+            previous = error;
+            report[shear ? "viscoelastic_s_wave" : "viscoelastic_p_wave"].push_back(error);
+        }
+        Check(previous < .002, "Viscoelastic plane-wave accuracy");
+    }
+    for (const auto *mass : {"full", "weight_adjusted"}) {
+        Json varying = material;
+        const auto elastic = EvaluateMaterial(Solid(), V3::Zero());
+        Mat stiffness = elastic.Stiffness;
+        stiffness(0, 0) *= 1.2;
+        stiffness(0, 5) = stiffness(5, 0) = .1;
+        varying["stiffness"] = Rows(stiffness);
+        varying["density"] = {{"value", 1.}, {"gradient", {.1, .02, 0.}}};
+        varying["relaxation"].push_back({{"stress_time", .08}, {"strain_time", .088}});
+        varying["relaxation"][0]["stress_time"][0] = {{"value", .05}, {"gradient", {.001, 0., 0.}}};
+        const Json config = {{"degree", 1}, {"mass", mass}, {"materials", {{"1", Fluid()}, {"2", varying}, {"3", Solid()}}}, {"default_boundary", "absorbing"}};
+        const auto mixed = Curved(BoxMesh(1, V3::Ones(), [](const V3 &x) { return x[0] < .4 ? 1 : x[0] > .6 ? 3 :
+                                                                                                              2; }));
+        Model model(config, mixed);
+        model.Initial = model.Project([&](const V3 &x, int tag) {
+            const auto material = EvaluateMaterial(config["materials"][std::to_string(tag)], x);
+            Vec q = Vec::Zero(material.Fields());
+            q.head(3) << .1 * x[0], .2 * x[1], -.1 * x[2];
+            if (material.Fluid()) q[3] = .3;
+            else q.segment(3, 3).setConstant(.3);
+            if (tag == 2) q[9] = .02;
+            return q;
+        });
+        const Vec rhs = model.Apply(model.Initial);
+        Check((rhs - model.ApplyMatrixFree(model.Initial)).norm() < 1e-11 * rhs.norm(), "Viscoelastic matrix-free equivalence");
+        const auto d = model.Diagnostics(model.Initial, 0);
+        Check(d[5] > 0 && d[4] >= -1e-12, "Separate material and interface dissipation");
+        Check(std::abs(model.Power(model.Initial, rhs) - (d[2] + d[3] - d[4] - d[5])) < 1e-11, "Viscoelastic energy balance");
+        CheckCfl(model, report["viscoelastic_cfl"]);
+        const auto cpu = model.Run(.02, 200, RunOptions{true, 0});
+        Model local(config, mixed, false);
+        local.Initial = model.Initial;
+        const auto gpu = local.Run(.02, 200);
+        const double stateError = std::sqrt(model.Energy(gpu.State - cpu.State) / model.Energy(cpu.State));
+        const double diagnosticError = (gpu.Energy - cpu.Energy).norm() / cpu.Energy.norm();
+        Check(stateError < 1e-8 && diagnosticError < 1e-8, "Viscoelastic Metal agreement");
+        Check(gpu.Energy.col(5).minCoeff() >= 0 && gpu.Energy(gpu.Energy.rows() - 1, 0) < model.Energy(model.Initial), "Viscoelastic decay");
+        report["viscoelastic_backends"][mass] = {{"state_error", stateError}, {"diagnostic_error", diagnosticError}};
+    }
+    Json zero = Solid();
+    zero["relaxation"] = {{{"stress_time", .05}, {"strain_time", .05}}};
+    const Json config = {{"degree", 1}, {"materials", {{"2", Solid()}}}, {"default_boundary", "absorbing"}};
+    Model lossless(config, mesh);
+    auto zeroConfig = config;
+    zeroConfig["materials"]["2"] = zero;
+    Model limit(zeroConfig, mesh);
+    const auto initial = [](const V3 &x, int) { Vec q = Vec::Zero(9); q[0] = x[0]; q[3] = .2; return q; };
+    lossless.Initial = lossless.Project(initial);
+    limit.Initial = limit.Project([&](const V3 &x, int tag) { Vec q = Vec::Zero(15); q.head(9) = initial(x, tag); return q; });
+    const Vec a = lossless.Apply(lossless.Initial), b = limit.Apply(limit.Initial);
+    for (int i = 0; i < int(limit.Elements.size()); ++i) {
+        Check((a.segment(lossless.Elements[i].Offset, 9 * lossless.Nodes) - b.segment(limit.Elements[i].Offset, 9 * limit.Nodes)).norm() < 1e-11, "Lossless relaxation limit");
+        Check(b.segment(limit.Elements[i].Offset + 9 * limit.Nodes, 6 * limit.Nodes).norm() == 0, "Unexcited zero-strength memory");
+    }
+    report["viscoelastic_passed"] = true;
+}
+
 } // namespace
 int main(int argc, char *const *argv) try {
     Json report;
+    if (argc > 1 && std::string(argv[1]) == "--viscoelastic") {
+        ViscoelasticChecks(report);
+        std::cout << report.dump(2) << '\n';
+        return 0;
+    }
     const auto fluid = EvaluateMaterial(Fluid(), V3::Zero()), solid = EvaluateMaterial(Solid(), V3::Zero());
     const V3 n = V3(1, 2, 3).normalized();
     Vec f(4), s(9);
@@ -431,6 +570,7 @@ int main(int argc, char *const *argv) try {
         const auto zero = deviceModel.Run(.002, 1000);
         Check(zero.State.isZero() && zero.Energy.isZero() && zero.Samples.isZero(), "Zero unforced GPU state");
     }
+    ViscoelasticChecks(report);
     report["passed"] = true;
     if (argc > 1) {
         std::ofstream out(argv[1]);

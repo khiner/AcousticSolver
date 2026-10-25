@@ -66,12 +66,12 @@ class Gpu final : public Stepper {
     MTL4::ComputeCommandEncoder *Encoder{};
     Buffer Parameters;
     size_t ParameterOffset{};
-    std::array<uint64_t, 23> BoundAddresses{};
+    std::array<uint64_t, 26> BoundAddresses{};
     uint32_t PendingReads{}, PendingWrites{}, QAccess{StateA}, NextAccess{StateB}, PhysicalAccess{PhysicalA}, NextPhysicalAccess{PhysicalB};
     bool ResidencyDirty{};
     NS::SharedPtr<MTL::Library> Library;
     Pipeline Sample, Diagnostic, Reduce, FinishDiagnostic, FaceFlux, MassStep, MassRhs;
-    GpuMatrix P, B, S, R, InverseOperator, MassTransform;
+    GpuMatrix P, B, S, R, D, Loss, InverseOperator, MassTransform;
     Buffer FaceInfo, FaceInputs, FaceMatrices, ElementInfo, FaceMap, Weak, MassBasis, MassCoefficients, Physical, NextPhysical, FaceValues, Rhs;
     Buffer Q, Next, Residual, Drives, Partial, Reduced, Samples, Energy;
 
@@ -198,7 +198,7 @@ class Gpu final : public Stepper {
         for (int i = 0; i < int(M.Elements.size()); ++i) {
             const int offset = M.Elements[i].Offset;
             const Mat block = blockAt(i);
-            for (int row = 0; row < block.rows(); ++row) {
+            for (int row = 0; row < M.Elements[i].Fields() * M.Nodes; ++row) {
                 starts[offset + row] = columns.size();
                 for (int col = 0; col < block.cols(); col += M.Nodes) {
                     if (block.row(row).segment(col, M.Nodes).isZero(0)) continue;
@@ -228,10 +228,8 @@ class Gpu final : public Stepper {
                 for (int q = 0; q < nq; ++q) {
                     const auto &h = e.QuadratureInverse[q];
                     mass.push_back(Pack(M.Weights[q] * h(0, 0)));
-                    if (e.Fluid) mass.push_back(Pack(M.Weights[q] * h(3, 3)));
-                    else
-                        for (int r = 3; r < 9; ++r)
-                            for (int c = 3; c < 9; ++c) mass.push_back(Pack(M.Weights[q] * h(r, c)));
+                    for (int r = 3; r < e.Fields(); ++r)
+                        for (int c = 3; c < e.Fields(); ++c) mass.push_back(Pack(M.Weights[q] * h(r, c)));
                 }
         }
         std::vector<FaceData> faces;
@@ -241,7 +239,7 @@ class Gpu final : public Stepper {
             const uint32_t offset = inputs.size(), leftRows = M.Elements[f.Left].Fields() * f.TraceNodes[0].size();
             const uint32_t rows = f.Load.rows();
             // Same-type interfaces use one flux with opposite signs on the two elements.
-            const uint32_t outputs = f.Right >= 0 && M.Elements[f.Left].Fluid == M.Elements[f.Right].Fluid ? leftRows : rows;
+            const uint32_t outputs = f.Right >= 0 && M.Elements[f.Left].Fields() == M.Elements[f.Right].Fields() ? leftRows : rows;
             faces.push_back({offset, uint32_t(values.size()), rows, outputs});
             for (int col = 0; col < rows; ++col)
                 for (int row = 0; row < outputs; ++row) values.push_back(Pack(f.Load(row, col)));
@@ -265,6 +263,7 @@ class Gpu final : public Stepper {
         FaceInputs = Upload(inputs);
         FaceMatrices = Upload(values);
         InverseOperator = UploadBlocks([&](int i) { return Inverse[i]; });
+        if (M.Viscoelastic) Loss = UploadBlocks([&](int i) { return M.Elements[i].Dissipation; });
         MassTransform = UploadBlocks([&](int i) { return M.WeightAdjusted ? u[i] : Mat(Inverse[i].transpose()); });
         ElementInfo = Upload(elements);
         FaceMap = Upload(faceMap);
@@ -300,6 +299,7 @@ class Gpu final : public Stepper {
         Bind(InverseOperator, 18);
         Bind(Physical, 21);
         Bind(NextPhysical, 22);
+        if (M.Viscoelastic) Bind(Loss, 23);
         const uint32_t reads = PhysicalAccess | FluxValues | (update ? QAccess | (p.Stage ? RkResidual : 0) : 0);
         Dispatch(update ? MassStep : MassRhs, MTL::Size(M.Elements.size(), 1, 1), MTL::Size(128, 1, 1), reads, RhsValues | (update ? NextAccess | NextPhysicalAccess | RkResidual : 0));
     }
@@ -313,6 +313,7 @@ class Gpu final : public Stepper {
         Bind(Drives, 13);
         Bind(Partial, 14);
         Params(RecordParams{uint32_t(M.Size), drive}, 15);
+        if (M.Viscoelastic) Bind(D, 16);
         Dispatch(Diagnostic, M.Size, QAccess | RhsValues, DiagnosticRows);
     }
 
@@ -330,7 +331,7 @@ public:
         Allocator = NS::TransferPtr(Device->newCommandAllocator());
         Command = NS::TransferPtr(Device->newCommandBuffer());
         auto const argumentDescriptor = NS::TransferPtr(MTL4::ArgumentTableDescriptor::alloc()->init());
-        argumentDescriptor->setMaxBufferBindCount(23);
+        argumentDescriptor->setMaxBufferBindCount(26);
         argumentDescriptor->setInitializeBindings(true);
         Arguments = NS::TransferPtr(Device->newArgumentTable(argumentDescriptor.get(), &setupError));
         auto const residencyDescriptor = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
@@ -342,12 +343,13 @@ public:
         std::ifstream const file(ACOUSTIC_ELASTIC_MSL_DIR "/Elastic.metal");
         if (!file) throw std::runtime_error("Cannot read Elastic.metal");
         // Leave half the threadgroup memory available for shader-validation instrumentation.
-        int massTile = 128;
-        const auto scratchBytes = [&] { return (18 * M.Nodes + 9 * (massTile + 1)) * sizeof(Pair) + 4; };
+        int massTile = 128, maxFields = 9;
+        for (const auto &e : M.Elements) maxFields = std::max(maxFields, e.Fields());
+        const auto scratchBytes = [&] { return (2 * maxFields * M.Nodes + maxFields * (massTile + 1)) * sizeof(Pair) + 4; };
         while (massTile > 1 && scratchBytes() > Device->maxThreadgroupMemoryLength() / 2) massTile /= 2;
         if (scratchBytes() > Device->maxThreadgroupMemoryLength() / 2) throw std::runtime_error("Insufficient threadgroup memory for elastic quadrature");
         std::stringstream source;
-        source << "#define MASS_TILE " << massTile << "\n"
+        source << "#define MAX_FIELDS " << maxFields << "\n#define DIAGNOSTICS " << M.DiagnosticCount() << "\n#define VISCOELASTIC " << M.Viscoelastic << "\n#define MASS_TILE " << massTile << "\n"
                << "#define NODES " << M.Nodes << "\n#define FACE_NODES " << (M.Degree + 1) * (M.Degree + 2) / 2 << "\n#define VOL_Q " << M.MassInterpolation.rows() << "\n#define WEIGHT_ADJUSTED " << M.WeightAdjusted << "\n"
                << file.rdbuf();
         auto const options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
@@ -396,13 +398,17 @@ public:
             const int n = M.Nodes * e.Fields();
             return e.EnergyMass == e.PhysicalMass ? Mat(Mat::Identity(n, n)) : Mat(Inverse[i].transpose() * e.PhysicalMass * Inverse[i]);
         });
+        if (M.Viscoelastic) D = UploadBlocks([&](int i) -> Mat {
+                                const auto &e = M.Elements[i];
+                                return e.Dissipation.size() ? Mat(Inverse[i].transpose() * e.Dissipation * Inverse[i]) : Mat{};
+                            });
         S = Upload(MakeSparse(M.Size, M.Sources.size(), sources), 1);
         R = Upload(MakeSparse(M.Receivers.size(), M.Size, receivers), M.Nodes);
         Q = Upload(initial);
         Next = Allocate(Q->length());
         Residual = Allocate(Q->length());
-        Partial = Allocate(M.Size * 5 * sizeof(Pair));
-        Reduced = Allocate(((M.Size + 1023) / 1024) * 5 * sizeof(Pair));
+        Partial = Allocate(M.Size * M.DiagnosticCount() * sizeof(Pair));
+        Reduced = Allocate(((M.Size + 1023) / 1024) * M.DiagnosticCount() * sizeof(Pair));
         Samples = Allocate(trace.Samples.size() * sizeof(Pair));
         Energy = Allocate(trace.Energy.size() * sizeof(Pair));
     }
@@ -437,7 +443,7 @@ public:
             Bind(Reduced, 0);
             Bind(Energy, 1);
             Params(RecordParams{groups, uint32_t(outputFrame)}, 2);
-            Dispatch(FinishDiagnostic, MTL::Size(5, 1, 1), MTL::Size(32, 1, 1), DiagnosticGroups, EnergyOutput);
+            Dispatch(FinishDiagnostic, MTL::Size(M.DiagnosticCount(), 1, 1), MTL::Size(32, 1, 1), DiagnosticGroups, EnergyOutput);
         };
         int encoded = 0;
         for (int f = 0; f < frames; ++f) {
@@ -487,7 +493,7 @@ public:
         }
         for (int f = 0; f < trace.Samples.rows(); ++f) {
             for (int ch = 0; ch < trace.Samples.cols(); ++ch) trace.Samples(f, ch) = Scale * Unpack(samples[f * trace.Samples.cols() + ch]);
-            for (int col = 0; col < 5; ++col) trace.Energy(f, col) = Scale * Scale * Unpack(energy[f * 5 + col]);
+            for (int col = 0; col < M.DiagnosticCount(); ++col) trace.Energy(f, col) = Scale * Scale * Unpack(energy[f * M.DiagnosticCount() + col]);
         }
     }
 };

@@ -189,6 +189,9 @@ The license is retained in `external/openwind/LICENSE` and this project's `LICEN
 
 `src/Elastic/` implements the propagation equations in
 [Guo, Acosta and Chan, JCP 418 (2020)](https://doi.org/10.1016/j.jcp.2020.109632).
+Solid relaxation follows the constitutive equations of
+[Shukla, Chan and de Hoop (2021)](https://doi.org/10.1016/j.camwa.2021.08.003),
+expressed in equivalent scaled Maxwell-branch coordinates.
 The native solver does not link to these reference programs:
 
 - [KGuo26/WADG_Matlab](https://github.com/KGuo26/WADG_Matlab),
@@ -201,6 +204,9 @@ The native solver does not link to these reference programs:
   harness evaluates its Scholte/Snell analytical fields and runs its independent
   ADER-DG solver. Copyright (c) 2012–2026 SeisSol Group and (c) 2023 Intel Corporation.
   The complete notice and license are retained in `external/seissol/LICENSE`.
+  `ElasticTest` also compiles its unchanged viscoelastic attenuation-fit header
+  against a minimal material interface to compare complex moduli independently;
+  this check does not execute SeisSol's wave propagator.
 - [e3Dss](https://github.com/Zetison/e3Dss), `external/e3dss`, revision
   `a12c01cc80dfdb1d9f1e9bc5822bbd4e9afd83fe`, GPL-3.0, retained in
   `external/e3dss/LICENSE`. It provides the independent elastic-sphere scattering

@@ -13,20 +13,23 @@ using Json = nlohmann::json;
 struct Material {
     double Density{}, Bulk{}, Speed{}, Impedance{};
     Mat Stiffness;
+    Mat RelaxationCoupling;
+    Vec RelaxationRates;
     bool Fluid() const { return Stiffness.size() == 0; }
-    int Fields() const { return Fluid() ? 4 : 9; }
+    int Fields() const { return Fluid() ? 4 : 9 + RelaxationRates.size(); }
 };
 Material EvaluateMaterial(const Json &, const V3 &);
 Mat NormalMatrix(const V3 &);
 Vec Flux(const Vec &, const Vec &, const Material &, const Material &, const V3 &, double penalty);
 struct Element {
-    int Offset{}, Tag{};
-    bool Fluid{};
+    int Offset{}, Tag{}, FieldCount{};
     Mat Geometry;
     Mat InverseMass, EnergyMass, PhysicalMass, Points;
+    Mat Dissipation;
     std::array<Mat, 3> Weak;
     std::vector<Mat> QuadratureInverse;
-    int Fields() const { return Fluid ? 4 : 9; }
+    int Fields() const { return FieldCount; }
+    bool Fluid() const { return Fields() == 4; }
 };
 struct Face {
     int Left{}, Right{-1};
@@ -63,7 +66,8 @@ class Model {
 public:
     Model(const Json &config, const Json &mesh, bool assembleReference = true);
     int Degree{}, Nodes{}, Size{};
-    bool WeightAdjusted{};
+    bool WeightAdjusted{}, Viscoelastic{};
+    int DiagnosticCount() const { return Viscoelastic ? 6 : 5; }
     Mat MassInterpolation;
     Vec Weights;
     double DtLimit{}, Penalty{}, CflRealBound{}, CflImaginaryBound{};
@@ -77,7 +81,7 @@ public:
     Eigen::SparseMatrix<double, Eigen::RowMajor> System, BoundaryPower;
     Vec Rhs(const Vec &, double time = 0) const;
     void AddForcing(Vec &, double time) const;
-    Eigen::Matrix<double, 5, 1> Diagnostics(const Vec &, double time) const;
+    Eigen::Matrix<double, 6, 1> Diagnostics(const Vec &, double time) const;
     Vec Apply(const Vec &) const;
     Vec ApplyMatrixFree(const Vec &) const;
     double Energy(const Vec &, bool physical = false) const;

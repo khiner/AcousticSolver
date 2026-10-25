@@ -35,7 +35,7 @@ public:
                 const auto &r = M.Receivers[ch];
                 T.Samples(f, ch) = r.Sign * r.Weights.dot(Q.segment(M.Elements[r.ElementIndex].Offset + r.Field * M.Nodes, M.Nodes));
             }
-            T.Energy.row(f) = M.Diagnostics(Q, (f + 1) / rate).transpose();
+            T.Energy.row(f) = M.Diagnostics(Q, (f + 1) / rate).head(M.DiagnosticCount()).transpose();
         }
     }
     void Finish(Trace &trace) override { trace.State = Q; }
@@ -44,14 +44,14 @@ public:
 Trace Model::Run(double seconds, double sampleRate, const RunOptions &options) const {
     if (!std::isfinite(seconds) || seconds <= 0 || !std::isfinite(sampleRate) || sampleRate < 1 || !std::isfinite(options.Dt) || options.Dt < 0) throw std::invalid_argument("Invalid render duration, rate or timestep");
     const double frames = std::floor(seconds * sampleRate);
-    if (frames < 1 || frames * (Receivers.size() + 5) >= 32000000) throw std::invalid_argument("Output storage exceeds limit");
+    if (frames < 1 || frames * (Receivers.size() + DiagnosticCount()) >= 32000000) throw std::invalid_argument("Output storage exceeds limit");
     const double target = options.Dt > 0 ? options.Dt : DtLimit;
     const double count = std::max(1., std::ceil(1 / (sampleRate * target)));
     if (count > 1000000) throw std::invalid_argument("Too many substeps");
     const int substeps = int(count);
     Trace trace;
     trace.Samples.resize(int(frames), Receivers.size());
-    trace.Energy.resize(int(frames), 5);
+    trace.Energy.resize(int(frames), DiagnosticCount());
     trace.Dt = 1 / (sampleRate * substeps);
     trace.Steps = uint64_t(frames) * substeps;
     const auto start = std::chrono::steady_clock::now();

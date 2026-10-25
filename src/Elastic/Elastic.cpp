@@ -47,12 +47,20 @@ Mat Constitutive(const Material &m) {
     Mat h = Mat::Zero(m.Fields(), m.Fields());
     h.topLeftCorner(3, 3).diagonal().setConstant(m.Density);
     if (m.Fluid()) h(3, 3) = 1 / m.Bulk;
-    else h.bottomRightCorner(6, 6) = Inverse(m.Stiffness);
+    else if (!m.RelaxationRates.size()) h.bottomRightCorner(6, 6) = Inverse(m.Stiffness);
+    else {
+        // Scaled Maxwell branch stresses: H^-1 couples total stress to local memory variables.
+        Mat inverse = Mat::Identity(6 + m.RelaxationRates.size(), 6 + m.RelaxationRates.size());
+        inverse.topLeftCorner(6, 6) = m.Stiffness;
+        inverse.topRightCorner(6, m.RelaxationRates.size()) = m.RelaxationCoupling;
+        inverse.bottomLeftCorner(m.RelaxationRates.size(), 6) = m.RelaxationCoupling.transpose();
+        h.bottomRightCorner(inverse.rows(), inverse.cols()) = Inverse(inverse);
+    }
     return h;
 }
-Mat Operator(bool fluid, const V3 &n) {
-    Mat a = Mat::Zero(fluid ? 4 : 9, fluid ? 4 : 9);
-    if (fluid) {
+Mat Operator(int fields, const V3 &n) {
+    Mat a = Mat::Zero(fields, fields);
+    if (fields == 4) {
         a.block<3, 1>(0, 3) = n;
         a.block<1, 3>(3, 0) = n.transpose();
     } else {
@@ -91,9 +99,9 @@ Vec BoundaryFlux(const Vec &q, const Material &m, const V3 &n, const std::string
             Eigen::SelfAdjointEigenSolver<Mat> const eigen(m.Density * b.transpose() * m.Stiffness * b);
             Require(eigen.info() == Eigen::Success && eigen.eigenvalues().minCoeff() > 0, "Invalid characteristic impedance");
             const Mat z = eigen.eigenvectors() * eigen.eigenvalues().cwiseSqrt().asDiagonal() * eigen.eigenvectors().transpose();
-            const Vec velocity = .5 * (q.head(3) - z.ldlt().solve(b.transpose() * q.tail(6)));
+            const Vec velocity = .5 * (q.head(3) - z.ldlt().solve(b.transpose() * q.segment(3, 6)));
             flux.head(3) = -z * velocity;
-            flux.tail(6) = b * velocity;
+            flux.segment(3, 6) = b * velocity;
         }
         return flux;
     }
@@ -110,7 +118,7 @@ Vec BoundaryFlux(const Vec &q, const Material &m, const V3 &n, const std::string
         else {
             Require(boundary == "free", "Unknown solid boundary: " + boundary);
             const Mat b = NormalMatrix(n);
-            ghost.tail(6) -= 2 * b * (b.transpose() * b).ldlt().solve(b.transpose() * q.tail(6));
+            ghost.segment(3, 6) -= 2 * b * (b.transpose() * b).ldlt().solve(b.transpose() * q.segment(3, 6));
         }
     }
     return Flux(q, ghost, m, m, n, penalty);
@@ -138,6 +146,7 @@ Material EvaluateMaterial(const Json &j, const V3 &x) {
     m.Density = Field(j.at("density"), x);
     Require(std::isfinite(m.Density) && m.Density > 0, "Density must be finite and positive");
     if (j.at("type") == "fluid") {
+        Require(!j.contains("relaxation"), "Solid relaxation is not a fluid absorption model");
         if (j.contains("bulk_modulus")) m.Bulk = Field(j.at("bulk_modulus"), x);
         else {
             const double speed = Field(j.at("sound_speed"), x);
@@ -167,6 +176,41 @@ Material EvaluateMaterial(const Json &j, const V3 &x) {
         Eigen::SelfAdjointEigenSolver<Mat> const eigen(m.Stiffness);
         Require(eigen.info() == Eigen::Success && eigen.eigenvalues().minCoeff() > 0, "Stiffness must be positive definite");
         m.Speed = std::sqrt(2 * eigen.eigenvalues().maxCoeff() / m.Density);
+        if (j.contains("relaxation")) {
+            const auto &mechanisms = j.at("relaxation");
+            Require(mechanisms.is_array(), "relaxation must be an array of stress/strain time pairs");
+            m.RelaxationCoupling = Mat::Zero(6, 6 * mechanisms.size());
+            m.RelaxationRates.resize(6 * mechanisms.size());
+            const double g = m.Stiffness.bottomRightCorner(3, 3).trace() / 3;
+            const double k = m.Stiffness.topLeftCorner(3, 3).trace() / 3 - 4 * g / 3;
+            for (int l = 0; l < int(mechanisms.size()); ++l) {
+                const auto &branch = mechanisms[l];
+                std::array<double, 4> strength, rate;
+                for (int mode = 0; mode < 4; ++mode) {
+                    const auto time = [&](const char *name) {
+                        const auto &value = branch.at(name);
+                        Require(!value.is_array() || value.size() == 4, "Relaxation times need four modes: bulk, yz, xz, xy");
+                        return Field(value.is_array() ? value[mode] : value, x);
+                    };
+                    const double stress = time("stress_time"), strain = time("strain_time");
+                    Require(std::isfinite(stress) && std::isfinite(strain) && stress > 0 && strain >= stress && std::isfinite(1 / stress), "Require finite strain_time >= stress_time > 0");
+                    rate[mode] = 1 / stress;
+                    strength[mode] = 1 - stress / strain;
+                }
+                Require(k >= 0 || strength[0] == 0, "Dilatational relaxation requires nonnegative mean bulk modulus");
+                auto coupling = m.RelaxationCoupling.middleCols(6 * l, 6);
+                coupling.col(0).head(3).setConstant(std::sqrt(std::max(0., k) * strength[0]));
+                // Orthonormal normal-deviatoric directions, followed by the three engineering shears.
+                coupling(0, 1) = std::sqrt(g * strength[1]);
+                coupling(1, 1) = -coupling(0, 1);
+                coupling(0, 2) = coupling(1, 2) = std::sqrt(g * strength[1] / 3);
+                coupling(2, 2) = -2 * coupling(0, 2);
+                for (int mode = 0; mode < 3; ++mode) coupling(3 + mode, 3 + mode) = std::sqrt(m.Stiffness(3 + mode, 3 + mode) * strength[1 + mode]);
+                m.RelaxationRates.segment(6 * l, 6) << rate[0], rate[1], rate[1], rate[1], rate[2], rate[3];
+            }
+            // The equilibrium stiffness must remain positive after all parallel relaxation decrements.
+            Inverse(m.Stiffness - m.RelaxationCoupling * m.RelaxationCoupling.transpose());
+        }
     }
     m.Impedance = m.Density * m.Speed;
     Require(std::isfinite(m.Speed) && std::isfinite(m.Impedance) && m.Impedance > 0, "Material exceeds numerical range");
@@ -188,8 +232,8 @@ Mat NormalMatrix(const V3 &n) {
 Vec Flux(const Vec &left, const Vec &right, const Material &ml, const Material &mr, const V3 &n, double penalty) {
     const V3 vl = left.head<3>(), vr = right.head<3>();
     const Mat b = NormalMatrix(n);
-    const V3 tl = ml.Fluid() ? V3(left[3] * n) : V3(b.transpose() * left.tail(6));
-    const V3 tr = mr.Fluid() ? V3(right[3] * n) : V3(b.transpose() * right.tail(6));
+    const V3 tl = ml.Fluid() ? V3(left[3] * n) : V3(b.transpose() * left.segment(3, 6));
+    const V3 tr = mr.Fluid() ? V3(right[3] * n) : V3(b.transpose() * right.segment(3, 6));
     const double tv = penalty * 2 / (1 / ml.Impedance + 1 / mr.Impedance), ts = penalty * 2 / (ml.Impedance + mr.Impedance);
     Vec result = Vec::Zero(left.size());
     if (ml.Fluid()) {
@@ -197,10 +241,10 @@ Vec Flux(const Vec &left, const Vec &right, const Material &ml, const Material &
         result[3] = .5 * n.dot(vl + vr) + .5 * ts * n.dot(tr - tl);
     } else if (mr.Fluid()) {
         result.head<3>() = (.5 * n.dot(tl + tr) + .5 * tv * n.dot(vr - vl)) * n;
-        result.tail(6) = b * (vl + .5 * n.dot(vr - vl) * n + .5 * ts * (tr - tl));
+        result.segment(3, 6) = b * (vl + .5 * n.dot(vr - vl) * n + .5 * ts * (tr - tl));
     } else {
         result.head<3>() = .5 * (tl + tr) + .5 * tv * b.transpose() * b * (vr - vl);
-        result.tail(6) = b * (.5 * (vl + vr) + .5 * ts * (tr - tl));
+        result.segment(3, 6) = b * (.5 * (vl + vr) + .5 * ts * (tr - tl));
     }
     return result;
 }
@@ -244,10 +288,13 @@ Model::Model(const Json &config, const Json &mesh, bool assembleReference) : Geo
         const auto geometry = Map(e, quadrature.Points);
         e.Points = geometry.X;
         const auto &material = config.at("materials").at(std::to_string(e.Tag));
-        e.Fluid = EvaluateMaterial(material, e.Points.row(0)).Fluid();
+        const auto first = EvaluateMaterial(material, e.Points.row(0));
+        e.FieldCount = first.Fields();
+        Viscoelastic |= first.RelaxationRates.size() > 0;
         e.Offset = Size;
         Size += Nodes * e.Fields();
         std::vector<Mat> h;
+        Mat rates(V.rows(), first.RelaxationRates.size());
         std::array<Mat, 3> derivative{Mat(V.rows(), Nodes), Mat(V.rows(), Nodes), Mat(V.rows(), Nodes)};
         for (int q = 0; q < V.rows(); ++q) {
             const auto m = EvaluateMaterial(material, e.Points.row(q));
@@ -255,6 +302,7 @@ Model::Model(const Json &config, const Json &mesh, bool assembleReference) : Geo
             const double jacobian = geometry.J[q].determinant();
             const Mat value = jacobian * Constitutive(m);
             h.push_back(value);
+            rates.row(q) = jacobian * m.RelaxationRates.transpose();
             if (WeightAdjusted) e.QuadratureInverse.push_back(Inverse(value));
             for (int a = 0; a < 3; ++a) {
                 derivative[a].row(q).setZero();
@@ -262,6 +310,11 @@ Model::Model(const Json &config, const Json &mesh, bool assembleReference) : Geo
             }
         }
         e.PhysicalMass = Mass(V, Weights, h);
+        if (rates.cols()) {
+            e.Dissipation = Mat::Zero(Nodes * e.Fields(), Nodes * e.Fields());
+            for (int r = 0; r < rates.cols(); ++r)
+                e.Dissipation.block((9 + r) * Nodes, (9 + r) * Nodes, Nodes, Nodes) = V.transpose() * Weights.cwiseProduct(rates.col(r)).asDiagonal() * V;
+        }
         e.InverseMass = WeightAdjusted ? ApplyReference(Mass(V, Weights, e.QuadratureInverse), ReferenceInverse, e.Fields()) : Inverse(e.PhysicalMass);
         e.EnergyMass = WeightAdjusted ? Inverse(e.InverseMass) : e.PhysicalMass;
         for (int a = 0; a < 3; ++a) e.Weak[a] = derivative[a].transpose() * Weights.asDiagonal() * V;
@@ -344,7 +397,7 @@ Model::Model(const Json &config, const Json &mesh, bool assembleReference) : Geo
         const auto [index, weights] = Locate(Point(receiver.at("position")), receiver.value("region", 0));
         const auto &e = Elements[index];
         const std::string field = receiver.value("field", std::string("pressure"));
-        const std::vector<std::string> fields = e.Fluid ? std::vector<std::string>{"vx", "vy", "vz", "pressure"} : std::vector<std::string>{"vx", "vy", "vz", "sxx", "syy", "szz", "syz", "sxz", "sxy"};
+        const std::vector<std::string> fields = e.Fluid() ? std::vector<std::string>{"vx", "vy", "vz", "pressure"} : std::vector<std::string>{"vx", "vy", "vz", "sxx", "syy", "szz", "syz", "sxz", "sxy"};
         auto const it = std::find(fields.begin(), fields.end(), field);
         Require(it != fields.end(), "Receiver field incompatible with material");
         Receivers.push_back({index, int(it - fields.begin()), field == "pressure" ? -1. : 1., weights});
@@ -354,7 +407,7 @@ Model::Model(const Json &config, const Json &mesh, bool assembleReference) : Geo
         const auto &e = Elements[index];
         Vec load = Vec::Zero(Nodes * e.Fields());
         if (source.at("type") == "volume_flow") {
-            Require(e.Fluid, "Volume source requires fluid");
+            Require(e.Fluid(), "Volume source requires fluid");
             load.segment(3 * Nodes, Nodes) = -weights;
         } else {
             Require(source.at("type") == "force", "Unknown source type");
@@ -395,11 +448,12 @@ void Model::Assemble(bool assembleReference) {
         const auto &e = Elements[i];
         Mat volume = Mat::Zero(Nodes * e.Fields(), Nodes * e.Fields());
         for (int d = 0; d < 3; ++d) {
-            const Mat a = Operator(e.Fluid, V3::Unit(d));
+            const Mat a = Operator(e.Fields(), V3::Unit(d));
             for (int row = 0; row < e.Fields(); ++row)
                 for (int col = 0; col < e.Fields(); ++col)
                     if (a(row, col) != 0) volume.block(row * Nodes, col * Nodes, Nodes, Nodes) -= a(row, col) * e.Weak[d];
         }
+        if (e.Dissipation.size()) volume -= e.Dissipation;
         blocks[i][i] = std::move(volume);
     }
     for (auto &f : Faces) {
@@ -432,7 +486,7 @@ void Model::Assemble(bool assembleReference) {
             accumulate(blocks[i][i], own, v, vn, start);
             if (j < 0) {
                 for (int q = 0; q < v.rows(); ++q) {
-                    const Mat physical = .5 * f.Weights[q] * Operator(a.Fluid, f.Normals.row(q));
+                    const Mat physical = .5 * f.Weights[q] * Operator(nf, f.Normals.row(q));
                     for (int col = 0; col < nf; ++col) own[col].row(q) -= physical.col(col).transpose();
                 }
                 for (int row = 0; row < nf; ++row)
@@ -494,7 +548,11 @@ Vec Model::ApplyMatrixFree(const Vec &state) const {
     for (const auto &e : Elements) {
         const Eigen::Map<const Mat> q(state.data() + e.Offset, Nodes, e.Fields());
         Mat local = Mat::Zero(Nodes, e.Fields());
-        for (int d = 0; d < 3; ++d) local.noalias() -= e.Weak[d] * q * Operator(e.Fluid, V3::Unit(d)).transpose();
+        for (int d = 0; d < 3; ++d) local.noalias() -= e.Weak[d] * q * Operator(e.Fields(), V3::Unit(d)).transpose();
+        if (e.Dissipation.size()) {
+            Eigen::Map<Vec> flat(local.data(), local.size());
+            flat.noalias() -= e.Dissipation * state.segment(e.Offset, local.size());
+        }
         load.push_back(std::move(local));
     }
     for (const auto &f : Faces) {
@@ -566,23 +624,24 @@ double Model::Power(const Vec &state, const Vec &rhs) const {
     for (const auto &e : Elements) power += state.segment(e.Offset, Nodes * e.Fields()).dot(e.EnergyMass * rhs.segment(e.Offset, Nodes * e.Fields()));
     return power;
 }
-Eigen::Matrix<double, 5, 1> Model::Diagnostics(const Vec &state, double time) const {
+Eigen::Matrix<double, 6, 1> Model::Diagnostics(const Vec &state, double time) const {
     Vec massState(Size);
-    double physical = 0;
+    double physical = 0, dissipation = 0;
     for (const auto &e : Elements) {
         auto const q = state.segment(e.Offset, Nodes * e.Fields());
         massState.segment(e.Offset, q.size()).noalias() = e.EnergyMass * q;
         physical += .5 * q.dot(e.PhysicalMass * q);
+        if (e.Dissipation.size()) dissipation += q.dot(e.Dissipation * q);
     }
     double source = 0;
     for (const auto &s : Sources) source += (s.Amplitude * s.Drive(time)) * massState.segment(Elements[s.ElementIndex].Offset, s.Load.size()).dot(s.Load);
     Vec forcing = Vec::Zero(Size);
     AddForcing(forcing, time);
     const double boundary = state.dot(BoundaryPower * state);
-    return {.5 * state.dot(massState), physical, source, boundary + massState.dot(forcing) - source, boundary - massState.dot(Apply(state))};
+    return {.5 * state.dot(massState), physical, source, boundary + massState.dot(forcing) - source, boundary - massState.dot(Apply(state)) - dissipation, dissipation};
 }
 Eigen::Vector3d Model::Powers(const Vec &state, double time) const {
-    return Diagnostics(state, time).tail<3>();
+    return Diagnostics(state, time).segment<3>(2);
 }
 Vec Model::Project(const std::function<Vec(const V3 &, int)> &field) const {
     Vec state(Size);

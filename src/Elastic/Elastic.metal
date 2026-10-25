@@ -51,44 +51,51 @@ kernel void sample(device const uint *starts [[buffer(0)]], device const uint *c
     float2 value = dotRow(starts, columns, values, q, row, lane);
     if (!lane) out[p.index * p.count + row] = value;
 }
-kernel void diagnostic(device const float2 *operatorRhs [[buffer(0)]], device const uint *ps [[buffer(3)]], device const uint *pc [[buffer(4)]], device const float2 *pv [[buffer(5)]], device const uint *bs [[buffer(6)]], device const uint *bc [[buffer(7)]], device const float2 *bv [[buffer(8)]], device const uint *ss [[buffer(9)]], device const uint *sc [[buffer(10)]], device const float2 *sv [[buffer(11)]], device const float2 *q [[buffer(12)]], device const float2 *drive [[buffer(13)]], device float2 *partial [[buffer(14)]], constant RecordParams &p [[buffer(15)]], uint id [[thread_position_in_grid]]) {
+kernel void diagnostic(device const float2 *operatorRhs [[buffer(0)]], device const uint *ps [[buffer(3)]], device const uint *pc [[buffer(4)]], device const float2 *pv [[buffer(5)]], device const uint *bs [[buffer(6)]], device const uint *bc [[buffer(7)]], device const float2 *bv [[buffer(8)]], device const uint *ss [[buffer(9)]], device const uint *sc [[buffer(10)]], device const float2 *sv [[buffer(11)]], device const float2 *q [[buffer(12)]], device const float2 *drive [[buffer(13)]], device float2 *partial [[buffer(14)]], constant RecordParams &p [[buffer(15)]], device const uint *ds [[buffer(16)]], device const uint *dc [[buffer(17)]], device const float2 *dv [[buffer(18)]], uint id [[thread_position_in_grid]]) {
     uint row = id / 32, lane = id % 32;
     if (row >= p.count) return;
     float2 aq = operatorRhs[row], pq = dotRow(ps, pc, pv, q, row, lane);
     float2 bq = dotRow(bs, bc, bv, q, row, lane);
+#if VISCOELASTIC
+    float2 dq = dotRow(ds, dc, dv, q, row, lane);
+#endif
     if (!lane) {
         float2 sq = sourceRow(ss, sc, sv, drive + p.index, row);
         const float2 x = q[row];
-        partial[row * 5] = mul(float2(.5f, 0), mul(x, x));
-        partial[row * 5 + 1] = mul(float2(.5f, 0), mul(x, pq));
-        partial[row * 5 + 2] = mul(x, sq);
-        partial[row * 5 + 3] = mul(x, bq);
-        partial[row * 5 + 4] = mul(x, add(bq, -aq));
+        partial[row * DIAGNOSTICS] = mul(float2(.5f, 0), mul(x, x));
+        partial[row * DIAGNOSTICS + 1] = mul(float2(.5f, 0), mul(x, pq));
+        partial[row * DIAGNOSTICS + 2] = mul(x, sq);
+        partial[row * DIAGNOSTICS + 3] = mul(x, bq);
+        partial[row * DIAGNOSTICS + 4] = mul(x, add(bq, -aq));
+#if VISCOELASTIC
+        partial[row * DIAGNOSTICS + 5] = mul(x, dq);
+        partial[row * DIAGNOSTICS + 4] = add(partial[row * DIAGNOSTICS + 4], -partial[row * DIAGNOSTICS + 5]);
+#endif
     }
 }
 kernel void reduceDiagnostic(device const float2 *partial [[buffer(0)]], device float2 *out [[buffer(1)]], constant RecordParams &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
     threadgroup float2 sums[8];
     uint lane = tid % 32;
-    for (uint col = 0; col < 5; ++col) {
+    for (uint col = 0; col < DIAGNOSTICS; ++col) {
         float2 sum = 0;
-        for (uint row = group * 1024 + tid; row < min((group + 1) * 1024, p.count); row += 256) sum = add(sum, partial[row * 5 + col]);
+        for (uint row = group * 1024 + tid; row < min((group + 1) * 1024, p.count); row += 256) sum = add(sum, partial[row * DIAGNOSTICS + col]);
         sum = sumLanes(sum, lane);
         if (!lane) sums[tid / 32] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid < 32) {
             sum = sumLanes(tid < 8 ? sums[tid] : float2(0), lane);
-            if (!tid) out[group * 5 + col] = sum;
+            if (!tid) out[group * DIAGNOSTICS + col] = sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 kernel void finishDiagnostic(device const float2 *partial [[buffer(0)]], device float2 *out [[buffer(1)]], constant RecordParams &p [[buffer(2)]], uint id [[thread_position_in_grid]]) {
     uint lane = id % 32, col = id / 32;
-    if (col >= 5) return;
+    if (col >= DIAGNOSTICS) return;
     float2 sum = 0;
-    for (uint row = lane; row < p.count; row += 32) sum = add(sum, partial[row * 5 + col]);
+    for (uint row = lane; row < p.count; row += 32) sum = add(sum, partial[row * DIAGNOSTICS + col]);
     sum = sumLanes(sum, lane);
-    if (!lane) out[p.index * 5 + col] = sum;
+    if (!lane) out[p.index * DIAGNOSTICS + col] = sum;
 }
 
 struct ElementData {
@@ -99,7 +106,7 @@ struct FaceData {
     uint inputs, values, rows, outputs;
 };
 kernel void faceFlux(device const FaceData *faces [[buffer(0)]], device const uint *inputs [[buffer(1)]], device const float2 *values [[buffer(2)]], device const float2 *physical [[buffer(3)]], device float2 *flux [[buffer(4)]], uint fi [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float2 q[18 * FACE_NODES];
+    threadgroup float2 q[2 * MAX_FIELDS * FACE_NODES];
     FaceData f = faces[fi];
     for (uint col = tid; col < f.rows; col += 128) q[col] = physical[inputs[f.inputs + col]];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -111,8 +118,8 @@ kernel void faceFlux(device const FaceData *faces [[buffer(0)]], device const ui
     }
 }
 constant bool Update [[function_constant(0)]];
-kernel void massStep(device const ElementData *elements [[buffer(0)]], device const float2 *basis [[buffer(1)]], device const float2 *coefficients [[buffer(2)]], device const float2 *weak [[buffer(3)]], device const uint *starts [[buffer(4)]], device const uint *columns [[buffer(5)]], device const float2 *values [[buffer(6)]], device const float2 *q [[buffer(7)]], device float2 *next [[buffer(8)]], device float2 *residual [[buffer(9)]], device const uint *ss [[buffer(10)]], device const uint *sc [[buffer(11)]], device const float2 *sv [[buffer(12)]], device const float2 *drive [[buffer(13)]], constant StepParams &p [[buffer(14)]], device float2 *rhs [[buffer(15)]], device const uint *faceMap [[buffer(16)]], device const float2 *flux [[buffer(17)]], device const uint *is [[buffer(18)]], device const uint *ic [[buffer(19)]], device const float2 *iv [[buffer(20)]], device const float2 *physical [[buffer(21)]], device float2 *nextPhysical [[buffer(22)]], uint tid [[thread_index_in_threadgroup]], uint ei [[threadgroup_position_in_grid]]) {
-    threadgroup float2 input[9 * NODES], local[9 * NODES], quad[9 * (MASS_TILE + 1)];
+kernel void massStep(device const ElementData *elements [[buffer(0)]], device const float2 *basis [[buffer(1)]], device const float2 *coefficients [[buffer(2)]], device const float2 *weak [[buffer(3)]], device const uint *starts [[buffer(4)]], device const uint *columns [[buffer(5)]], device const float2 *values [[buffer(6)]], device const float2 *q [[buffer(7)]], device float2 *next [[buffer(8)]], device float2 *residual [[buffer(9)]], device const uint *ss [[buffer(10)]], device const uint *sc [[buffer(11)]], device const float2 *sv [[buffer(12)]], device const float2 *drive [[buffer(13)]], constant StepParams &p [[buffer(14)]], device float2 *rhs [[buffer(15)]], device const uint *faceMap [[buffer(16)]], device const float2 *flux [[buffer(17)]], device const uint *is [[buffer(18)]], device const uint *ic [[buffer(19)]], device const float2 *iv [[buffer(20)]], device const float2 *physical [[buffer(21)]], device float2 *nextPhysical [[buffer(22)]], device const uint *ls [[buffer(23)]], device const uint *lc [[buffer(24)]], device const float2 *lv [[buffer(25)]], uint tid [[thread_index_in_threadgroup]], uint ei [[threadgroup_position_in_grid]]) {
+    threadgroup float2 input[MAX_FIELDS * NODES], local[MAX_FIELDS * NODES], quad[MAX_FIELDS * (MASS_TILE + 1)];
     ElementData e = elements[ei];
     for (uint row = tid; row < e.fields * NODES; row += 128) input[row] = physical[e.offset + row];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -126,7 +133,7 @@ kernel void massStep(device const ElementData *elements [[buffer(0)]], device co
                     for (uint d = 0; d < 3; ++d) sum = madd(sum, -weak[((ei * 3 + d) * NODES + node) * NODES + j], input[stressIndex(field, d) * NODES + j]);
             } else if (e.fields == 4) {
                 for (uint d = 0; d < 3; ++d) sum = madd(sum, -weak[((ei * 3 + d) * NODES + node) * NODES + j], input[d * NODES + j]);
-            } else {
+            } else if (field < 9) {
                 const uint2 axes[6] = {uint2(0, 0), uint2(1, 1), uint2(2, 2), uint2(1, 2), uint2(0, 2), uint2(0, 1)};
                 uint2 a = axes[field - 3];
                 sum = madd(sum, -weak[((ei * 3 + a.x) * NODES + node) * NODES + j], input[a.y * NODES + j]);
@@ -137,6 +144,10 @@ kernel void massStep(device const ElementData *elements [[buffer(0)]], device co
             uint faceRow = faceMap[4 * (e.offset + row) + side];
             if (faceRow != UINT_MAX) sum = add(sum, flux[faceRow]);
         }
+#if VISCOELASTIC
+        uint global = e.offset + row;
+        for (uint j = ls[global] * NODES; j < ls[global + 1] * NODES; ++j) sum = madd(sum, -lv[j], input[lc[j / NODES] - e.offset + j % NODES]);
+#endif
         local[row] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -149,20 +160,19 @@ kernel void massStep(device const ElementData *elements [[buffer(0)]], device co
     for (uint chunk = 0; chunk < VOL_Q; chunk += MASS_TILE) {
         uint qp = chunk + tid;
         if (tid < MASS_TILE && qp < VOL_Q) {
-            float2 point[9];
+            float2 point[MAX_FIELDS];
             for (uint field = 0; field < e.fields; ++field) {
                 point[field] = 0;
                 for (uint j = 0; j < NODES; ++j) point[field] = madd(point[field], basis[qp * NODES + j], input[field * NODES + j]);
             }
-            uint base = e.mass + qp * (e.fields == 4 ? 2 : 37);
+            uint constitutiveFields = e.fields - 3;
+            uint base = e.mass + qp * (1 + constitutiveFields * constitutiveFields);
             for (uint field = 0; field < 3; ++field) quad[field * (MASS_TILE + 1) + tid] = mul(coefficients[base], point[field]);
-            if (e.fields == 4) quad[3 * (MASS_TILE + 1) + tid] = mul(coefficients[base + 1], point[3]);
-            else
-                for (uint field = 0; field < 6; ++field) {
-                    float2 value = 0;
-                    for (uint j = 0; j < 6; ++j) value = madd(value, coefficients[base + 1 + field * 6 + j], point[3 + j]);
-                    quad[(3 + field) * (MASS_TILE + 1) + tid] = value;
-                }
+            for (uint field = 0; field < constitutiveFields; ++field) {
+                float2 value = 0;
+                for (uint j = 0; j < constitutiveFields; ++j) value = madd(value, coefficients[base + 1 + field * constitutiveFields + j], point[3 + j]);
+                quad[(3 + field) * (MASS_TILE + 1) + tid] = value;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint row = tid; row < e.fields * NODES; row += 128) {

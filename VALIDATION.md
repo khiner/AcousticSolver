@@ -272,7 +272,15 @@ correction. e3Dss supplies an independent harmonic sphere solution; SeisSol supp
 matched Scholte/Snell trajectories. Both native and SeisSol results are also scored
 against analytic fields. Reports and hashes live under `build/elastic-reference/`.
 
-The local absorbing boundary reflects oblique waves, physical attenuation is absent,
+`build/ElasticTest --viscoelastic` checks the Zener complex modulus against the
+pinned SeisSol attenuation fit, analytical stress relaxation, P/S plane-wave
+convergence, the lossless limit, and CPU/Metal agreement for curved, heterogeneous,
+anisotropic mixed fluid/solid meshes. It checks full and weight-adjusted mass,
+multiple mechanisms, energy balance with separate material dissipation, and the
+augmented operator CFL spectrum. These checks are also part of `ElasticTest`.
+The full geological benchmark suite from Shukla et al. has not been reproduced.
+
+The local absorbing boundary reflects oblique waves,
 and demo meshes have no guaranteed frequency bandwidth. These checks do not qualify
 measured specimens or provide the paper's photoacoustic inversion workflow.
 

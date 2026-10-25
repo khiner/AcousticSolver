@@ -40,6 +40,7 @@ int main(int argc, char *const *argv) try {
     const double rate = config.value("sample_rate", 48000.), duration = config.value("seconds", 1.);
     if (!std::isfinite(rate) || rate < 1 || rate > 384000 || std::floor(rate) != rate) throw std::invalid_argument("Sample rate must be an integer in 1..384000 Hz");
     elastic::Json report = {{"config", config}, {"paper", "https://doi.org/10.1016/j.jcp.2020.109632"}, {"backend", cpu ? "CPU FP64" : "Metal 4 paired float"}, {"elements", model.Elements.size()}, {"unknowns", model.Size}, {"assembled_reference_nonzeros", model.System.nonZeros()}, {"operator", cpu ? "assembled reference" : "element-local"}, {"cfl_dt", model.DtLimit}, {"cfl_real_bound", model.CflRealBound}, {"cfl_imaginary_bound", model.CflImaginaryBound}, {"prepare_seconds", preparation}};
+    if (model.Viscoelastic) report["viscoelastic_paper"] = "https://doi.org/10.1016/j.camwa.2021.08.003";
     if (prepare) {
         std::cout << report.dump(2) << '\n';
         return 0;
@@ -63,6 +64,7 @@ int main(int argc, char *const *argv) try {
         if (!wav.save(prefix + ".wav")) throw std::runtime_error("Cannot write WAV");
     }
     report.update({{"audio_seconds", samples.rows() / rate}, {"render_seconds", trace.Seconds}, {"gpu_seconds", trace.GpuSeconds}, {"dt", trace.Dt}, {"backend_setup_seconds", trace.SetupSeconds}, {"steps", trace.Steps}, {"wav_gain", gain}, {"sample_count", samples.rows()}, {"first_sample_seconds", 1 / rate}, {"energy_columns", {"discrete_energy_J", "physical_energy_J", "source_power_W", "boundary_power_W", "interface_dissipation_W"}}});
+    if (model.Viscoelastic) report["energy_columns"].push_back("material_dissipation_W");
     if (!(std::ofstream(prefix + ".json") << report.dump(2) << '\n')) throw std::runtime_error("Cannot write report");
     std::cout << report.dump(2) << '\n';
     return 0;

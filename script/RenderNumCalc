@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Render an offline NumCalc frequency response with mono WAV or pulse excitation."""
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import numpy as np
+from scipy.signal import fftconvolve, resample_poly
+import soundfile as sf
+from numcalc.common import ROOT, digest, run, unpack
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('scene', type=Path)
+    parser.add_argument('--output', type=Path, default=ROOT/'build/numcalc-audio')
+    parser.add_argument('--input', type=Path)
+    parser.add_argument('--backend', choices=['cpu', 'metal'], default='cpu')
+    parser.add_argument('--sample-rate', type=int, default=8000)
+    parser.add_argument('--fft-size', type=int, default=512)
+    parser.add_argument('--seconds', type=float, default=2)
+    parser.add_argument('--max-frequency', type=float)
+    parser.add_argument('--tail-tolerance', type=float, default=1e-3)
+    args = parser.parse_args()
+    if args.sample_rate < 100 or args.fft_size < 32 or args.fft_size % 2 or not np.isfinite(args.seconds) or args.seconds <= 0 or not 0 < args.tail_tolerance < 1:
+        raise ValueError('Invalid sampling, duration, FFT size, or tail tolerance')
+    scene = json.loads(args.scene.read_text())
+    if not scene.get('receivers'):
+        raise ValueError('Audio rendering needs receivers')
+    vertices = np.asarray(scene['vertices'])
+    edge = max(np.linalg.norm(vertices[a]-vertices[b]) for face in scene['elements'] for a,b in zip(face, face[1:]+face[:1]))
+    nominal_band = scene.get('sound_speed', 343)/(8*edge)
+    maximum = args.max_frequency if args.max_frequency is not None else min(.45*args.sample_rate, nominal_band)
+    if not 0 < maximum < args.sample_rate/2:
+        raise ValueError('Maximum frequency must be below Nyquist')
+    scene.pop('frequencies', None)
+    args.output.mkdir(parents=True, exist_ok=True)
+    version = digest(ROOT/'build/NumCalcSolve') + digest(ROOT/'src/NumCalc/Kernels.metal') + digest(Path(__file__).parent/'numcalc/common.py')
+    frequencies = np.fft.rfftfreq(args.fft_size, 1/args.sample_rate)
+    response = np.zeros((len(frequencies), len(scene['receivers'])), complex)
+    for i, f in enumerate(frequencies):
+        if f == 0 or f >= maximum:
+            continue
+        config = dict(scene, frequency=float(f))
+        key = hashlib.sha256((version + args.backend + json.dumps(config, sort_keys=True)).encode()).hexdigest()
+        folder = args.output/'sweep'/key
+        result = folder/'result.json'
+        report = json.loads(result.read_text()) if result.exists() else run(config, folder, args.backend)
+        response[i] = unpack(report['fields'][0]['receiver_pressure'])
+        if i % 32 == 0:
+            print(f'{i} bins complete ({f:g} Hz)', flush=True)
+    taper = .5 * (1 + np.cos(np.pi * np.clip((frequencies-.9*maximum)/(.1*maximum), 0, 1)))
+    response *= taper[:, None]
+    # A fixed time-origin shift accommodates receivers upstream of a plane wave's phase origin.
+    delay = args.fft_size // 4
+    spectrum = response.conj() * np.exp(-2j*np.pi*frequencies*delay/args.sample_rate)[:, None]
+    spectrum[-1] = spectrum[-1].real
+    impulse = np.fft.irfft(spectrum, n=args.fft_size, axis=0)
+    energy = np.sum(impulse**2, axis=0)
+    guard = args.fft_size // 8
+    tail = (np.sum(impulse[:guard]**2, axis=0) + np.sum(impulse[-guard:]**2, axis=0)) / np.maximum(energy, 1e-300)
+    report = {'backend': args.backend, 'executable_sha256': digest(ROOT/'build/NumCalcSolve'),
+              'sample_rate': args.sample_rate, 'frequency_spacing': args.sample_rate/args.fft_size,
+              'fft_size': args.fft_size, 'max_frequency': maximum, 'delay_samples': delay,
+              'nominal_mesh_band_hz': nominal_band, 'largest_element_edge_m': edge,
+              'guard_energy_fraction': tail.tolist(), 'dc': 'Excluded; acoustic AC response',
+              'time_convention': 'exp(-i omega t); conjugated for inverse FFT',
+              'excitation': 'Input samples multiply all configured sources and prescribed boundary pressure/velocity'}
+    np.savez(args.output/'transfer.npz', frequencies=frequencies, pressure=response, impulse=impulse)
+    (args.output/'report.json').write_text(json.dumps(report, indent=2)+'\n')
+    if np.max(tail) > args.tail_tolerance:
+        raise RuntimeError(f'Impulse guard energy {max(tail):.3g} exceeds {args.tail_tolerance:g}; increase --fft-size and compare convergence')
+    if args.input:
+        excitation, rate = sf.read(args.input)
+        if excitation.ndim != 1 or not np.isfinite(excitation).all():
+            raise ValueError('Input WAV must be finite and mono')
+        if rate != args.sample_rate:
+            common = math.gcd(rate, args.sample_rate)
+            excitation = resample_poly(excitation, args.sample_rate//common, rate//common)
+    else:
+        t = (np.arange(round(args.seconds*args.sample_rate))/args.sample_rate - .05) * 600
+        excitation = (1-2*t*t)*np.exp(-t*t)
+    pressure = np.column_stack([fftconvolve(excitation, impulse[:,i]) for i in range(impulse.shape[1])])
+    if not np.isfinite(pressure).all():
+        raise RuntimeError('Nonfinite rendered pressure')
+    peak = float(np.max(np.abs(pressure)))
+    gain = .95/peak if peak else 1
+    np.save(args.output/'pressure.npy', pressure)
+    sf.write(args.output/'render.wav', pressure*gain, args.sample_rate, subtype='PCM_24')
+    report.update(playback_gain=gain, peak_pressure_pa=peak, output_seconds=len(pressure)/args.sample_rate)
+    (args.output/'report.json').write_text(json.dumps(report, indent=2)+'\n')
+    print((args.output/'render.wav').resolve())
+
+
+if __name__ == '__main__':
+    main()

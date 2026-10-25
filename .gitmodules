@@ -28,3 +28,6 @@
 [submodule "external/hmatrices"]
 	path = external/hmatrices
 	url = https://github.com/IntegralEquations/HMatrices.jl.git
+[submodule "external/mesh2hrtf"]
+	path = external/mesh2hrtf
+	url = https://github.com/Any2HRTF/Mesh2HRTF.git

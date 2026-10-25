@@ -283,6 +283,12 @@ For timing, record hardware, warmup, repeated runs, competing load and excluded
 setup/output work. Runtime Metal shaders come from the source checkout recorded
 at build time: separate binaries from one checkout share that shader source.
 
+## NumCalc scattering and radiation
+
+`script/ValidateNumCalc --head` compares native CPU and compensated Metal pressure/velocity fields with the pinned, unmodified author executable. Cases cover both source types, boundary pressure/velocity/admittance, frequency curves, direct/CGS solves, ILU and scaling, dense/single-level/multilevel FMM, and the author's sample head. Independent sphere solutions, mesh refinement, fictitious-resonance frequencies and the paper's terminated-duct example check physical accuracy. The native residual is recomputed in FP64 against the unpreconditioned operator.
+
+The numerical core is shared with upstream, so those comparisons establish execution-backend agreement; the analytic checks supply independent evidence. The sample head is smaller than the published head-and-torso example. Full published figures and timing tables have not been reproduced. See [scope, conventions and rendering checks](src/NumCalc/README.md).
+
 ## Thermoviscous boundary elements
 
 `script/ValidateThermoviscous` compares native quadratic boundary operators and all recovered fields with the pinned Julia implementation's direct coupled solve at 100 and 1000 Hz. The harness explicitly corrects upstream free-term and interior-normal conventions. Independent mesh-refinement checks cover the paper's translating sphere and analytical radial interior/exterior thermoviscous solutions, plus complex excitation and silence. A disconnected narrow-gap case checks quadrature convergence and agreement with a direct coupled solve.

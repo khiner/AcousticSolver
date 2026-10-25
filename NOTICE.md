@@ -242,6 +242,17 @@ Copyright (C) 2019–2023 The Simons Foundation, Inc., FMM3D Development Team.
 Licensed under Apache-2.0. The license, author list and bundled-file notices are
 retained in `external/fmm3d/LICENSE`, `AUTHORS`, and the named source files.
 
+## NumCalc / Mesh2HRTF
+
+The scattering solver builds the numerical core of [Mesh2HRTF / NumCalc](https://github.com/Any2HRTF/Mesh2HRTF),
+v1.3.0, revision `e45d0436a6fbeca3db13828cbae23ca109225be3`, pinned in `external/mesh2hrtf`.
+The source headers credit H. Ziegelwanger, W. Kreuzer and Z. S. Chen.
+The source and bundled notices are retained in the submodule under the
+[European Union Public Licence 1.2](external/mesh2hrtf/LICENSE.txt).
+`script/numcalc/adapt.py` generates build-directory adaptations for native solver/operator hooks,
+RHS-relative convergence checking, boundary-record capacity and CGS fallback fixes, and full-precision field serialization; the submodule is unchanged.
+The unmodified sources also build the separate `NumCalcReference` executable.
+
 ## HMatrices.jl
 
 Geometric clustering and partial adaptive cross approximation in

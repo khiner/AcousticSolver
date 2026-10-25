@@ -17,6 +17,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Coupled plates and air](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf) | Radiating panels, sympathetic vibration and drums | Nonlinear parallel plates/membranes with two-way 3D air coupling |
 | [Viscothermal tubes](https://doi.org/10.1121/10.0005537) | Narrow pipes, tapered ducts and tube resonators | 1D pressure/volume-flow propagation with viscous and thermal boundary-layer losses |
 | [Thermoviscous boundary elements](src/Thermoviscous/README.md) | Small cavities, gaps and viscous sound radiation | 3D harmonic acoustic, thermal and viscous modes; prescribed isothermal no-slip walls |
+| [NumCalc](https://doi.org/10.1016/j.enganabound.2024.01.008) | Scattering, enclosures and prescribed-wall radiation | Interior/exterior BEM, Burton–Miller stabilization, admittance boundaries and multilevel FMM |
 | [Acoustic Reliefs](script/reliefs/README.md) | Acoustic heightfield optimization | Differentiable boundary elements with an appearance objective |
 
 See [validation](VALIDATION.md) for checks and numerical limits, and [third-party notices](NOTICE.md) for licensing and reference-code provenance.
@@ -329,6 +330,18 @@ script/RenderThermoviscous build/thermoviscous/sphere.json  # broadband pulse or
 ```
 
 See [mesh import, material parameters and numerical limits](src/Thermoviscous/README.md). `ThermoviscousDemo` renders a steady tone; `RenderThermoviscous` sweeps frequencies and convolves the receiver response with an excitation.
+
+## Acoustic scattering and radiation
+
+[NumCalc (Kreuzer et al., 2024)](https://doi.org/10.1016/j.enganabound.2024.01.008) solves scattering and radiation from surface meshes with pressure, velocity or frequency-dependent admittance boundaries. The native integration retains the author's quadrature and dense/single-level/multilevel FMM formulations, with Accelerate CPU algebra and an optional compensated Metal operator backend.
+
+```sh
+script/PrepareNumCalc build/numcalc/sphere.json
+script/RunNumCalc build/numcalc/sphere.json --output build/numcalc/sphere
+script/RenderNumCalc build/numcalc/sphere.json --output build/numcalc/audio
+```
+
+See [geometry, boundary data, performance and numerical limits](src/NumCalc/README.md). `PrepareNumCalc --scene enclosure` generates a vibrating enclosure; `--scene duct` generates a terminated interior duct. Audio rendering accepts mono WAV excitation with `--input`.
 
 ## Acoustic Reliefs
 

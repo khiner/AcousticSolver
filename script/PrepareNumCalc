@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Create a sphere, enclosure, or lined duct example for the NumCalc solver."""
+import argparse
+import json
+from pathlib import Path
+from numcalc.common import box, sphere
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('output', type=Path)
+parser.add_argument('--scene', choices=['sphere', 'enclosure', 'duct'], default='sphere')
+parser.add_argument('--frequency', type=float, default=500)
+parser.add_argument('--level', type=int, default=3)
+parser.add_argument('--radius', type=float, default=.06)
+parser.add_argument('--method', choices=['dense', 'slfmm', 'mlfmm'], default='mlfmm')
+parser.add_argument('--mesh', type=Path, help='Linear triangle/quad Gmsh or COMSOL surface mesh')
+parser.add_argument('--scale', type=float, default=1, help='Mesh-coordinate multiplier to metres')
+args = parser.parse_args()
+scene = {'frequency': args.frequency, 'method': args.method}
+if args.scene == 'sphere':
+    vertices, elements = sphere(args.level, args.radius)
+    scene.update(sources=[{'type': 'plane', 'direction': [1,0,0], 'amplitude': 1}],
+                 receivers=[[2*args.radius,0,0], [0,2*args.radius,0], [-2*args.radius,0,0]])
+else:
+    vertices, elements, sides = box((.24,.16,.12),(12,8,6)) if args.scene == 'enclosure' else box()
+    if args.scene == 'enclosure':
+        scene.update(patches=[{'elements': sides[1], 'type': 'velocity', 'value': .01}],
+                     receivers=[[1,0,0], [-1,0,0]])
+    else:
+        scene.update(exterior=False, patches=[{'elements': sides[0], 'type': 'velocity', 'value': -.01},
+                                              {'elements': sides[1], 'type': 'admittance', 'value': 1}],
+                     receivers=[[-.25,0,0], [0,0,0], [.25,0,0]])
+scene.update(vertices=vertices, elements=elements)
+if args.mesh:
+    from thermoviscous.mesh import mesh
+    vertices, elements = mesh(args.mesh)
+    if any(len(face) not in (3, 4) for face in elements):
+        raise ValueError('NumCalc uses linear triangular or planar quadrilateral geometry')
+    scene.update(vertices=(vertices*args.scale).tolist(), elements=[list(map(int, face)) for face in elements])
+    scene.pop('patches', None)
+args.output.parent.mkdir(parents=True, exist_ok=True)
+args.output.write_text(json.dumps(scene, indent=2)+'\n')
+print(args.output.resolve())

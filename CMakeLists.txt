@@ -215,3 +215,5 @@ target_compile_options(ThermoviscousCore PRIVATE -ffp-contract=off)
 target_link_libraries(ThermoviscousCore PUBLIC "-framework Accelerate" Fmm3d)
 add_executable(ThermoviscousSolve src/Thermoviscous/Main.cpp)
 target_link_libraries(ThermoviscousSolve PRIVATE ThermoviscousCore)
+
+include(cmake/NumCalc.cmake)

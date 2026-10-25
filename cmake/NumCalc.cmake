@@ -1,0 +1,30 @@
+set(NUMCALC_DIR "${PROJECT_SOURCE_DIR}/external/mesh2hrtf/mesh2hrtf/NumCalc/src")
+if(NOT EXISTS "${NUMCALC_DIR}/NC_Main.cpp")
+    message(FATAL_ERROR "Initialize external/mesh2hrtf with git submodule update --init")
+endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(NUMCALC_NAMES NC_Main NC_CommonFunctions NC_3dFunctions NC_Input NC_Addresses NC_EquationSystem NC_PostProcessing)
+set(NUMCALC_ORIGINAL)
+set(NUMCALC_ADAPTED)
+foreach(name IN LISTS NUMCALC_NAMES)
+    list(APPEND NUMCALC_ORIGINAL "${NUMCALC_DIR}/${name}.cpp")
+    list(APPEND NUMCALC_ADAPTED "${PROJECT_BINARY_DIR}/numcalc-core/${name}.cpp")
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NUMCALC_ORIGINAL} "${PROJECT_SOURCE_DIR}/script/numcalc/adapt.py")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/script/numcalc/adapt.py"
+    "${NUMCALC_DIR}" "${PROJECT_BINARY_DIR}/numcalc-core" COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND git -C "${NUMCALC_DIR}" rev-parse HEAD
+    OUTPUT_VARIABLE NUMCALC_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+add_executable(NumCalcReference ${NUMCALC_ORIGINAL})
+target_include_directories(NumCalcReference PRIVATE "${NUMCALC_DIR}")
+target_compile_options(NumCalcReference PRIVATE -w -ffp-contract=off)
+add_library(NumCalcAuthorCore STATIC ${NUMCALC_ADAPTED})
+target_include_directories(NumCalcAuthorCore PUBLIC "${NUMCALC_DIR}" PRIVATE "${PROJECT_SOURCE_DIR}/src/NumCalc")
+target_compile_options(NumCalcAuthorCore PRIVATE -w -ffp-contract=off)
+add_executable(NumCalcSolve src/NumCalc/Main.cpp src/NumCalc/Backend.cpp src/NumCalc/Gpu.cpp)
+target_link_libraries(NumCalcSolve PRIVATE NumCalcAuthorCore AcousticCore)
+target_compile_definitions(NumCalcSolve PRIVATE
+    ACCELERATE_NEW_LAPACK
+    ACOUSTIC_NUMCALC_COMMIT="${NUMCALC_COMMIT}"
+    ACOUSTIC_NUMCALC_MSL="${PROJECT_SOURCE_DIR}/src/NumCalc/Kernels.metal")
+target_compile_options(NumCalcSolve PRIVATE -ffp-contract=off)

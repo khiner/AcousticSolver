@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Compare NumCalc backends with the pinned author executable and analytic fields."""
+import argparse
+import json
+from pathlib import Path
+import numpy as np
+from numcalc.common import ROOT, UPSTREAM, box, sphere, run, unpack, digest
+from numcalc.analytic import relative, sphere_plane
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT/'build/numcalc-validation')
+    parser.add_argument('--cpu-only', action='store_true')
+    parser.add_argument('--head', action='store_true', help='Also compare the author-provided 17,432-element head mesh')
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    checks, fixtures = [], {}
+
+    def check(name, value, limit):
+        if not np.isfinite(value) or value > limit:
+            raise AssertionError(f'{name}: {value:g} > {limit:g}')
+        checks.append({'name': name, 'error': value, 'limit': limit})
+        print(f'{name}: {value:.3g}', flush=True)
+
+    def fields(name, result, reference, limit=2e-5):
+        for a, b in zip(result['fields'], reference['fields'], strict=True):
+            for field in ('boundary_pressure', 'boundary_velocity', 'receiver_pressure', 'receiver_velocity'):
+                check(f'{name}/{a["frequency"]:g}/{field}', relative(unpack(a[field]), unpack(b[field])), limit)
+
+    def compare(name, scene, metal=True):
+        ref = run(scene, args.output/name/'upstream', reference=True)
+        cpu = run(scene, args.output/name/'cpu')
+        fields(f'{name}/cpu', cpu, ref)
+        if metal and not args.cpu_only:
+            fields(f'{name}/metal', run(scene, args.output/name/'metal', 'metal'), ref, 1e-4)
+        return cpu
+
+    v, e = sphere(0, .06)
+    small = dict(vertices=v, elements=e, frequency=500, method='dense',
+                 sources=[dict(type='plane', direction=[1,0,0])], receivers=[[.15,0,0]])
+    combined = dict(type='admittance', value=.2, velocity=.001)
+    # Equivalent grouped input fits the unchanged author's boundary parser.
+    grouped = run(dict(small, boundary=combined), args.output/'boundary-capacity/upstream', reference=True)
+    last_iteration = run(dict(small, solver='direct'), args.output/'last-iteration/direct')
+    v, e = sphere(2, .25)
+    fallback = dict(small, vertices=v, elements=e, receivers=[[.5,0,0]])
+    direct = run(dict(fallback, solver='direct'), args.output/'fallback/direct', reference=True)
+    for backend in (['cpu'] if args.cpu_only else ['cpu', 'metal']):
+        cases = [
+            ('boundary-capacity', dict(small, patches=[dict(combined, elements=[i]) for i in range(len(small['elements']))]), grouped, 'cgs'),
+            ('last-iteration', dict(small, max_iterations=1), last_iteration, 'cgs'),
+            ('fallback', dict(fallback, max_iterations=1, preconditioner='ilu' if backend == 'metal' else 'scaling'), direct, 'direct_fallback'),
+        ]
+        for name, scene, reference, solver in cases:
+            directory = args.output/name/backend
+            result = run(scene, directory, backend)
+            actual = result['native']['frequencies'][0]
+            if actual['solver'] != solver or (solver == 'direct_fallback' and actual.get('direct_backend') != 'accelerate'):
+                raise AssertionError(f'{name}/{backend}: unexpected solver: {actual}')
+            if name == 'last-iteration' and 'Maximum number of iterations' in (directory/'run.log').read_text():
+                raise AssertionError('Converged final iteration reported as failure')
+            fields(f'{name}/{backend}', result, reference)
+
+    vertices, elements = sphere(3, .25)
+    base = dict(vertices=vertices, elements=elements, frequency=500, method='dense',
+                sources=[dict(type='plane', direction=[1,0,0])], receivers=[[.5,0,0],[0,.5,0],[-.5,0,0]])
+    dense = compare('rigid-plane', base)
+    coarse_vertices, coarse_elements = sphere(2, .25)
+    coarse = run(dict(base, vertices=coarse_vertices, elements=coarse_elements), args.output/'coarse')
+    exact = sphere_plane(base['receivers'], 500, .25)
+    coarse_error = relative(unpack(coarse['fields'][0]['receiver_pressure']), exact)
+    fine_error = relative(unpack(dense['fields'][0]['receiver_pressure']), exact)
+    check('sphere analytic', fine_error, .012)
+    check('sphere refinement ratio', fine_error/coarse_error, .4)
+    compare('soft-point', dict(base, boundary=dict(type='pressure', value=0),
+                                     sources=[dict(type='point', position=[.8,.2,0], amplitude=[.7,.2])]))
+    compare('prescribed-pressure', dict(base, boundary=dict(type='pressure', value=[1,.1]), sources=[]))
+    compare('ilu', dict(base, method='slfmm', preconditioner='ilu'))
+    direct = compare('direct', dict(base, solver='direct'), metal=False)
+    check('direct versus CGS', relative(unpack(direct['fields'][0]['receiver_pressure']), unpack(dense['fields'][0]['receiver_pressure'])), 1e-7)
+    # The first l=0 fictitious Dirichlet frequency of a radius .25 sphere is c/(2a).
+    resonance = compare('fictitious-resonance', dict(base, frequencies=[680, 686, 692]))
+    for result in resonance['fields']:
+        check(f'resonance analytic/{result["frequency"]:g}', relative(unpack(result['receiver_pressure']), sphere_plane(base['receivers'], result['frequency'], .25)), .025)
+    admittance = {'frequencies': [100,1000], 'values': [[.1,.05],[.4,.1]]}
+    compare('admittance-curve', dict(base, method='slfmm', frequencies=[300,700], boundary=dict(type='admittance', value=admittance)))
+    v, e = sphere(4, .25)
+    v, e = np.asarray(v), np.asarray(e)
+    e = e[np.all(v[e,0] >= -1e-12, axis=1)]
+    used, indices = np.unique(e, return_inverse=True)
+    compare('symmetry-impedance', dict(base, vertices=v[used].tolist(), elements=indices.reshape(-1,3).tolist(), method='slfmm',
+                                     symmetry=dict(planes=[1,0,0], origin=[0,0,0]), boundary=dict(type='impedance', value=[2,.2]),
+                                     sources=[dict(type='plane', direction=[1,0,0], amplitude={'frequencies':[100,1000], 'values':[[1,.1],[.8,.2]]})],
+                                     receivers=[[.5,0,0],[.1,.5,0]]))
+    v, e = sphere(4, .25)
+    for kind, value in [('pressure', 0), ('admittance', [.3,.05])]:
+        result = run(dict(base, vertices=v, elements=e, boundary=dict(type=kind, value=value)), args.output/f'analytic-{kind}')
+        exact = sphere_plane(base['receivers'], 500, .25, kind=kind, admittance=complex(*value) if isinstance(value, list) else 0)
+        check(f'{kind} analytic', relative(unpack(result['fields'][0]['receiver_pressure']), exact), .012)
+    fine_dense = run(dict(base, vertices=v, elements=e), args.output/'fine-dense')
+    for method in ('slfmm', 'mlfmm'):
+        scene = dict(base, vertices=v, elements=e, method=method, cluster_edge=.22 if method == 'mlfmm' else 0)
+        result = compare(method, scene)
+        actual = result['native']['frequencies'][0]
+        if actual['method'] != method or (method == 'mlfmm' and actual['levels'] < 2):
+            raise AssertionError(f'{method} was not exercised: {actual}')
+        exact = sphere_plane(scene['receivers'], 500, .25)
+        check(f'{method} analytic', relative(unpack(result['fields'][0]['receiver_pressure']), exact), .005)
+        check(f'{method} versus dense', relative(unpack(result['fields'][0]['receiver_pressure']), unpack(fine_dense['fields'][0]['receiver_pressure'])), .002)
+    v, e, sides = box((3.4,.2,.2), (68,4,4))
+    duct = dict(vertices=v, elements=e, frequencies=[240,480], method='mlfmm', exterior=False, sound_speed=340, density=1.3,
+                patches=[dict(elements=sides[0], type='velocity', value=1), dict(elements=sides[1], type='admittance', value=1)],
+                receivers=[[x,0,0] for x in np.linspace(-1.6,1.6,9)])
+    result = compare('paper-duct-h005', duct)
+    x = np.asarray(duct['receivers'])[:,0]+1.7
+    for field in result['fields']:
+        exact = -442*np.exp(2j*np.pi*field['frequency']*x/340)
+        check(f'duct analytic/{field["frequency"]:g}', relative(unpack(field['receiver_pressure']), exact), .08)
+    v, e, sides = box((3.4,.2,.2), (136,8,8))
+    refined = run(dict(duct, vertices=v, elements=e, patches=[dict(elements=sides[0], type='velocity', value=1),
+                                                           dict(elements=sides[1], type='admittance', value=1)]), args.output/'paper-duct-h0025')
+    for coarse, fine in zip(result['fields'], refined['fields']):
+        exact = -442*np.exp(2j*np.pi*fine['frequency']*x/340)
+        error = relative(unpack(fine['receiver_pressure']), exact)
+        check(f'duct refined/{fine["frequency"]:g}', error, .035)
+        check(f'duct refinement ratio/{fine["frequency"]:g}', error/relative(unpack(coarse['receiver_pressure']), exact), .65)
+    if args.head:
+        path = UPSTREAM/'mesh2hrtf/Mesh2Input/Meshes/Data/example_head_max_f_16_kHz.ply'
+        data = path.read_bytes()
+        offset = data.index(b'end_header\n') + len(b'end_header\n')
+        header = data[:offset].decode()
+        if 'element vertex 8718\n' not in header or 'element face 17432\n' not in header or 'format binary_little_endian' not in header:
+            raise ValueError('Author head fixture format changed')
+        v = np.frombuffer(data, dtype='<f4', count=8718*3, offset=offset).reshape(-1,3)*.001
+        faces = np.frombuffer(data, dtype=[('count','u1'),('vertices','<u4',(3,))], count=17432, offset=offset+8718*12)
+        if np.any(faces['count'] != 3):
+            raise ValueError('Expected author head triangles')
+        head = dict(base, vertices=v.tolist(), elements=faces['vertices'].tolist(), frequency=2000, method='mlfmm')
+        compare('author-head', head)
+        fixtures['head'] = {'path': str(path.relative_to(ROOT)), 'sha256': digest(path),
+                            'note': 'Author sample head; not the much larger published head-and-torso mesh'}
+    zero = run(dict(base, sources=[]), args.output/'zero')
+    check('zero excitation', np.linalg.norm(unpack(zero['fields'][0]['boundary_pressure'])), 0)
+    (args.output/'report.json').write_text(json.dumps({'checks': checks, 'passed': len(checks), 'fixtures': fixtures}, indent=2)+'\n')
+    print(f'{len(checks)} comparisons passed; {args.output / "report.json"}')
+
+
+if __name__ == '__main__':
+    main()

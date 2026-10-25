@@ -183,3 +183,25 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 GNU General Public License for more details.
 
 The license is retained in `external/openwind/LICENSE` and this project's `LICENSE`.
+
+## Coupled elastic–acoustic references
+
+`src/Elastic/` implements the propagation equations in
+[Guo, Acosta and Chan, JCP 418 (2020)](https://doi.org/10.1016/j.jcp.2020.109632).
+The native solver does not link to these reference programs:
+
+- [KGuo26/WADG_Matlab](https://github.com/KGuo26/WADG_Matlab),
+  `external/wadg-elastic`, revision `2ea0350d4c52e38352a94bfc007005335fc1e646`.
+  The pinned repository has no explicit project license. Its MATLAB code is used
+  only by the optional author-reference harness, which makes a generated headless
+  copy and records changes, including a boundary-stage clock correction.
+- [SeisSol](https://github.com/SeisSol/SeisSol), `external/seissol`, revision
+  `a526776fed818f206bd56d894e7ecfc3e046187b`, BSD-3-Clause. The optional comparison
+  harness evaluates its Scholte/Snell analytical fields and runs its independent
+  ADER-DG solver. Copyright (c) 2012–2026 SeisSol Group and (c) 2023 Intel Corporation.
+  The complete notice and license are retained in `external/seissol/LICENSE`.
+- [e3Dss](https://github.com/Zetison/e3Dss), `external/e3dss`, revision
+  `a12c01cc80dfdb1d9f1e9bc5822bbd4e9afd83fe`, GPL-3.0, retained in
+  `external/e3dss/LICENSE`. It provides the independent elastic-sphere scattering
+  solution. The Octave harness supplies pool-query and field-name compatibility
+  helpers without changing its numerical functions.

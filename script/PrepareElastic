@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Convert a tagged Gmsh tetrahedral mesh to ElasticSolve geometry."""
+
+import argparse
+import json
+from pathlib import Path
+import gmsh
+import numpy as np
+
+
+def convert(source, output):
+    gmsh.initialize()
+    try:
+        gmsh.open(str(source))
+        ids, xyz, _ = gmsh.model.mesh.getNodes()
+        indices = {int(tag): i for i, tag in enumerate(ids)}
+        result = {"nodes": np.asarray(xyz).reshape(-1, 3).tolist(), "elements": [], "boundaries": []}
+        for dim in (3, 2):
+            for _, entity in gmsh.model.getEntities(dim):
+                tags = gmsh.model.getPhysicalGroupsForEntity(dim, entity)
+                if dim == 2 and not len(tags):
+                    continue
+                if len(tags) != 1:
+                    raise ValueError("Each volume and tagged exterior surface needs exactly one physical tag")
+                types, _, connectivity = gmsh.model.mesh.getElements(dim, entity)
+                for kind, flat in zip(types, connectivity):
+                    name, _, degree, count, local, primary = gmsh.model.mesh.getElementProperties(kind)
+                    if primary != (4 if dim == 3 else 3):
+                        raise ValueError(
+                            f"Only tetrahedral volumes and triangular boundaries are supported: {name}"
+                        )
+                    if dim == 3:
+                        if "geometry_degree" in result and result["geometry_degree"] != degree:
+                            raise ValueError("Use a uniform geometry order")
+                        result["geometry_degree"] = degree
+                        result["reference_nodes"] = (2 * np.asarray(local).reshape(-1, 3) - 1).tolist()
+                    for nodes in np.asarray(flat).reshape(-1, count):
+                        result["elements" if dim == 3 else "boundaries"].append(
+                            {
+                                "tag": int(tags[0]),
+                                "nodes": [indices[int(i)] for i in (nodes if dim == 3 else nodes[:3])],
+                            }
+                        )
+        if not result["elements"]:
+            raise ValueError("No tetrahedral volumes")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+        print(f'{len(result["elements"])} tetrahedra, geometry degree {result["geometry_degree"]}: {output}')
+    finally:
+        gmsh.finalize()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mesh", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    convert(args.mesh, args.output)

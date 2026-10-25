@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Prepare an elastic sphere in air or a water-filled elastic spherical shell."""
+
+import argparse
+import json
+from pathlib import Path
+import runpy
+import gmsh
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def mesh(output, spacing, container=False, optimize=True):
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        occ = gmsh.model.occ
+        box = occ.addBox(-0.8, -0.8, -0.8, 1.6, 1.6, 1.6)
+        sphere = occ.addSphere(0, 0, 0, 0.4)
+        tools = [(3, sphere)]
+        if container:
+            tools.append((3, occ.addSphere(0, 0, 0, 0.3)))
+        occ.fragment([(3, box)], tools)
+        occ.synchronize()
+        for _, volume in gmsh.model.getEntities(3):
+            mass = occ.getMass(3, volume)
+            tag = 1 if mass > 1 else (3 if container and mass < 0.12 else 2)
+            gmsh.model.addPhysicalGroup(3, [volume], tag)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", spacing)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", spacing)
+        gmsh.option.setNumber("Mesh.MinimumCirclePoints", 8)
+        gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.setOrder(2)
+        if optimize:
+            gmsh.model.mesh.optimize("HighOrder")
+        gmsh.write(str(output / "mesh.msh"))
+    finally:
+        gmsh.finalize()
+    runpy.run_path(str(ROOT / "script/PrepareElastic"))["convert"](output / "mesh.msh", output / "mesh.json")
+
+
+def prepare(output, scene, spacing, degree):
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    mesh(output, spacing, scene == "container")
+    config = {
+        "mesh": "mesh.json",
+        "degree": degree,
+        "mass": "weight_adjusted",
+        "seconds": 1.0,
+        "sample_rate": 48000,
+        "default_boundary": "absorbing",
+        "materials": {
+            "1": {"type": "fluid", "density": 1.204, "sound_speed": 343.0},
+            "2": {"type": "solid", "density": 1100.0, "young_modulus": 2e6, "poisson_ratio": 0.45},
+        },
+        "sources": [
+            {
+                "type": "force",
+                "position": [0.1, 0.02, 0.01],
+                "region": 2,
+                "direction": [1, 0, 0],
+                "amplitude": 1.0,
+                "frequency": 60.0,
+                "time": 0.025,
+            }
+        ],
+        "receivers": [
+            {"position": [0.6, 0.11, 0.03], "region": 1, "field": "pressure"},
+            {"position": [0.05, 0.12, 0.03], "region": 2, "field": "vx"},
+        ],
+    }
+    if scene == "container":
+        config["materials"]["2"] = {
+            "type": "solid",
+            "density": 1180.0,
+            "young_modulus": 3e9,
+            "poisson_ratio": 0.35,
+        }
+        config["materials"]["3"] = {"type": "fluid", "density": 998.0, "sound_speed": 1480.0}
+        config["sources"][0].update(position=[0.35, 0.01, 0.02], frequency=250.0, time=0.006)
+        config["receivers"][1] = {"position": [0.1, 0.03, 0.02], "region": 3, "field": "pressure"}
+        config["receivers"].append({"position": [0.35, 0.04, 0.02], "region": 2, "field": "vx"})
+    (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    print(output / "config.json")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("scene", choices=["sphere", "container"])
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--spacing", type=float)
+    parser.add_argument("--degree", type=int, default=2)
+    args = parser.parse_args()
+    prepare(
+        args.output,
+        args.scene,
+        args.spacing if args.spacing is not None else (0.3 if args.scene == "container" else 0.7),
+        args.degree,
+    )

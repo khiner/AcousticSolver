@@ -1,0 +1,81 @@
+{
+  "scene": "Soft elastic sphere in air",
+  "audio_seconds": 2.0,
+  "sample_rate": 48000,
+  "video_fps": 60,
+  "video_frames": 120,
+  "audio_channels": [
+    "Outside air pressure"
+  ],
+  "audio_gain_per_channel": [
+    488.97284371999484
+  ],
+  "dt": 1.0416666666666666e-05,
+  "steps": 192000,
+  "render_seconds": 67.275499625,
+  "visualization": "Instantaneous element-centre fields on a y=0 slice of the corner-linearized mesh; no displacement or time scaling. Logarithmic colour scales are fixed across frames.",
+  "config": {
+    "default_boundary": "absorbing",
+    "degree": 2,
+    "mass": "weight_adjusted",
+    "materials": {
+      "1": {
+        "density": 1.204,
+        "sound_speed": 343.0,
+        "type": "fluid"
+      },
+      "2": {
+        "density": 1100.0,
+        "poisson_ratio": 0.45,
+        "type": "solid",
+        "young_modulus": 2000000.0
+      }
+    },
+    "mesh": "mesh.json",
+    "receivers": [
+      {
+        "field": "pressure",
+        "position": [
+          0.6,
+          0.11,
+          0.03
+        ],
+        "region": 1
+      },
+      {
+        "field": "vx",
+        "position": [
+          0.05,
+          0.12,
+          0.03
+        ],
+        "region": 2
+      }
+    ],
+    "sample_rate": 48000,
+    "seconds": 2.0,
+    "sources": [
+      {
+        "amplitude": 1.0,
+        "direction": [
+          1,
+          0,
+          0
+        ],
+        "frequency": 60.0,
+        "position": [
+          0.1,
+          0.02,
+          0.01
+        ],
+        "region": 2,
+        "time": 0.025,
+        "type": "force"
+      }
+    ]
+  },
+  "mesh_sha256": "171e8e8639ecd109e765cfb9d87fcd7773d29714b80fb712a7f03ed5b73c2fe7",
+  "raw_samples_sha256": "a4cda77c2633000266d38b128107b8338cb6a5c9185622cbd3cebd73a42d5eb0",
+  "paper": "https://doi.org/10.1016/j.jcp.2020.109632",
+  "mp4_sha256": "8db150c73fa887759eced40ed3f26403236f5ab7d0f58673722654ef4b4be744"
+}

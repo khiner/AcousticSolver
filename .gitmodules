@@ -10,3 +10,12 @@
 [submodule "external/openwind"]
 	path = external/openwind
 	url = https://gitlab.inria.fr/openwind/openwind.git
+[submodule "external/wadg-elastic"]
+	path = external/wadg-elastic
+	url = https://github.com/KGuo26/WADG_Matlab.git
+[submodule "external/seissol"]
+	path = external/seissol
+	url = https://github.com/SeisSol/SeisSol.git
+[submodule "external/e3dss"]
+	path = external/e3dss
+	url = https://github.com/Zetison/e3Dss.git

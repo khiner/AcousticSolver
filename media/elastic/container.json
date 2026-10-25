@@ -1,0 +1,97 @@
+{
+  "scene": "Water-filled acrylic shell",
+  "audio_seconds": 2.0,
+  "sample_rate": 48000,
+  "video_fps": 60,
+  "video_frames": 120,
+  "audio_channels": [
+    "Outside air pressure",
+    "Inside water pressure"
+  ],
+  "audio_gain_per_channel": [
+    394.89086201692004,
+    1.1164338380962884
+  ],
+  "dt": 1.7959770114942529e-07,
+  "steps": 11136000,
+  "render_seconds": 13723.872690917,
+  "visualization": "Instantaneous element-centre fields on a y=0 slice of the corner-linearized mesh; no displacement or time scaling. Logarithmic colour scales are fixed across frames.",
+  "config": {
+    "default_boundary": "absorbing",
+    "degree": 2,
+    "mass": "weight_adjusted",
+    "materials": {
+      "1": {
+        "density": 1.204,
+        "sound_speed": 343.0,
+        "type": "fluid"
+      },
+      "2": {
+        "density": 1180.0,
+        "poisson_ratio": 0.35,
+        "type": "solid",
+        "young_modulus": 3000000000.0
+      },
+      "3": {
+        "density": 998.0,
+        "sound_speed": 1480.0,
+        "type": "fluid"
+      }
+    },
+    "mesh": "mesh.json",
+    "receivers": [
+      {
+        "field": "pressure",
+        "position": [
+          0.6,
+          0.11,
+          0.03
+        ],
+        "region": 1
+      },
+      {
+        "field": "pressure",
+        "position": [
+          0.1,
+          0.03,
+          0.02
+        ],
+        "region": 3
+      },
+      {
+        "field": "vx",
+        "position": [
+          0.35,
+          0.04,
+          0.02
+        ],
+        "region": 2
+      }
+    ],
+    "sample_rate": 48000,
+    "seconds": 2.0,
+    "sources": [
+      {
+        "amplitude": 1.0,
+        "direction": [
+          1,
+          0,
+          0
+        ],
+        "frequency": 250.0,
+        "position": [
+          0.35,
+          0.01,
+          0.02
+        ],
+        "region": 2,
+        "time": 0.006,
+        "type": "force"
+      }
+    ]
+  },
+  "mesh_sha256": "43f0dd92a27f8f41d16c8d34b7b8c33c0e02e17f0a2bf1ce7c29534ef38aea22",
+  "raw_samples_sha256": "00d2799b84c916ccb71fa768a3fd9e290fa4f6a99e3b4a1cc736a9a21429963a",
+  "paper": "https://doi.org/10.1016/j.jcp.2020.109632",
+  "mp4_sha256": "730e5c9a323d367ff492c05d85b629075e36057d45861d60266644aa4ed317b1"
+}

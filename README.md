@@ -11,6 +11,7 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Implicit room acoustics](https://doi.org/10.1121/10.0036229) | Low-dispersion room simulation | 27-point scheme with real-admittance walls |
 | [Immersed boundaries](https://doi.org/10.1121/10.0020635) | Exterior scattering and transmission | Static surfaces, impedances and finite barriers |
 | [Curved tetrahedral DG](src/Dg/README.md) | Rigid-wall wave propagation | Prepared meshes and operators; no native scene/source integration |
+| [Coupled elastic–acoustic waves](src/Elastic/README.md) | Transmission, structural radiation and fluid-filled elastic objects | General conforming tetrahedral fluids/solids, curved geometry, heterogeneity and anisotropy |
 | [Nonlinear plates](https://arxiv.org/abs/2608.06139) | Plate vibration and crash sounds | Simply supported rectangular plates; displacement output |
 | [Nonlinear stiff strings](https://doi.org/10.1007/s11071-026-12708-0) | Plucked-string vibration | Geometrically exact, cubic and Kirchhoff–Carrier models; displacement output |
 | [Coupled plates and air](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf) | Radiating panels, sympathetic vibration and drums | Nonlinear parallel plates/membranes with two-way 3D air coupling |
@@ -317,3 +318,38 @@ See [validation](VALIDATION.md#viscothermal-tubes) for upstream comparisons.
 ## Acoustic Reliefs
 
 Generate and optimize a heightfield with the Metal acoustic solver and an MPS appearance objective. A target image is required; completed runs produce an OBJ and resumable checkpoints. See [setup, rendering and upstream comparison instructions](script/reliefs/README.md).
+
+## Coupled elastic–acoustic waves
+
+[Guo, Acosta and Chan (JCP 2020)](https://doi.org/10.1016/j.jcp.2020.109632)
+provides the coupled DG propagation model for general fluid and solid volumes.
+`ElasticSolve` uses GPU-resident paired-float propagation with fixed timesteps
+and an Accelerate FP64 reference (`--cpu`), with tagged curved tetrahedra, isotropic or
+anisotropic elasticity, spatially varying materials, point sources and receivers.
+The GPU renderer requires macOS 26 or newer and a Metal 4-capable Apple GPU.
+
+```sh
+python3 script/ElasticDemo sphere build/elastic-demo/sphere
+build/ElasticSolve build/elastic-demo/sphere/config.json --prepare
+build/ElasticSolve build/elastic-demo/sphere/config.json --output build/elastic-demo/sphere/render
+```
+
+Preparation requires NumPy and Gmsh. The example requests one second; `--seconds N`
+overrides it. This explicit volumetric solver can be much slower than rendered audio.
+See [inputs, outputs and physical limits](src/Elastic/README.md), including the
+reflection limits of its local absorbing boundary.
+
+## Elastic–acoustic demo videos
+
+Two-second simulations of the coupled model from
+[Guo, Acosta and Chan (JCP 2020)](https://doi.org/10.1016/j.jcp.2020.109632),
+with synchronized pressure audio and field visualization at real-time playback speed.
+
+| Scene | MP4 | Audio |
+| --- | --- | --- |
+| Soft elastic sphere in air | [Watch](media/elastic/sphere.mp4) | Mono: outside air pressure |
+| Water-filled acrylic shell | [Watch](media/elastic/container.mp4) | Stereo: outside air (left), inside water (right) |
+
+Audio uses a fixed gain per channel over the whole clip. The videos show instantaneous
+fluid pressure and solid speed at element centres on a mesh slice, with fixed logarithmic
+colour scales. The adjacent JSON files record scene settings, gains and render timings.

@@ -1,4 +1,5 @@
 #pragma once
+#include "DgBasis.h"
 #include "json.hpp"
 #include <Eigen/Dense>
 #include <array>
@@ -14,9 +15,6 @@
 namespace dg::reference {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
-template<class T> using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-using Mat = Matrix<double>;
-using Vec = Eigen::VectorXd;
 using State = Mat;
 inline void Require(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
@@ -38,18 +36,6 @@ std::string Hash(const fs::path &);
 void NewDirectory(const fs::path &);
 Mat ReadMatrix(const fs::path &, int rows, int cols);
 Mat ReadNodes(const fs::path &, int count);
-struct Basis {
-    Mat V;
-    std::array<Mat, 3> D;
-};
-Basis Bernstein(const Mat &, int degree);
-struct Quadrature {
-    Mat Points;
-    Vec Weights;
-    std::array<Mat, 4> Faces;
-    Vec FaceWeights;
-};
-Quadrature Integrate(int order);
 struct Mesh {
     Json Metadata;
     fs::path Directory;

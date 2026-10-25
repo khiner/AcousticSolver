@@ -16,16 +16,18 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Nonlinear stiff strings](https://doi.org/10.1007/s11071-026-12708-0) | Plucked-string vibration | Geometrically exact, cubic and Kirchhoff–Carrier models; displacement output |
 | [Coupled plates and air](https://www.ness.music.ed.ac.uk/wp-content/uploads/2013/06/dafx2013_submission_41.pdf) | Radiating panels, sympathetic vibration and drums | Nonlinear parallel plates/membranes with two-way 3D air coupling |
 | [Viscothermal tubes](https://doi.org/10.1121/10.0005537) | Narrow pipes, tapered ducts and tube resonators | 1D pressure/volume-flow propagation with viscous and thermal boundary-layer losses |
+| [Thermoviscous boundary elements](src/Thermoviscous/README.md) | Small cavities, gaps and viscous sound radiation | 3D harmonic acoustic, thermal and viscous modes; prescribed isothermal no-slip walls |
 | [Acoustic Reliefs](script/reliefs/README.md) | Acoustic heightfield optimization | Differentiable boundary elements with an appearance objective |
 
 See [validation](VALIDATION.md) for checks and numerical limits, and [third-party notices](NOTICE.md) for licensing and reference-code provenance.
 
 ## Build
 
-Requires macOS on Apple Silicon, Xcode's Metal toolchain, CMake 3.24+, and a C++23 compiler. Homebrew LLVM is used for development. Boost, MPFR and GMP support plate preparation; Eigen is vendored and CMake downloads pinned metal-cpp headers.
+Requires macOS on Apple Silicon, Xcode's Metal toolchain, CMake 3.24+, and a C++23 compiler. Homebrew LLVM is used for development. Boost, MPFR and GMP support plate preparation; Eigen is vendored and CMake downloads pinned metal-cpp headers. GCC supplies gfortran for the thermoviscous FMM library; initialize the submodules before configuring.
 
 ```sh
-brew install cmake ninja llvm boost mpfr gmp
+brew install cmake ninja llvm boost mpfr gmp gcc
+git submodule update --init --recursive
 PATH="$(brew --prefix llvm)/bin:$PATH" script/Build
 ```
 
@@ -314,6 +316,19 @@ motion, nonlinear propagation, or the exterior radiation field. Endpoint resista
 is a local termination model. The mesh is limited to 4096 pressure nodes and 8192
 flow nodes. Reported render times exclude preparation and file output.
 See [validation](VALIDATION.md#viscothermal-tubes) for upstream comparisons.
+
+## Thermoviscous boundary elements
+
+[Preuss et al. (2023)](https://doi.org/10.1142/S2591728523500159) resolve viscous and thermal losses on surface meshes, using a nested Schur-complement solve. The FP64 CPU implementation supports interior cavities and exterior radiation, linear/quadratic triangles and quads, dense/FMM/H-matrix acoustic operators, and prescribed wall motion.
+
+```sh
+script/PrepareThermoviscous build/thermoviscous/sphere.json --radius .01 --frequency 1000
+build/ThermoviscousSolve build/thermoviscous/sphere.json build/thermoviscous/result.json
+script/ThermoviscousDemo  # two-second steady-state listening sample
+script/RenderThermoviscous build/thermoviscous/sphere.json  # broadband pulse or --input WAV
+```
+
+See [mesh import, material parameters and numerical limits](src/Thermoviscous/README.md). `ThermoviscousDemo` renders a steady tone; `RenderThermoviscous` sweeps frequencies and convolves the receiver response with an excitation.
 
 ## Acoustic Reliefs
 

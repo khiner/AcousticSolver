@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Run the paper's sphere mesh/frequency study and compare its four solution systems."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+
+from thermoviscous.common import ROOT, REVISION, PAPER, executable_hash, run, complex_values
+from thermoviscous.mesh import mesh as load_mesh
+from thermoviscous.analytic import translation_pressure, relative
+MESHES={246:'sphere_1m_coarser',464:'sphere_1m_coarse',840:'sphere_1m',1320:'sphere_1m_fine',
+        2794:'sphere_1m_finer',4506:'sphere_1m_4p5k',6530:'sphere_1m_extremely_fine'}
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',type=Path,default=ROOT/'build/thermoviscous-paper')
+    parser.add_argument('--elements',type=int,nargs='+',default=list(MESHES))
+    parser.add_argument('--frequencies',type=float,nargs='+',default=[100,1000])
+    parser.add_argument('--methods',nargs='+',choices=['iterative','direct1','direct4','direct10'],default=['iterative'])
+    parser.add_argument('--backend',choices=['dense','fmm','hmatrix'],default='dense')
+    parser.add_argument('--repetitions',type=int,default=1,help='Paper timing protocol uses 20')
+    parser.add_argument('--direct-memory-gib',type=float,default=2)
+    parser.add_argument('--mesh-2794',type=Path,help='Override the 2794-element mesh recovered from upstream history')
+    args=parser.parse_args()
+    if args.repetitions<1: raise ValueError('repetitions must be positive')
+    args.output.mkdir(parents=True,exist_ok=True)
+    power=subprocess.check_output(['pmset','-g','batt'],text=True)
+    report={'paper':PAPER,'executable_sha256':executable_hash(),
+            'power':power,'repetitions':args.repetitions,'backend':args.backend,'cases':[],
+            'timing_scope':'Assembly includes boundary operators. Pressure includes RHS and pressure solve. Recovery includes residual checks, modal recovery and receiver evaluation.',
+            'qualification':'Local correctness/scaling study; different hardware and boundary-convention corrections prevent exact reproduction of published timings.'}
+    def save(): (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+    for elements in args.elements:
+        name=MESHES[elements]
+        mesh=ROOT/'external/thermoviscous-bem/examples/meshes'/(name+'.mphtxt')
+        mesh_revision=REVISION
+        if elements==2794:
+            if args.mesh_2794:
+                mesh=args.mesh_2794;mesh_revision='user-supplied'
+            else:
+                mesh_revision='dcbc25949764493ca0dc78705782769bf74ac623'
+                mesh=args.output/(name+'.mphtxt')
+                data=subprocess.check_output(['git','-C',str(ROOT/'external/thermoviscous-bem'),'show',
+                                              mesh_revision+':examples/meshes/'+name+'.mphtxt'])
+                mesh.write_bytes(data)
+        vertices,triangles=load_mesh(mesh)
+        if len(triangles)!=elements: raise ValueError('Mesh element count does not match the paper case')
+        for frequency in args.frequencies:
+            expected=translation_pressure(vertices,frequency)
+            for method in args.methods:
+                record={'elements':elements,'nodes':len(vertices),'frequency':frequency,'method':method,'mesh_revision':mesh_revision,'mesh_sha256':hashlib.sha256(mesh.read_bytes()).hexdigest(),'runs':[]}
+                dimension={'direct1':1,'direct4':4,'direct10':10}.get(method)
+                if dimension and 16*len(vertices)**2*(2*dimension**2+20)>args.direct_memory_gib*1024**3:
+                    record['status']='exceeds_explicit_memory_budget';report['cases'].append(record);save();continue
+                directory=args.output/f'{elements}-{frequency:g}-{method}';directory.mkdir(exist_ok=True)
+                scene={'vertices':vertices.tolist(),'triangles':triangles.tolist(),'frequency':frequency,'velocity':[0,0,.01],
+                       'quadrature':3,'loss_neighborhood':'incident','method':method,'acoustic_backend':args.backend,'direct_memory_gib':args.direct_memory_gib}
+                for repeat in range(args.repetitions):
+                    values=run(scene,directory,output=f'{repeat}.json')
+                    error=relative(complex_values(values['acoustic_pressure']),expected)
+                    if error>.1 or values['relative_residual']>1e-6: raise AssertionError('Failed paper solve')
+                    record['runs'].append({key:values[key] for key in ['assembly_seconds','pressure_seconds','recovery_seconds','solve_seconds','relative_residual','iterations','acoustic_bytes']})
+                    record['runs'][-1]['analytic_relative_error']=error
+                record['status']='completed';report['cases'].append(record);save()
+    print(args.output/'report.json')
+
+
+if __name__=='__main__': main()

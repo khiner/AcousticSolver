@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Solve a harmonic sphere/cavity and write a two-second steady-state listening sample."""
+import argparse
+import json
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+
+from thermoviscous.common import ROOT, run
+from thermoviscous.mesh import sphere
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',type=Path,default=ROOT/'build/thermoviscous-demo')
+    parser.add_argument('--frequency',type=float,default=1000)
+    parser.add_argument('--seconds',type=float,default=2)
+    parser.add_argument('--interior',action='store_true',help='Radially driven spherical cavity instead of translating sphere')
+    args = parser.parse_args()
+    if not np.isfinite(args.seconds) or args.seconds<=0 or not 0<args.frequency<24000:
+        raise ValueError('Duration must be positive and frequency must lie between 0 and 24000 Hz')
+    vertices,triangles = sphere(2,.01)
+    scene = {'vertices':vertices.tolist(),'triangles':triangles.tolist(),'frequency':args.frequency,'exterior':not args.interior,
+             'velocity':[0,0,.01],'receivers':[[0,0,.005 if args.interior else .02]]}
+    if args.interior:
+        scene['nodal_velocity'] = vertices.tolist() # radius 0.01 m, radial speed 0.01 m/s
+    report = run(scene,args.output)
+    re,im = report['receiver_pressure'][0]
+    t = np.arange(round(args.seconds*48000))/48000
+    pressure = re*np.cos(2*np.pi*args.frequency*t)+im*np.sin(2*np.pi*args.frequency*t)
+    # Apply a listening fade; this is not a simulated turn-on transient.
+    fade = min(round(.02*48000),len(t)//2)
+    if fade:
+        ramp = np.sin(np.linspace(0,np.pi/2,fade))**2
+        pressure[:fade]*=ramp;pressure[-fade:]*=ramp[::-1]
+    gain = .95/max(float(np.max(np.abs(pressure))),1e-300)
+    sf.write(args.output/'steady.wav',gain*pressure,48000,subtype='PCM_24')
+    (args.output/'audio.json').write_text(json.dumps({'seconds':args.seconds,'gain':gain,'pressure_peak_pa':float(np.hypot(re,im)),
+        'description':'Normalized steady-state harmonic pressure with a 20 ms listening fade; no turn-on transient'},indent=2)+'\n')
+    print((args.output/'steady.wav').resolve())
+
+
+if __name__ == '__main__':
+    main()

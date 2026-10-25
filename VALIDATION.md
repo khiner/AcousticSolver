@@ -282,3 +282,13 @@ Match inputs, discretization, clocks and output precision; retain report hashes.
 For timing, record hardware, warmup, repeated runs, competing load and excluded
 setup/output work. Runtime Metal shaders come from the source checkout recorded
 at build time: separate binaries from one checkout share that shader source.
+
+## Thermoviscous boundary elements
+
+`script/ValidateThermoviscous` compares native quadratic boundary operators and all recovered fields with the pinned Julia implementation's direct coupled solve at 100 and 1000 Hz. The harness explicitly corrects upstream free-term and interior-normal conventions. Independent mesh-refinement checks cover the paper's translating sphere and analytical radial interior/exterior thermoviscous solutions, plus complex excitation and silence. A disconnected narrow-gap case checks quadrature convergence and agreement with a direct coupled solve.
+
+The extension checks cover all four solve formulations, FMM/H-matrix agreement on both fluid sides, compressed operator probes, and mesh refinement for linear/quadratic quads and discontinuous triangle/quad fields. A delayed band-limited pulse checks Fourier sign and linear convolution. `--analytic-only` omits Julia; `--extensions-only` runs just the added paths. Reports go to `build/thermoviscous-validation/`.
+
+`script/BenchmarkThermoviscous` covers all seven sphere meshes at 100/1000 Hz, recovering the deleted 2,794-element mesh from upstream history. Use `--methods iterative direct1 direct4 direct10 --repetitions 20` for the paper's comparison protocol; direct cases over the explicit memory budget are recorded as skipped. Local timings use different hardware and report their timing scope.
+
+Broadband rendering checks impulse guard energy and reports frequency spacing, but users must refine the FFT grid to resolve narrow resonances and long cavity decay. Neither a small algebraic residual nor a passing guard qualifies arbitrary geometry or broadband accuracy. See [solver conventions and limits](src/Thermoviscous/README.md).

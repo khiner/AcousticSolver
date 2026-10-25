@@ -19,3 +19,12 @@
 [submodule "external/e3dss"]
 	path = external/e3dss
 	url = https://github.com/Zetison/e3Dss.git
+[submodule "external/thermoviscous-bem"]
+	path = external/thermoviscous-bem
+	url = https://github.com/mipals/BoundaryIntegralEquations.jl.git
+[submodule "external/fmm3d"]
+	path = external/fmm3d
+	url = https://github.com/flatironinstitute/FMM3D.git
+[submodule "external/hmatrices"]
+	path = external/hmatrices
+	url = https://github.com/IntegralEquations/HMatrices.jl.git

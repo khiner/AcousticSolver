@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Check thermoviscous operators against Julia and solutions against spherical acoustics."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import numpy as np
+from scipy.linalg import solve, block_diag
+
+from thermoviscous.common import ROOT, REVISION, PAPER, EXECUTABLE, executable_hash, run, complex_values
+from thermoviscous.mesh import sphere
+from thermoviscous.analytic import constants, translation_pressure, radial_pressure, relative
+from thermoviscous.extensions import validate as extensions
+
+
+def matrices(directory, shapes):
+    return {k:np.fromfile(directory/(k+'.bin'),'<c16').reshape((s['rows'],s['cols']),order='F') for k,s in shapes.items()}
+
+
+def reference(out, julia):
+    revision = subprocess.check_output(['git','-C',str(ROOT/'external/thermoviscous-bem'),'rev-parse','HEAD'],text=True).strip()
+    if revision != REVISION:
+        raise RuntimeError(f'Unexpected upstream revision {revision}')
+    environment = out/'env'
+    environment.mkdir(parents=True,exist_ok=True)
+    env = dict(os.environ,JULIA_NUM_THREADS='2',JULIA_NUM_PRECOMPILE_TASKS='2',OPENBLAS_NUM_THREADS='1')
+    if not (environment/'Manifest.toml').exists():
+        subprocess.run([julia,f'--project={environment}','-e',
+            'using Pkg; Pkg.develop(path="external/thermoviscous-bem"); Pkg.add("JSON"); Pkg.precompile()'],cwd=ROOT,env=env,check=True)
+    results = []
+    for f in (100,1000):
+        directory = out/f'reference-{f}'
+        subprocess.run([julia,f'--project={environment}',str(ROOT/'script/thermoviscous/reference.jl'),str(directory),'sphere_1m_extremely_coarse',str(f)],cwd=ROOT,env=env,check=True)
+        scene = json.loads((directory/'scene.json').read_text())
+        scene.update(tolerance=1e-10,inner_tolerance=1e-12,restart=120)
+        native = out/f'native-{f}'
+        r = run(scene,native,export='operators')
+        ref = matrices(directory,json.loads((directory/'operators.json').read_text()))
+        actual = matrices(native,r['operators'])
+        errors = {name:relative(value,ref[name]) for name,value in actual.items()}
+        for name,value in errors.items():
+            assert value < 3e-8, (name,value)
+        n = r['nodes']
+        fields = ref['fields'][:,0]
+        field_errors = {}
+        for name,begin,size in [('acoustic_pressure',0,1),('acoustic_derivative',1,1),('thermal_pressure',2,1),('thermal_derivative',3,1),('viscous_velocity',4,3),('viscous_derivative',7,3)]:
+            field_errors[name] = relative(complex_values(r[name]),fields[begin*n:(begin+size)*n])
+            assert field_errors[name] < 2e-5,(name,field_errors[name])
+        assert r['relative_residual'] < 1e-10
+        results.append({'frequency':f,'operators':errors,'fields':field_errors})
+    return results
+
+
+def analytic(out):
+    results = []
+    for kind in ('translation','exterior_radial','interior_radial'):
+        errors = []
+        for level in (1,2,3):
+            radius = 1 if kind=='translation' else .01
+            frequency = 100 if kind=='translation' else 1000
+            exterior = kind!='interior_radial'
+            v,t = sphere(level,radius)
+            receivers = np.array([[0,0,radius*(2 if exterior else .5)]])
+            scene = {'vertices':v.tolist(),'triangles':t.tolist(),'frequency':frequency,'exterior':exterior,
+                     'quadrature':6,'velocity':[0,0,.01],'tolerance':1e-9,'inner_tolerance':1e-12,'receivers':receivers.tolist()}
+            if kind!='translation':
+                scene['nodal_velocity'] = (.01*v/np.linalg.norm(v,axis=1)[:,None]).tolist()
+            directory = out/f'{kind}-{level}'
+            r = run(scene,directory)
+            if kind=='translation':
+                expected = translation_pressure(v,frequency)
+                receiver = translation_pressure(receivers,frequency)
+            else:
+                pa, receiver = radial_pressure(receivers,frequency,radius,exterior)
+                expected = np.full(len(v),pa)
+            error = relative(complex_values(r['acoustic_pressure']),expected)
+            receiver_error = relative(complex_values(r['receiver_pressure']),receiver)
+            errors.append(error)
+            results.append({'case':kind,'nodes':len(v),'surface_error':error,'receiver_error':receiver_error})
+            assert error < .1 and receiver_error < .06,(kind,level,error,receiver_error)
+            if level==3:
+                assert error < .003 and receiver_error < .003,(kind,error,receiver_error)
+            if kind=='interior_radial' and level==1:
+                # Complex excitation and silence exercise linearity and the exact zero RHS path.
+                phased = json.loads(json.dumps(scene))
+                phased['nodal_velocity'] = [[[0,x] for x in row] for row in scene['nodal_velocity']]
+                rotation = run(phased,out/'phase')
+                assert relative(complex_values(rotation['acoustic_pressure']),1j*complex_values(r['acoustic_pressure'])) < 1e-7
+                phased['nodal_velocity'] = np.zeros_like(v).tolist()
+                silent = run(phased,out/'silence')
+                assert np.count_nonzero(complex_values(silent['acoustic_pressure'])) == 0
+        assert errors[2] < errors[1] < errors[0],(kind,errors)
+    return results
+
+
+def gap(out):
+    vertices,triangles = sphere(1,.001)
+    half = len(vertices)
+    vertices = np.vstack((vertices+[-.00101,0,0],vertices+[.00101,0,0]))
+    triangles = np.vstack((triangles,triangles+half))
+    velocity = np.zeros_like(vertices)
+    velocity[:half,0],velocity[half:,0] = .01,-.01
+    scene = {'vertices':vertices.tolist(),'triangles':triangles.tolist(),'nodal_velocity':velocity.tolist(),
+             'frequency':1000,'tolerance':1e-9,'inner_tolerance':1e-12,'receivers':[[0,0,0]]}
+    captures = []
+    for order in (16,32):
+        scene['quadrature'] = order
+        captures.append(run(scene,out/f'gap-{order}',export='operators' if order==32 else None))
+    r = captures[-1]
+    refinement = relative(complex_values(captures[0]['acoustic_pressure']),complex_values(r['acoustic_pressure']))
+    assert refinement < 3e-4, refinement
+    m = matrices(out/'gap-32',r['operators'])
+    n = len(vertices)
+    _,_,_,_,_,_,ratio,phia,phih = constants(scene['frequency'])
+    dc,nd = m['Dc'],m['Nd']
+    dr = np.hstack([dc[axis*n:(axis+1)*n] for axis in range(3)])
+    f = np.zeros((10*n,10*n),complex)
+    f[:n,:n],f[:n,n:2*n] = m['Ha'],m['Ga']
+    f[n:2*n,2*n:3*n],f[n:2*n,3*n:4*n] = m['Hh'],m['Gh']
+    f[2*n:5*n,4*n:7*n],f[2*n:5*n,7*n:] = block_diag(*([m['Hv']]*3)),block_diag(*([m['Gv']]*3))
+    f[5*n:6*n,4*n:7*n],f[5*n:6*n,7*n:] = dr,nd.T
+    f[6*n:7*n,:n],f[6*n:7*n,2*n:3*n] = ratio*np.eye(n),np.eye(n)
+    f[7*n:,:n],f[7*n:,n:2*n] = phia*dc,phia*nd
+    f[7*n:,2*n:3*n],f[7*n:,3*n:4*n] = phih*dc,phih*nd
+    f[7*n:,4*n:7*n] = np.eye(3*n)
+    full = solve(f,np.r_[np.zeros(7*n),velocity.T.ravel()])
+    error = relative(complex_values(r['acoustic_pressure']),full[:n])
+    assert error < 1e-7, error
+    assert np.linalg.norm(m['Gv'][:half,half:]) > .01*np.linalg.norm(m['Gv'])
+    for invalid in (dict(scene,frequency=0),dict(scene,triangles=triangles[:-1].tolist())):
+        config = out/'invalid.json'
+        config.write_text(json.dumps(invalid))
+        proc = subprocess.run([str(EXECUTABLE),str(config),str(out/'invalid-result.json')],capture_output=True,text=True)
+        assert proc.returncode != 0 and 'ThermoviscousSolve:' in proc.stderr
+    return {'quadrature_relative_change':refinement,'full_system_relative_error':error}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',type=Path,default=ROOT/'build/thermoviscous-validation')
+    parser.add_argument('--julia',default=shutil.which('julia') or '/Applications/Julia-1.8.app/Contents/Resources/julia/bin/julia')
+    parser.add_argument('--extensions-only',action='store_true')
+    parser.add_argument('--analytic-only',action='store_true',help='Run without the independent Julia comparison')
+    args = parser.parse_args()
+    out = args.output.resolve()
+    out.mkdir(parents=True,exist_ok=True)
+    report = {'paper':PAPER,'upstream_revision':REVISION,
+              'reference_corrections':['Free term follows the interior constant Laplace identity','Interior gradient normal points into the fluid'],
+              'executable_sha256':executable_hash()}
+    def save(): (out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+    if not args.extensions_only:
+        if not args.analytic_only:
+            report['reference'] = reference(out,args.julia);save()
+        report['analytic'] = analytic(out);save()
+        report['gap'] = gap(out);save()
+    report['extensions']=extensions(out/'extensions')
+    (out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report,indent=2))
+
+
+if __name__ == '__main__':
+    main()

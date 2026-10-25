@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Sweep a thermoviscous model and convolve real excitation with receiver impulse responses."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import numpy as np
+from scipy.signal import fftconvolve, resample_poly
+import soundfile as sf
+
+from thermoviscous.common import ROOT, executable_hash, run, complex_values
+
+
+def synthesize(frequencies, response, sample_rate, fft_size):
+    if len(frequencies)!=fft_size//2+1 or not np.allclose(frequencies,np.fft.rfftfreq(fft_size,1/sample_rate)):
+        raise ValueError('Transfer samples must cover the complete FFT frequency grid')
+    # The solver uses exp(-i omega t); NumPy's inverse FFT uses exp(+i omega t).
+    # Differentiate the transfer to displacement to remove the closed-cavity 1/omega pole.
+    spectrum=np.conjugate((-2j*np.pi*frequencies[:,None])*response)
+    spectrum*=np.exp(-2j*np.pi*frequencies*(fft_size//4)/sample_rate)[:,None]
+    spectrum[0]=0
+    if fft_size%2==0: spectrum[-1]=spectrum[-1].real
+    return np.fft.irfft(spectrum,n=fft_size,axis=0)
+
+
+def convolve(excitation,impulse,sample_rate,fft_size):
+    excitation=excitation-np.mean(excitation)
+    size=1 << (len(excitation)+fft_size-2).bit_length()
+    omega=2*np.pi*np.fft.rfftfreq(size,1/sample_rate)
+    spectrum=np.fft.rfft(excitation,n=size)
+    spectrum[0]=0
+    spectrum[1:]/=1j*omega[1:]
+    displacement=np.fft.irfft(spectrum,n=size)
+    displacement-=displacement[0]
+    delay=fft_size//4
+    return np.column_stack([fftconvolve(displacement,impulse[:,ch])[delay:delay+len(excitation)+fft_size-1] for ch in range(impulse.shape[1])])
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('scene',type=Path)
+    parser.add_argument('--output',type=Path,default=ROOT/'build/thermoviscous-broadband')
+    parser.add_argument('--input',type=Path,help='Mono WAV; samples multiply the configured spatial wall-velocity pattern')
+    parser.add_argument('--sample-rate',type=int,default=8000)
+    parser.add_argument('--fft-size',type=int,default=512,help='Impulse-response period in samples; increase to check wraparound')
+    parser.add_argument('--seconds',type=float,default=2,help='Generated pulse excitation length when --input is omitted')
+    parser.add_argument('--max-frequency',type=float,help='Band limit with a cosine transition over the top 10%%; default 90%% of Nyquist')
+    parser.add_argument('--tail-tolerance',type=float,default=1e-3,help='Maximum energy fraction in the impulse response guard intervals')
+    args=parser.parse_args()
+    if args.fft_size<16 or args.fft_size%2 or args.sample_rate<100 or args.seconds<=0 or not 0<args.tail_tolerance<1:
+        raise ValueError('Invalid FFT, sample rate, duration or tail tolerance')
+    scene=json.loads(args.scene.read_text())
+    if not scene.get('receivers'): raise ValueError('The scene needs at least one receiver')
+    maximum=args.max_frequency or .45*args.sample_rate
+    if not 0<maximum<args.sample_rate/2: raise ValueError('max-frequency must be below Nyquist')
+    args.output.mkdir(parents=True,exist_ok=True)
+    version=executable_hash()
+    frequencies=np.fft.rfftfreq(args.fft_size,1/args.sample_rate)
+    response=np.zeros((len(frequencies),len(scene['receivers'])),complex)
+    solved=0
+    for i,f in enumerate(frequencies):
+        if f==0 or f>=maximum: continue
+        config=dict(scene,frequency=float(f))
+        digest=hashlib.sha256((version+json.dumps(config,sort_keys=True)).encode()).hexdigest()
+        directory=args.output/'sweep'/digest
+        result=directory/'result.json'
+        values=json.loads(result.read_text()) if result.exists() else run(config,directory,quiet=True)
+        response[i]=complex_values(values['receiver_pressure'])
+        solved+=1
+        if solved%32==0: print(f'{solved} frequencies complete; {f:g} Hz',flush=True)
+    band=.5*(1+np.cos(np.pi*np.clip((frequencies-.9*maximum)/(.1*maximum),0,1)))
+    response*=band[:,None]
+    impulse=synthesize(frequencies,response,args.sample_rate,args.fft_size)
+    energy=np.sum(impulse**2,axis=0)
+    tail=(np.sum(impulse[:args.fft_size//8]**2,axis=0)+np.sum(impulse[7*args.fft_size//8:]**2,axis=0))/np.maximum(energy,1e-300)
+    np.savez(args.output/'transfer.npz',frequencies=frequencies,pressure=response,impulse=impulse,sample_rate=args.sample_rate)
+    report={'executable_sha256':version,'frequency_count':solved,'frequency_spacing':args.sample_rate/args.fft_size,
+            'sample_rate':args.sample_rate,'fft_size':args.fft_size,'maximum_frequency':maximum,'tail_energy_fraction':tail.tolist(),
+            'dc':'Zero: acoustic AC response only; static offsets are excluded','wall_velocity':'Input samples multiply scene velocity in m/s',
+            'time_convention':'Solver exp(-i omega t); transfer conjugated for inverse FFT',
+            'impulse_input':'Wall displacement multiplier; velocity excitation is spectrally integrated before convolution',
+            'removed_delay_samples':args.fft_size//4}
+    if np.max(tail)>args.tail_tolerance:
+        (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+        raise RuntimeError(f'Impulse tail fraction {np.max(tail):.3g} exceeds {args.tail_tolerance:g}; increase --fft-size and check convergence')
+    if args.input:
+        excitation,rate=sf.read(args.input)
+        if excitation.ndim!=1: raise ValueError('Input excitation must be mono')
+        if rate!=args.sample_rate:
+            import math
+            divisor=math.gcd(rate,args.sample_rate)
+            excitation=resample_poly(excitation,args.sample_rate//divisor,rate//divisor)
+    else:
+        t=np.arange(round(args.seconds*args.sample_rate))/args.sample_rate
+        z=(t-.02)*maximum/4
+        excitation=(1-2*z*z)*np.exp(-z*z)
+    audio=convolve(excitation,impulse,args.sample_rate,args.fft_size)
+    np.save(args.output/'pressure.npy',audio)
+    peak=float(np.max(np.abs(audio)))
+    gain=.95/peak if peak else 1
+    sf.write(args.output/'render.wav',audio*gain,args.sample_rate,subtype='PCM_24')
+    report.update(audio_seconds=len(audio)/args.sample_rate,wav_gain=gain,pressure_peak_pa=peak)
+    (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+    print((args.output/'render.wav').resolve())
+
+
+if __name__=='__main__': main()

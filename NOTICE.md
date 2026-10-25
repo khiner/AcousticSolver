@@ -18,6 +18,7 @@ upstream-identical. Files under `src/` not listed here are original to this proj
 | `String/*` | [nLinStringsConv-SAV](https://github.com/Nemus-Project/nLinStringsConv-SAV) |
 | `Coupled/*` | [NESS](https://github.com/Edinburgh-Acoustics-and-Audio-Group/ness) |
 | `Tube/*` | [OpenWind](https://gitlab.inria.fr/openwind/openwind) |
+| `Thermoviscous/*` | [BoundaryIntegralEquations.jl](https://github.com/mipals/BoundaryIntegralEquations.jl) |
 
 ### WaveBlender and FluidSound
 
@@ -205,3 +206,67 @@ The native solver does not link to these reference programs:
   `external/e3dss/LICENSE`. It provides the independent elastic-sphere scattering
   solution. The Octave harness supplies pool-query and field-name compatibility
   helpers without changing its numerical functions.
+
+## BoundaryIntegralEquations.jl
+
+Thermoviscous formulation, surface derivatives and quadrature ported from revision
+`938ee0630a7a6516c15dea33998472bdbdcbbfc0`, pinned in `external/thermoviscous-bem`.
+
+MIT License
+
+Copyright (c) 2022 Mikkel Paltorp Schmitt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## FMM3D
+
+The thermoviscous acoustic operators link [FMM3D](https://github.com/flatironinstitute/FMM3D),
+pinned at `cad293ae9b8ae1218dd8319d459ffcc5f1412875` in `external/fmm3d`.
+Copyright (C) 2019–2023 The Simons Foundation, Inc., FMM3D Development Team.
+Licensed under Apache-2.0. The license, author list and bundled-file notices are
+retained in `external/fmm3d/LICENSE`, `AUTHORS`, and the named source files.
+
+## HMatrices.jl
+
+Geometric clustering and partial adaptive cross approximation in
+`src/Thermoviscous/Acoustic.cpp` follow [HMatrices.jl](https://github.com/IntegralEquations/HMatrices.jl),
+v0.2.13, revision `54ba3561a617c4eba1f11c0751baa157fa3adcc7`,
+pinned in `external/hmatrices`. This reference package is not linked at runtime.
+
+MIT License
+
+Copyright (c) 2021 Luiz M. Faria <maltezfaria@gmail.com> and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

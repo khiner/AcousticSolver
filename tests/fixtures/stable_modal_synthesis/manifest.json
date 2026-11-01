@@ -1,0 +1,65 @@
+{
+  "author_repository": "https://github.com/victorzheleznov/jaes-modal-node",
+  "author_commit": "68017c953319636b7b69018d8e406f17e18cf0de",
+  "capture_date": "2026-10-27",
+  "dtype": "float64",
+  "fixtures": {
+    "initial.pt.gz": {
+      "sha256": "7c1fd48d04fea448f8a456c2ece82d1a0001607f96671b73c47c003725c6c354",
+      "bytes": 7121488,
+      "steps": 2,
+      "first_optimizer_step": 1,
+      "last_optimizer_step": 2,
+      "frames": 88,
+      "windows": [
+        0,
+        1,
+        20,
+        1000
+      ],
+      "full_capture": {
+        "sha256": "653042ea2f4dcf4d64c481650f42736d168aaca2c681ba8300a0c59501697595",
+        "steps": 4
+      },
+      "device": "NVIDIA GeForce RTX 4090"
+    },
+    "restored.pt.gz": {
+      "sha256": "b9c638d0d98bfa853d9e4d8c23de966ff32cf8e90356d6b932b68a98e505feef",
+      "bytes": 10080733,
+      "steps": 2,
+      "first_optimizer_step": 6136,
+      "last_optimizer_step": 6137,
+      "frames": 88,
+      "windows": [
+        0,
+        1,
+        20,
+        1000
+      ],
+      "full_capture": {
+        "sha256": "c752644ae49136cff45e16e86c8f00f580d15532cdb61c0060358bbc8062de00",
+        "steps": 8
+      },
+      "device": "NVIDIA GeForce RTX 4090"
+    },
+    "release-96k.pt.gz": {
+      "sha256": "93a512269bfe09ecc85efd740a8f5849d30a78ce33dd62a5083e99255f78834e",
+      "bytes": 4977274,
+      "steps": 1,
+      "first_optimizer_step": 1,
+      "last_optimizer_step": 1,
+      "frames": 96,
+      "windows": [
+        0,
+        1,
+        20,
+        1000
+      ],
+      "full_capture": {
+        "sha256": "0436677867e51b74a96e36d69c08c9c3d2d54bf04d9ce839b36128f9c0f642fe",
+        "steps": 4
+      },
+      "device": "NVIDIA GeForce RTX 4090"
+    }
+  }
+}

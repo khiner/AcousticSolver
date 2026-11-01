@@ -1,6 +1,6 @@
 # AcousticSolver
 
-Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
+Offline acoustic solvers and differentiable physical-model paper ports for Apple Silicon, using C++, Metal, Accelerate, MLX, and PyTorch.
 
 | Solver | Use | Scope |
 | --- | --- | --- |
@@ -20,6 +20,9 @@ Offline acoustic solvers for Apple Silicon, implemented in C++ and Metal.
 | [Thermoviscous boundary elements](src/Thermoviscous/README.md) | Small cavities, gaps and viscous sound radiation | 3D harmonic acoustic, thermal and viscous modes; prescribed isothermal no-slip walls |
 | [NumCalc](https://doi.org/10.1016/j.enganabound.2024.01.008) | Scattering, enclosures and prescribed-wall radiation | Interior/exterior BEM, Burton–Miller stabilization, admittance boundaries and multilevel FMM |
 | [Acoustic Reliefs](script/reliefs/README.md) | Acoustic heightfield optimization | Differentiable boundary elements with an appearance objective |
+| [DiffImpact](script/diffimpact/README.md) | Joint contact/body fitting, source separation and audio-encoder training | Modal impact model, MLX/Metal execution; curated ASMR data is an adaptation |
+| [DiffSound](script/diffsound/README.md) | Material, thickness and shape inference, material transfer and impact localization | Differentiable FEM and modal synthesis; CPU float64 physics and MPS audio/neural execution |
+| [Stable Modal Synthesis](script/stable_modal_synthesis/README.md) | Learn stable nonlinear modal coupling | Synthetic string state supervision; Accelerate float64 training and Metal spectral generation |
 
 See [validation](VALIDATION.md) for checks and numerical limits, and [third-party notices](NOTICE.md) for licensing and reference-code provenance.
 
@@ -36,6 +39,8 @@ PATH="$(brew --prefix llvm)/bin:$PATH" script/Build
 `script/Build --debug` selects a debug build. Python scoring and WAV tools require NumPy, SciPy and SoundFile. Plate and other reference wrappers manage their own isolated Python environments; [Acoustic Reliefs](script/reliefs/README.md) has separate dependencies.
 
 Commands below start at the repository root unless indicated otherwise. Run the WaveBlender, SonicRadiation and room examples from `build/` as shown; their dataset paths or output directories are relative to the working directory.
+
+DiffImpact, DiffSound, and Stable Modal Synthesis use Python packages under `script/`, with independent environments documented in their READMEs. Stable Modal Synthesis's native code lives under `src/StableModal/`. Reference fixtures live under `tests/fixtures/`, archived inputs and retained local runs under `data/`, and disposable validation outputs under `build/`. Component READMEs describe usage and model scope; [validation](VALIDATION.md#differentiable-physical-model-ports) records numerical coverage and reproduction limits.
 
 ## WaveBlender
 

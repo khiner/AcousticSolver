@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Validate Stable Modal training and rendering against retained fixtures."""
+
+from python_env import run_module
+
+run_module(
+    "stable-modal-env", "script/stable_modal_synthesis/requirements.txt", "script.stable_modal_synthesis.training_check"
+)

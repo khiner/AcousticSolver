@@ -9,6 +9,69 @@ Where supported, `--score` checks existing captures and `--exact` requires ident
 bytes. The Radiation, Room and Immersed validators' `--update` options replace
 committed references and are not ordinary validation runs.
 
+## Differentiable physical-model ports
+
+The validation commands select isolated Python environments and install missing pinned dependencies. They do not download author datasets or contact remote compute. Build the native targets with `script/Build` before validating Stable Modal Synthesis. Use `external/` submodules only for deliberate author-code comparisons; retained regression fixtures do not require them.
+
+### DiffImpact
+
+```sh
+script/ValidateDiffImpact
+```
+
+The [accepted local baseline](tests/fixtures/diffimpact/manifest.json) covers forward values and vector-Jacobian products for the DSP components, complete hammer/separation graphs, MFCCs, GRU, encoder/decoder and property networks. Independent encoder checks instantiate the actual released classes with identical weights. They also cover the complete audio-to-synthesis graph, every trainable parameter, spectral-loss gradients and three Adam updates including both moment tensors. These bounded comparisons use explicit ASMR wiring and the documented batch-index correction; float32 phase and spectral-loss sensitivity prevent a promise of identical cross-framework training trajectories. The property-network fixtures are local regression checks, not upstream equivalence checks. Routine checks use the accepted native fixture, plus analytic, batch-isolation, padding, split-isolation, source-assignment, stem-composition and checkpoint-continuation checks:
+
+
+The retained hammer and separation checkpoints cover completed native 10,000-step and 6,000-step schedules. These are adapted native fits, not author checkpoints. The original ASMR selection/settings, property-network checkpoints, external baseline training and human study remain unreproduced; curated ASMR recordings are explicitly an adaptation. See [model and usage](script/diffimpact/README.md).
+
+### DiffSound
+
+```sh
+script/ValidateDiffSound
+```
+
+Retained author-code fixtures cover synthesis and parameter gradients, recorded-audio damping controls, noise, spectral/transport objectives, both FEM orders, tetrahedral clipping, shell derivatives, the neural SDF and acoustic transfer. Additional checks cover finite-difference eigenvalue derivatives and exact interrupted/resumed optimization across the loss-stage reset. The author reference runs on CPU with documented dependency/device substitutions; it is not a CUDA comparison. Runtime fitting and validation require no remote machine.
+
+The fixtures are a fixed regression reference. `python -m script.diffsound.capture` can recapture them from the pinned author checkout when deliberately auditing source parity; it is not part of routine training or validation. End-to-end checks exercise the released tasks at bounded budgets. They do not establish convergence or agreement with every published table or figure.
+
+See [model and usage](script/diffsound/README.md).
+
+### Stable Modal Synthesis
+
+```sh
+script/ValidateStableModal --output build/stable-modal-training-check
+```
+
+The bundled captures establish independent CUDA agreement. Use `--golden path/to/accepted-local.pt.gz` for subsequent comparisons against an accepted local capture. Checks cover loss, states, gradients, Adam updates/moments, loss-only execution, streaming blocks, and explicit auxiliary-state preservation. The native target rebuild is also checked against the previous local implementation; numerical agreement does not establish a complete training reproduction.
+
+Completed reproduction checks:
+
+- Independent dense SAV solve, potential-gradient identity, a weight finite difference, and unforced undamped energy conservation.
+- All 140 CUDA-generated recordings match the released normalized target audio within relative L2 `5.43e-14`; all linear reference recordings match exactly. Dataset fingerprints are retained in `build/stable-modal-cuda/results/dataset-comparison.json`.
+- Released-checkpoint evaluation is complete for all 140 recordings. Normalized predictions match the published audio within relative L2 `1.39e-12`. All 12 Table 2 entries agree when the computed errors are truncated to two significant digits; the paper does not state its rounding convention. Full-precision metrics remain in the reports.
+- CUDA Graph capture produces exactly equal states and audio to eager inference for the checked short trajectories, including a batch of four training strings.
+- Native forward synthesis is checked against complete saved CUDA trajectories. Learned rendering shares the Accelerate training step and preserves states exactly across block sizes; the spectral generator uses Metal float-pair arithmetic.
+- All five comparison figures have been generated from the released checkpoint and full test partition. The worst-case recording is 40 and the strongest-nonlinearity recording is 6, matching the author notebook selections. Styling differs from the paper.
+
+Training ended after 409 completed epochs, with epoch 408 selected by validation loss. Final evaluation covers all 140 recordings and includes the five comparison figures. This is a shortened-training adaptation, not a reproduction of the full 2,000-epoch training experiment. Dataset regeneration and released-checkpoint evaluation are complete. Native training uses Accelerate float64 and supports full local dataset iteration, validation and checkpoint/resume; the full local training schedule has not been run.
+
+#### Shortened training
+
+Evaluation uses the checkpoint selected by validation loss at epoch 408 of the 409 completed epochs. The table reports the mean per-recording normalized squared error on the 60 test recordings; initial means the first 100 ms, and full means the complete three-second trajectory. The released column uses the full-precision results from our evaluation of the author checkpoint, avoiding ratios against rounded paper values.
+
+| Test metric | Shortened run | Released checkpoint | Error ratio |
+| --- | ---: | ---: | ---: |
+| Modal displacement, initial | 0.00191286 | 0.000279280 | 6.85 |
+| Waveform, initial | 0.00198884 | 0.000270907 | 7.34 |
+| Modal displacement, full | 0.134677 | 0.0697109 | 1.93 |
+| Waveform, full | 0.136552 | 0.0736534 | 1.85 |
+
+All reported train, validation, and test means are higher than the released-checkpoint errors. This run demonstrates training and evaluation execution, but does not match the paper's trained quality. The independent released-checkpoint reproduction remains successful. These results do not isolate the effect of training duration from the other documented execution adaptations.
+
+Artifacts are under `build/stable-modal-cuda/results/`: `training-stop.json` records the final decision, checkpoint epochs, optimizer steps, and hashes; `retrained-checkpoint/report.json` and `assessment.json` retain metrics and comparison details; `retrained-checkpoint/figures/` contains the five plots. `checkpoint_409.pt` and `checkpoint_best.pt` retain model and optimizer state. These generated files are ignored by Git.
+
+See [model, training protocol and execution adaptations](script/stable_modal_synthesis/README.md).
+
 ## WaveBlender
 
 ```sh

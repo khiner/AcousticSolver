@@ -1,0 +1,20 @@
+DiffSound: Differentiable Modal Sound Rendering and Inverse Rendering for Diverse Inference Tasks
+Xutong Jin, Chenxi Xu, Ruohan Gao, Jiajun Wu, Guoping Wang, and Sheng Li
+SIGGRAPH Conference Papers 2024
+https://doi.org/10.1145/3641519.3657493
+
+Reference implementation:
+https://github.com/TechnetiumMan/DiffSound
+Revision: 3a0be14b8bfa95dcbcd98f3c233e981c713d021b
+
+The port follows the released FEM, DDSP and DMTet algorithms. The clipping
+tables in tables.py are copied from src/dmtet/geometry/dmtet_geometry.py,
+with its NVIDIA copyright and proprietary-rights notice retained there.
+The pinned repository has no top-level license. This notice records
+provenance and does not grant additional rights to upstream material.
+
+Author assets and source are archived locally by fetch.py, outside Git.
+Reference fixtures are numerical outputs of the pinned author source with
+CPU device placement and the dependency substitutions recorded in their
+manifest. The port uses separately installed PyTorch, torchaudio, GeomLoss,
+NumPy, SciPy, meshio, Open3D and Bempp-cl under their respective licenses.

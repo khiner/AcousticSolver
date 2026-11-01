@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Validate DiffImpact against retained local results."""
+
+from python_env import run_module
+
+run_module("diffimpact-native-env", "script/diffimpact/requirements-native.txt", "script.diffimpact.verify")

@@ -1,6 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
-using R = StringReal;
+using R = FloatPair;
 
 inline R StringSum(R value, threadgroup R *shared, uint tid) {
     shared[tid] = value;
@@ -40,7 +40,7 @@ struct StringGeometry {
     R U, V, Potential;
 };
 inline StringGeometry StringGeometric(R q, R longitudinal, constant StringParams &p) {
-    R a = R(1) + longitudinal, radius = StringSqrt(a * a + q * q);
+    R a = R(1) + longitudinal, radius = FloatPairSqrt(a * a + q * q);
     // Rationalization retains small extensions near the unstretched state.
     R extension = (R(2) * longitudinal + longitudinal * longitudinal + q * q) / (radius + R(1));
     R coefficient = p.H * p.NonlinearModulus;
@@ -88,7 +88,7 @@ inline void StringReferenceStep(device const R *x, device const R *increment, de
             nextIncrement[i] = StringIncrement(x, increment, i, true, p) + p.InverseMass * p.Dt2 * p.InvH * force;
         }
     } else if (p.Model == 3) {
-        R factor = p.Nonlinear ? R(.5) * p.Dt * StringSqrt(p.H * p.EA / p.Length) : R(0);
+        R factor = p.Nonlinear ? R(.5) * p.Dt * FloatPairSqrt(p.H * p.EA / p.Length) : R(0);
         R dotPrevious{};
         for (uint i = tid; i < n; i += 256) {
             gradient[i] = factor * StringLap(x, int(i), p);
@@ -191,7 +191,7 @@ inline R StringReferencePotential(device const R *x, device const R *next, devic
         potential = potential + StringSum(linear, reduction, tid);
     }
     R shift = p.Model == 3 && p.Split ? R(0) : (p.Model <= 1 ? p.Shift : R(2) * p.Shift);
-    psi = StringSqrt(R(2) * potential + shift);
+    psi = FloatPairSqrt(R(2) * potential + shift);
     return nonlinear;
 }
 
@@ -243,7 +243,7 @@ kernel void StringAdvance(device R *state [[buffer(0)]], device R *scratch [[buf
             R potential = StringSum(potentialLocal, reduction, tid);
             if (p.Model == 3 && p.Nonlinear)
                 potential = potential + R(.125) * p.EA * p.H * p.H / p.Length * norm * norm;
-            R divisor = StringSqrt(R(2) * potential + (p.Model <= 1 ? p.Shift : R(2) * p.Shift));
+            R divisor = FloatPairSqrt(R(2) * potential + (p.Model <= 1 ? p.Shift : R(2) * p.Shift));
             threadgroup_barrier(mem_flags::mem_device);
             R dotPrevious{};
             for (uint i = tid; i < d; i += 256) {
@@ -257,7 +257,7 @@ kernel void StringAdvance(device R *state [[buffer(0)]], device R *scratch [[buf
                     if (i < n) g = g + p.H * p.Rigidity * StringBiharmonic(component, int(node), p);
                 }
                 if (p.Model == 3 && p.Split)
-                    g = p.Nonlinear ? -StringSqrt(p.EA * p.H * p.H / p.Length) * StringLap(x, int(node), p) : R(0);
+                    g = p.Nonlinear ? -FloatPairSqrt(p.EA * p.H * p.H / p.Length) * StringLap(x, int(node), p) : R(0);
                 else
                     g = divisor.Hi != 0 ? g / divisor : R(0);
                 gradient[i] = g;

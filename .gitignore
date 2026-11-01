@@ -3,3 +3,6 @@ build/
 Scenes
 /room/
 /gen/dg-*/
+/data/diffimpact/
+/data/diffsound/
+/data/stable_modal_synthesis/

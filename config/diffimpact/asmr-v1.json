@@ -1,0 +1,92 @@
+{
+  "name": "Curated ASMR tapping v1",
+  "rate": 44100,
+  "samples": 132300,
+  "guard_seconds": 3,
+  "split_seconds": {
+    "train": [
+      0,
+      240
+    ],
+    "validation": [
+      243,
+      273
+    ],
+    "test": [
+      276,
+      306
+    ]
+  },
+  "sources": [
+    {
+      "id": "sIgkTYTWPz8",
+      "url": "https://www.youtube.com/watch?v=sIgkTYTWPz8",
+      "creator": "ASMR Bakery",
+      "title": "ASMR Addictive Tapping 1 Hr (No Talking)",
+      "upload_date": "20190403",
+      "sha256": "10f1e4ecebe333191893696114017acdec8894414a7d1ddd8692d0b9f2ff01db",
+      "formats": [
+        "136",
+        "140"
+      ],
+      "video": "1280x720 H264",
+      "audio": "stereo 44100 Hz AAC",
+      "file_bytes": 162991086
+    },
+    {
+      "id": "FPnfzPozRW4",
+      "url": "https://www.youtube.com/watch?v=FPnfzPozRW4",
+      "creator": "ASMR Bakery",
+      "title": "ASMR Sleepy Slow Tapping | Metal Sounds (No Talking)",
+      "upload_date": "20190317",
+      "sha256": "8187d85756f3f0ae79b11bcaf1acf2070ed08237cf371bfb319c632e84b02b08",
+      "formats": [
+        "136",
+        "140"
+      ],
+      "video": "1280x720 H264",
+      "audio": "stereo 44100 Hz AAC",
+      "file_bytes": 115385372
+    }
+  ],
+  "objects": [
+    {
+      "name": "glass-bowl",
+      "source": "sIgkTYTWPz8",
+      "start_seconds": 581,
+      "role": "rigid-body target"
+    },
+    {
+      "name": "ceramic-plate",
+      "source": "sIgkTYTWPz8",
+      "start_seconds": 1865,
+      "role": "rigid-body target"
+    },
+    {
+      "name": "wooden-box",
+      "source": "sIgkTYTWPz8",
+      "start_seconds": 2276,
+      "role": "rigid-body target"
+    },
+    {
+      "name": "silicone-coaster",
+      "source": "sIgkTYTWPz8",
+      "start_seconds": 3178,
+      "role": "deformable comparison"
+    },
+    {
+      "name": "metal-spoon",
+      "source": "FPnfzPozRW4",
+      "start_seconds": 59,
+      "role": "rigid-body target"
+    }
+  ],
+  "adaptations": [
+    "Independently curated source intervals and 80/10/10 within-recording split, not recovered author selections",
+    "Three-second guard gaps and non-overlapping three-second clips; held-out sequences share the recording session",
+    "Metal spoon replaces the paper steel bar; material names are source descriptions, not measured physical properties",
+    "Audio is decoded from public AAC streams; left channel is used for fitting and original stereo/video is retained",
+    "No force, geometry or calibrated stiffness labels; video frames are retained but not model inputs"
+  ],
+  "quality_review": "Chapter descriptions and five sampled video frames per selected interval checked for object continuity; no per-impact annotations or cross-session generalization claim"
+}

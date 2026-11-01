@@ -9,25 +9,25 @@
 namespace stiffstring {
 namespace {
 std::string ReadShader(const char *name) {
-    std::ifstream input(std::string(ACOUSTIC_STRING_MSL_DIR) + "/" + name);
+    std::ifstream input(std::string(ACOUSTIC_PROJECT_ROOT) + "/src/" + name);
     if (!input) throw std::runtime_error(std::string("Cannot read string shader: ") + name);
     return {std::istreambuf_iterator<char>(input), {}};
 }
-StringReal Pack(double value) {
+FloatPair Pack(double value) {
     const float hi = float(value);
-    StringReal packed{hi, float(value - double(hi))};
+    FloatPair packed{hi, float(value - double(hi))};
     if (!std::isfinite(value) || !std::isfinite(packed.Hi) || (value && packed.Hi == 0))
         throw std::invalid_argument("String value exceeds Metal float-pair range");
     return packed;
 }
-double Read(StringReal value) {
+double Read(FloatPair value) {
     double const result = double(value.Hi) + value.Lo;
     if (!std::isfinite(result)) throw std::runtime_error("String Metal output became nonfinite");
     return result;
 }
 void Download(std::vector<double> &output, const GpuBuffer &buffer, size_t count) {
     output.resize(count);
-    const auto *data = buffer.As<StringReal>();
+    const auto *data = buffer.As<FloatPair>();
     std::transform(data, data + count, output.begin(), Read);
 }
 } // namespace
@@ -42,7 +42,7 @@ Gpu::Gpu(const Prepared &p) : Tables(p) {
     };
     auto const options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
     options->setFastMathEnabled(false);
-    std::string const source = ReadShader("StringReal.h") + "\n" + ReadShader("StringParams.h") + "\n" + ReadShader("StringKernels.metal");
+    std::string const source = ReadShader("Metal/FloatPair.h") + "\n" + ReadShader("String/StringParams.h") + "\n" + ReadShader("String/StringKernels.metal");
     NS::Error *error{};
     auto const library = NS::TransferPtr(MetalContext::Get().Device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options.get(), &error));
     if (!library) throw std::runtime_error(error ? error->localizedDescription()->utf8String() : "String shader compilation failed");
@@ -53,11 +53,11 @@ Gpu::Gpu(const Prepared &p) : Tables(p) {
     if (Pipeline->maxTotalThreadsPerThreadgroup() < 256)
         throw std::runtime_error("String Metal requires 256-thread groups");
     const size_t dimension = p.Points * p.Components;
-    StateBuffer.Resize(5 * dimension * sizeof(StringReal));
+    StateBuffer.Resize(5 * dimension * sizeof(FloatPair));
     const size_t tridiagonal = Params.Reference && p.Settings.Equation == Model::Cubic ? 8 * p.Points : 0;
-    Scratch.Resize((2 * (p.Points + 1) + 3 * dimension + tridiagonal) * sizeof(StringReal));
-    Scalars.Resize(2 * sizeof(StringReal));
-    States.Resize(sizeof(StringReal));
+    Scratch.Resize((2 * (p.Points + 1) + 3 * dimension + tridiagonal) * sizeof(FloatPair));
+    Scalars.Resize(2 * sizeof(FloatPair));
+    States.Resize(sizeof(FloatPair));
     Reset(InitialState(Tables));
 }
 Gpu::~Gpu() { MetalContext::Get().Drain(); }
@@ -65,23 +65,23 @@ void Gpu::Reset(const State &state) {
     const size_t dimension = Tables.Points * Tables.Components;
     if (state.Q.size() != dimension || state.Previous.size() != dimension)
         throw std::invalid_argument("Invalid string GPU state dimensions");
-    std::vector<StringReal> values(5 * dimension);
+    std::vector<FloatPair> values(5 * dimension);
     std::transform(state.Q.begin(), state.Q.end(), values.begin(), Pack);
     std::transform(state.Previous.begin(), state.Previous.end(), values.begin() + dimension, Pack);
     for (size_t i = 0; i < dimension; ++i) values[3 * dimension + i] = Pack(state.Q[i] - state.Previous[i]);
-    StringReal scalars[]{Pack(state.Psi), Pack(state.Loss)};
+    FloatPair scalars[]{Pack(state.Psi), Pack(state.Loss)};
     MetalContext::Get().Drain();
-    StateBuffer.Upload(values.data(), values.size() * sizeof(StringReal));
+    StateBuffer.Upload(values.data(), values.size() * sizeof(FloatPair));
     Scalars.Upload(scalars, sizeof(scalars));
     StepIndex = state.StepIndex;
 }
 State Gpu::GetState() {
     const size_t dimension = Tables.Points * Tables.Components;
-    const auto *values = StateBuffer.As<StringReal>();
+    const auto *values = StateBuffer.As<FloatPair>();
     State result{.Q = std::vector<double>(dimension), .Previous = std::vector<double>(dimension)};
     std::transform(values, values + dimension, result.Q.begin(), Read);
     std::transform(values + dimension, values + 2 * dimension, result.Previous.begin(), Read);
-    const auto *scalars = Scalars.As<StringReal>();
+    const auto *scalars = Scalars.As<FloatPair>();
     result.Psi = Read(scalars[0]);
     result.Loss = Read(scalars[1]);
     result.StepIndex = StepIndex;
@@ -93,11 +93,11 @@ GpuTrace Gpu::Run(uint32_t steps, bool recordStates) {
     const size_t dimension = Tables.Points * Tables.Components;
     if (StepIndex > std::numeric_limits<uint64_t>::max() - steps)
         throw std::overflow_error("String step counter overflow");
-    if (size_t(steps) > std::numeric_limits<size_t>::max() / sizeof(StringReal) / std::max<size_t>(6, recordStates ? dimension : 0))
+    if (size_t(steps) > std::numeric_limits<size_t>::max() / sizeof(FloatPair) / std::max<size_t>(6, recordStates ? dimension : 0))
         throw std::overflow_error("String trace allocation overflow");
-    Samples.Resize(size_t(steps) * Tables.Components * sizeof(StringReal));
-    Records.Resize(size_t(steps) * 6 * sizeof(StringReal));
-    if (recordStates) States.Resize(size_t(steps) * dimension * sizeof(StringReal));
+    Samples.Resize(size_t(steps) * Tables.Components * sizeof(FloatPair));
+    Records.Resize(size_t(steps) * 6 * sizeof(FloatPair));
+    if (recordStates) States.Resize(size_t(steps) * dimension * sizeof(FloatPair));
     auto &context = MetalContext::Get();
     const uint32_t batchSteps = uint32_t(std::clamp<size_t>(8192 / dimension, 1, 32));
     size_t queuedWork = 0;
@@ -119,7 +119,7 @@ GpuTrace Gpu::Run(uint32_t steps, bool recordStates) {
     StepIndex += steps;
     Download(trace.Samples, Samples, size_t(steps) * Tables.Components);
     if (recordStates) Download(trace.States, States, size_t(steps) * dimension);
-    const auto *values = Records.As<StringReal>();
+    const auto *values = Records.As<FloatPair>();
     trace.Metrics.resize(steps);
     for (size_t i = 0; i < steps; ++i)
         trace.Metrics[i] = {.Kinetic = Read(values[6 * i]), .LinearPotential = Read(values[6 * i + 1]), .NonlinearPotential = Read(values[6 * i + 2]), .Dissipated = Read(values[6 * i + 3]), .Energy = Read(values[6 * i + 4]), .Psi = Read(values[6 * i + 5])};

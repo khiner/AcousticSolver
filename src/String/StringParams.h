@@ -1,6 +1,6 @@
 #pragma once
 #ifndef __METAL_VERSION__
-#include "StringReal.h"
+#include "Metal/FloatPair.h"
 #include <cstdint>
 using StringUInt = std::uint32_t;
 #else
@@ -9,7 +9,7 @@ using StringUInt = uint;
 struct StringParams {
     StringUInt Points, Components, Model, Split, Nonlinear, Reference;
     StringUInt Steps, Offset, RecordStates, ReceiverU, ReceiverV;
-    StringReal H, InvH, InvH2, Dt, Dt2, InvDt, Mass, Rigidity, EA;
-    StringReal Tension, LongitudinalTension, NonlinearModulus;
-    StringReal Sigma0, Sigma1, InverseMass, Shift, Length;
+    FloatPair H, InvH, InvH2, Dt, Dt2, InvDt, Mass, Rigidity, EA;
+    FloatPair Tension, LongitudinalTension, NonlinearModulus;
+    FloatPair Sigma0, Sigma1, InverseMass, Shift, Length;
 };

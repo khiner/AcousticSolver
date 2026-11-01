@@ -31,3 +31,15 @@
 [submodule "external/mesh2hrtf"]
 	path = external/mesh2hrtf
 	url = https://github.com/Any2HRTF/Mesh2HRTF.git
+[submodule "external/diffimpact"]
+	path = external/diffimpact
+	url = https://github.com/samuel-clarke/diffimpact.git
+[submodule "external/diffsound"]
+	path = external/diffsound
+	url = https://github.com/TechnetiumMan/DiffSound.git
+[submodule "external/stable-modal-synthesis"]
+	path = external/stable-modal-synthesis
+	url = https://github.com/victorzheleznov/jaes-modal-node.git
+[submodule "external/soundsynth"]
+	path = external/soundsynth
+	url = https://github.com/ztzhang/SoundSynth.git

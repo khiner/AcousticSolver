@@ -46,7 +46,7 @@ Trace RunMetal(const Tables &t) {
     const auto options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
     options->setFastMathEnabled(false);
     const std::string root = ACOUSTIC_PROJECT_ROOT;
-    const std::string source = Read(root + "/src/String/StringReal.h") + "\n" +
+    const std::string source = Read(root + "/src/Metal/FloatPair.h") + "\n" +
         Read(root + "/src/Coupled/CoupledParams.h") + "\n" + Read(root + "/src/Coupled/CoupledKernels.metal");
     NS::Error *error{};
     auto const library = NS::TransferPtr(context.Device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding), options.get(), &error));

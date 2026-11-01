@@ -1,0 +1,30 @@
+{
+  "upstream_commit": "3a0be14b8bfa95dcbcd98f3c233e981c713d021b",
+  "source_hashes": {
+    "src/diffelastic/material_model.py": "5b2e7034d2c5fbc017a9f8c6b73758b922371441e58dbd0fb7d19320f0f95d6d",
+    "src/diffelastic/gauss.py": "3b62d2dba6f922d3ea8110bb90d23f52e6c71a0fa6d79bf4e4a7060748f00fa7",
+    "src/diffelastic/shape_func.py": "bc19e8412085f3bb4fd42597e06436775e59de4ca6e2a0019f2a29f07b80e052",
+    "src/diffelastic/mass_matrix.py": "5a9c079f523ddf489fc5a3cd4a957702f3c909347d3910d4865909844e9d66ca",
+    "src/diffelastic/mesh.py": "6a0df75a714c2dcd6dfa6e4381efd09ca526cc47efe8f16e475e68ef7d565867",
+    "src/diffelastic/deform.py": "4e2a0279186261bf4a5201c00f76c5db36a0a96bdc57f2aaefd7cd3d8a704e11",
+    "src/ddsp/utils.py": "a1bd9add70dcacb6996de04d3293d4cd7e4954f58b9e18d3b5b38f958092a941",
+    "src/ddsp/filtered_noise.py": "f8289c9c01bff5a05deec499644610f5654a4eb873bfab4ebf11e752b752a86f",
+    "src/ddsp/oscillator.py": "5268c3b4fb9048b0003f6d16a321440193c9a2cf867ee0297fdf0181f86bfa04",
+    "src/ddsp/mss_loss.py": "efa07d0d18600f86f3a9892a6880fff22455cc0235b944252a353afc54cada2f",
+    "src/diffelastic/diff_model.py": "80d200b1b4addb51a9dcdda38f1a4b14ec981314bf0ad052cf494d1a6d04058d",
+    "src/dmtet/geometry/dmtet_geometry.py": "c6483b49d11d299173b87ee1433a4eadffc07d740e35194b4a31bf07c69b79a5",
+    "src/dmtet/geometry/dmtet_thickness.py": "4b31df4a65441532aeb7a3dd90cef292a767976cf5dd3e569edda16933d982f4",
+    "src/dmtet/geometry/dmtet_interpolate.py": "74dd121035857ae60e8dfcde3c1290c6b1cc57891c8c8082b3096d9965862cbb",
+    "src/diffelastic/bem.py": "8ced81266d4f844e07a8ddcfc0c25e047079882d67ffb27f117a8b248bec7f65"
+  },
+  "dependencies": {
+    "torch": "2.8.0",
+    "torchaudio": "2.8.0",
+    "numpy": "2.5.4",
+    "scipy": "1.18.1",
+    "geomloss": "0.2.6",
+    "bempp-cl": "0.4.2"
+  },
+  "reference_backend": "Author PyTorch source on CPU; device placement, unused imports, torch_scatter reductions and bempp.api namespace substituted",
+  "fixture_sha256": "cae918ab7702cf5aecb109b562ed90f0a108210a127f8fef3180722193fb6f19"
+}

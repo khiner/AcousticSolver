@@ -4,6 +4,12 @@ AcousticSolver as a whole is distributed under the GNU General Public License v3
 `LICENSE`). Portions derive from the MIT-licensed projects listed below, whose copyright
 and permission notices are reproduced here as those licenses require.
 
+## Differentiable physical-model ports
+
+- DiffImpact's source revision and third-party licenses are retained in [its notice](script/diffimpact/NOTICE).
+- DiffSound's source revision and component attribution are retained in [its notice](script/diffsound/NOTICE).
+- Stable Modal Synthesis pins the author source in [its protocol](script/stable_modal_synthesis/protocol.json) and retains the author MIT license with [its reference fixtures](tests/fixtures/stable_modal_synthesis/LICENSE.reference).
+
 ## Derived sources under `src/`
 
 Ported from the projects listed, then restructured and optimized. None are

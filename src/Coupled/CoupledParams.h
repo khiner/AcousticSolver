@@ -1,10 +1,10 @@
 #pragma once
 #ifndef __METAL_VERSION__
-#include "String/StringReal.h"
+#include "Metal/FloatPair.h"
 #include <cstdint>
 using uint = uint32_t;
 #endif
-using Real = StringReal;
+using Real = FloatPair;
 struct CoupledMatrix {
     uint Rows{}, Row{}, Column{}, Value{};
 };

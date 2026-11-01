@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Validate DiffSound's synthesis, derivatives and inference contracts."""
+
+from python_env import run_module
+
+run_module("diffsound-env", "script/diffsound/requirements.txt", "script.diffsound.check")
